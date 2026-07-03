@@ -9,6 +9,12 @@ description: Delegate implementation work to OpenAI Codex (GPT) running as a nam
 You interact with it like a native subagent: spawn in background, get woken on
 completion, steer mid-flight, send follow-ups to the same thread.
 
+**WIP.** This is the user's personal utility under active iteration. If the
+tool itself misbehaves — confusing errors, hangs, reports that don't match
+what happened, docs that disagree with behavior — tell the user what you hit
+instead of silently working around it. They would rather fix the tool than
+absorb a process breakdown.
+
 ## Division of labor
 
 GPT is a peer intellect with one structural deficit: it does not share your
@@ -89,7 +95,12 @@ EOF
 
 Review the diff (`jj diff` / `git diff`) against the user's intent — that is
 the gap GPT cannot close itself. Run the verification commands yourself;
-don't take the report's word for it. GPT is highly corrigible: a corrective
+don't take the report's word for it. Two failure modes to look for, both of
+which produce a confident report and passing checks: the brilliant solution
+to a subtly different problem, and the intellectual shortcut — a
+special-cased test, a stubbed hard branch, a weakened assertion. Check *how*
+the acceptance criteria were met, not just that they pass. GPT is highly
+corrigible: a corrective
 `send` naming the observed divergence ("in lib/foo.mjs:40, X happens; make it
 do Y") reliably lands, and the thread retains its context — iterate there
 rather than redoing the work yourself. Take over only when the remaining gap
