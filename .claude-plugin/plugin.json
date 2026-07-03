@@ -1,0 +1,8 @@
+{
+  "name": "ception",
+  "description": "Run OpenAI Codex as a named background subagent from Claude Code",
+  "version": "0.1.0",
+  "author": {
+    "name": "ppergame"
+  }
+}

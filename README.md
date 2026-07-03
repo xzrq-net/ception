@@ -6,6 +6,22 @@ Codex thread. Thin CLI calls talk to that daemon over a Unix socket and exit
 when the turn completes, so Claude Code's background-Bash wakeup remains the
 synchronization mechanism.
 
+## Install
+
+The repository is a Claude Code plugin: `.claude-plugin/plugin.json`, the
+skill in `skills/ception/`, and `bin/`, which Claude Code adds to the Bash
+tool's PATH while the plugin is enabled (so `ception` resolves with no extra
+symlink). One symlink activates it:
+
+```sh
+ln -s ~/projects/ception ~/.claude/skills/ception
+```
+
+It loads on the next session as `ception@skills-dir`, discovered in place —
+edits to the checkout take effect without reinstalling (`/reload-plugins`
+picks up changes to non-skill components). For shells outside Claude Code,
+also symlink `bin/ception` somewhere on your PATH.
+
 ## Usage
 
 ```sh
