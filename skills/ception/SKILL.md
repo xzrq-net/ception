@@ -67,7 +67,7 @@ EOF
 ```
 
 - The first stdout line (of both `spawn` and `send`) is the log path; the
-  final report arrives on completion (message + status/files/tokens footer).
+  final report arrives on completion (message + status/files/tokens/duration footer).
   Exit codes: 0 done, 2 failed, 3 interrupted, 4 infra/usage error.
 - If you spawned with `--cwd` pointing outside the current project, pass that
   same `--cwd` to `send`, `interrupt`, `kill`, and `watch` too — without it

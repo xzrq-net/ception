@@ -53,7 +53,7 @@ for environments (dev containers) where Claude Code itself runs unsandboxed.
 There is no sandbox knob. If Codex ever sends an approval request anyway, the
 daemon rejects it and fails the turn with exit code 4.
 
-Report levels: `brief` (final message + status/files/tokens footer, default),
+Report levels: `brief` (final message + status/files/tokens/duration footer, default),
 `items` (adds one line per command/edit/tool call), `full` (everything the log
 gets, including reasoning). The log file always receives the full stream.
 
