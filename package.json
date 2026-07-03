@@ -1,0 +1,11 @@
+{
+  "name": "ception",
+  "version": "0.1.0",
+  "type": "module",
+  "bin": {
+    "ception": "bin/ception.mjs"
+  },
+  "scripts": {
+    "test": "node --test test/"
+  }
+}
