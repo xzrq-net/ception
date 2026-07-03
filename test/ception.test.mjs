@@ -168,8 +168,10 @@ test("happy path: spawn renders report, persists state, logs reasoning", async (
 
   assert.equal(result.code, 0, result.stderr);
   assert.match(result.stdout, /^log: .+alpha\.log/m);
+  assert.equal(result.stdout.match(/^log: /gm).length, 1);
   assert.match(result.stdout, /Handled the requested task/);
-  assert.match(result.stdout, /threadId: thr_1/);
+  assert.match(result.stdout, /files touched:/);
+  assert.doesNotMatch(result.stdout, /threadId:/);
 
   const projectState = await readProjectState(ctx);
   const entry = projectState.sessions[ctx.sessionKey].labels.alpha;
@@ -186,6 +188,7 @@ test("send to idle live daemon starts a second turn on same app-server", async (
   assert.equal((await runCeption(["spawn", "--label", "idle", "first"], { env: ctx.env, cwd: ctx.project })).code, 0);
   const second = await runCeption(["send", "idle", "follow up"], { env: ctx.env, cwd: ctx.project });
   assert.equal(second.code, 0, second.stderr);
+  assert.match(second.stdout, /^log: .+idle\.log/m);
   assert.match(second.stdout, /Resumed the prior run/);
 
   const fakeState = await readJson(ctx.fakeState);

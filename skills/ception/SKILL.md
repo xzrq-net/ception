@@ -58,11 +58,16 @@ ception spawn --label impl - <<'EOF'
 EOF
 ```
 
-- The first stdout line is the log path; the final report arrives on
-  completion (message + status/files/tokens footer). Exit codes: 0 done,
-  2 failed, 3 interrupted, 4 infra/usage error.
-- Labels are scoped to the project root (nearest `.jj`/`.git` walking up, so
-  invocation cwd doesn't matter) and to this Claude Code session — another
+- The first stdout line (of both `spawn` and `send`) is the log path; the
+  final report arrives on completion (message + status/files/tokens footer).
+  Exit codes: 0 done, 2 failed, 3 interrupted, 4 infra/usage error.
+- If you spawned with `--cwd` pointing outside the current project, pass that
+  same `--cwd` to `send`, `interrupt`, `kill`, and `watch` too — without it
+  they look in the wrong project and fail with "no live daemon or stored
+  thread".
+- Labels are scoped to the project root (nearest `.jj`/`.git` walking up from
+  the shell's cwd, so any subdirectory of the project reaches the same labels)
+  and to this Claude Code session — another
   session's labels are invisible to `send` and can't collide with yours. After
   the user resumes a session, `send` transparently adopts the old session's
   label and resumes its thread; if it instead fails with "belongs to live

@@ -19,11 +19,14 @@ function usage(message) {
   }
   console.error(`usage:
   ception spawn --label L [--cwd D] [--model M] [--effort E] [--report brief|items|full] [PROMPT | -]
-  ception send L [--report brief|items|full] [PROMPT | -]
-  ception interrupt L
-  ception kill L | --all
-  ception list [--all] [--json]
-  ception watch L`);
+  ception send L [--cwd D] [--report brief|items|full] [PROMPT | -]
+  ception interrupt L [--cwd D]
+  ception kill L | --all [--cwd D]
+  ception list [--all] [--json] [--cwd D]
+  ception watch L [--cwd D]
+
+labels are scoped to the project root resolved from the invocation cwd
+(or --cwd); a label spawned with --cwd must be addressed with the same --cwd`);
 }
 
 function normalizeReport(report) {

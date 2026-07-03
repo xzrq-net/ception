@@ -18,16 +18,19 @@ ception watch worker
 ception kill worker
 ```
 
-`spawn` starts a fresh Codex thread and prints the log path on its first line.
-`send` reuses the live daemon, or transparently respawns it (resuming the
-stored thread and the original `--model`/`--effort` options) if the daemon
-died. The daemon decides atomically what a `send` means: if a turn is running
+`spawn` starts a fresh Codex thread. Both `spawn` and `send` print the log
+path on their first stdout line. `send` reuses the live daemon, or
+transparently respawns it (resuming the stored thread and the original
+`--model`/`--effort` options) if the daemon died. The daemon decides atomically what a `send` means: if a turn is running
 it steers that turn and the sender exits immediately (the client that started
 the turn still blocks until completion and delivers the report); if idle it
 starts a new turn and blocks.
 
 Flags on `spawn`: `--cwd`, `--model`, `--effort`, `--report brief|items|full`.
-Model settings default to `~/.codex/config.toml`.
+Model settings default to `~/.codex/config.toml`. Every other command also
+accepts `--cwd`; since labels are scoped by the project root resolved from the
+invocation cwd, a label spawned with `--cwd` must be addressed with the same
+`--cwd` (or from inside that project).
 
 Codex always runs with full access and approvals disabled; `ception` is meant
 for environments (dev containers) where Claude Code itself runs unsandboxed.
