@@ -1,10 +1,10 @@
 # ception
 
 `ception` lets Claude Code run OpenAI Codex as a named, long-lived subagent.
-Each label maps to one per-project daemon that owns a `codex app-server` child
-and one Codex thread. Thin CLI calls talk to that daemon over a Unix socket and
-exit when the turn completes, so Claude Code's background-Bash wakeup remains
-the synchronization mechanism.
+Each label maps to one daemon that owns a `codex app-server` child and one
+Codex thread. Thin CLI calls talk to that daemon over a Unix socket and exit
+when the turn completes, so Claude Code's background-Bash wakeup remains the
+synchronization mechanism.
 
 ## Usage
 
@@ -21,9 +21,10 @@ ception kill worker
 `spawn` starts a fresh Codex thread and prints the log path on its first line.
 `send` reuses the live daemon, or transparently respawns it (resuming the
 stored thread and the original `--model`/`--effort` options) if the daemon
-died. If a turn is already running, `send` steers that in-flight turn and
-exits immediately; the client that started the turn still blocks until
-completion and delivers the report.
+died. The daemon decides atomically what a `send` means: if a turn is running
+it steers that turn and the sender exits immediately (the client that started
+the turn still blocks until completion and delivers the report); if idle it
+starts a new turn and blocks.
 
 Flags on `spawn`: `--cwd`, `--model`, `--effort`, `--report brief|items|full`.
 Model settings default to `~/.codex/config.toml`.
@@ -40,6 +41,33 @@ gets, including reasoning). The log file always receives the full stream.
 Exit codes: `0` turn completed (or steer/interrupt accepted), `2` turn failed,
 `3` turn interrupted, `4` usage or infrastructure error.
 
+## Scoping: project × session
+
+Labels are namespaced by **project root** and **session**:
+
+- The project root is found by walking up from the invocation directory to the
+  nearest `.jj`/`.git`/`.hg`; without one, the directory itself is the root.
+  Running `ception` from a subdirectory therefore hits the same labels as
+  running it at the root. `--cwd` overrides the starting point.
+- The session is the Claude Code process the client runs under (pid +
+  starttime). Two concurrent Claude Code sessions in the same project can both
+  use the label `impl` and get independent daemons and independent Codex
+  threads — no shared rollout, ever. Outside Claude Code, all invocations
+  share the `default` session.
+
+**Adoption.** When `send` doesn't find the label in its own session, it looks
+at other sessions' entries for the project. If the owning session is dead
+(typical after exiting and resuming Claude Code), the label is moved into the
+current session and its thread resumed — options, thread history, and log file
+carry over. If the owner is still alive, `send` refuses with exit code 4
+rather than share the rollout.
+
+`interrupt` and `kill` act only on the calling session's daemons; `kill --all`
+kills the calling session's daemons for the current project. `list` shows all
+sessions' labels for the project (`list --all` for every project), with a
+`session` column of `mine`, a live session key, or `adoptable`. `watch` may
+tail any session's log.
+
 ## Daemon lifecycle
 
 A daemon exits when any of these fires:
@@ -55,11 +83,17 @@ A daemon exits when any of these fires:
 Daemon death is cheap: thread history persists in Codex's own rollout store,
 and the next `send` respawns and resumes.
 
+State entries whose owning session is dead and that have been idle for
+`CEPTION_GC_DAYS` (default 7) are garbage-collected on the next invocation,
+along with their log files.
+
 ## Files
 
-- Logs: `~/.local/state/ception/logs/<cwdhash>-<label>.log` (tail with
-  `ception watch LABEL`)
-- State (label → thread id and options): `~/.local/state/ception/<cwdhash>.json`
+- Logs: `~/.local/state/ception/logs/<cwdhash>-<session>-<label>.log` (tail
+  with `ception watch LABEL`)
+- State (session → label → thread id and options):
+  `~/.local/state/ception/<cwdhash>.json`, guarded by a `.lock` file for
+  cross-process read-modify-write
 - Sockets/locks: `$XDG_RUNTIME_DIR/ception/`, falling back to
   `~/.local/state/ception/run/`
 
@@ -69,8 +103,13 @@ and the next `send` respawns and resumes.
   `npx -y @openai/codex app-server`); used by tests to substitute a fake.
 - `CEPTION_IDLE_TIMEOUT_SECS` — daemon idle timeout, default 14400.
 - `CEPTION_CLAUDE_POLL_SECS` — ancestor liveness poll interval, default 30.
+- `CEPTION_SPAWN_TIMEOUT_SECS` — how long the client waits for a spawned
+  daemon's socket, default 120 (generous because the first spawn may sit
+  through an npx download).
+- `CEPTION_GC_DAYS` — age before dead-session state entries and logs are
+  collected, default 7.
 - `CEPTION_WATCH_PID` / `CEPTION_WATCH_STARTTIME` — bypass ancestor detection
-  and watch this process instead (used by tests).
+  and watch this process instead (used by tests; also pins the session key).
 
 ## Development
 

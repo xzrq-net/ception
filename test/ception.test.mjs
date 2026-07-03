@@ -14,6 +14,12 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function procStarttime(pid) {
+  const stat = await fs.readFile(`/proc/${pid}/stat`, "utf8");
+  const end = stat.lastIndexOf(")");
+  return stat.slice(end + 2).trim().split(/\s+/)[19];
+}
+
 async function makeEnv(behavior = "happy") {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "ception-test-"));
   const home = path.join(root, "home");
@@ -23,6 +29,9 @@ async function makeEnv(behavior = "happy") {
   await fs.mkdir(runtime, { recursive: true });
   await fs.mkdir(project, { recursive: true });
   const fakeState = path.join(root, "fake-state.json");
+  // Pin the session identity to the test runner so tests are hermetic even
+  // when the suite itself runs under Claude Code.
+  const starttime = await procStarttime(process.pid);
   const env = {
     ...process.env,
     HOME: home,
@@ -30,9 +39,29 @@ async function makeEnv(behavior = "happy") {
     CEPTION_CODEX_CMD: `${process.execPath} ${FAKE}`,
     CEPTION_FAKE_STATE: fakeState,
     CEPTION_FAKE_BEHAVIOR: behavior,
-    CEPTION_IDLE_TIMEOUT_SECS: "30"
+    CEPTION_IDLE_TIMEOUT_SECS: "30",
+    CEPTION_CLAUDE_POLL_SECS: "0.2",
+    CEPTION_WATCH_PID: String(process.pid),
+    CEPTION_WATCH_STARTTIME: starttime
   };
-  return { root, home, runtime, project, fakeState, env };
+  const sessionKey = `c${process.pid}-${starttime}`;
+  return { root, home, runtime, project, fakeState, env, sessionKey };
+}
+
+async function spawnDummySession(ctx) {
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+    stdio: "ignore"
+  });
+  const starttime = await procStarttime(child.pid);
+  return {
+    child,
+    sessionKey: `c${child.pid}-${starttime}`,
+    env: {
+      ...ctx.env,
+      CEPTION_WATCH_PID: String(child.pid),
+      CEPTION_WATCH_STARTTIME: starttime
+    }
+  };
 }
 
 function runCeption(args, { env, cwd, input = null, timeoutMs = 8000 } = {}) {
@@ -102,6 +131,13 @@ async function readJson(file, fallback = null) {
   }
 }
 
+async function readProjectState(ctx) {
+  const dir = path.join(ctx.home, ".local", "state", "ception");
+  const names = await fs.readdir(dir);
+  const stateName = names.find((name) => name.endsWith(".json"));
+  return readJson(path.join(dir, stateName));
+}
+
 async function waitFor(fn, timeoutMs = 5000) {
   const deadline = Date.now() + timeoutMs;
   let last;
@@ -115,8 +151,10 @@ async function waitFor(fn, timeoutMs = 5000) {
   return last;
 }
 
-async function cleanup(ctx) {
-  await runCeption(["kill", "--all"], { env: ctx.env, cwd: ctx.project, timeoutMs: 4000 }).catch(() => {});
+async function cleanup(ctx, envs = []) {
+  for (const env of [ctx.env, ...envs]) {
+    await runCeption(["kill", "--all"], { env, cwd: ctx.project, timeoutMs: 4000 }).catch(() => {});
+  }
 }
 
 test("happy path: spawn renders report, persists state, logs reasoning", async (t) => {
@@ -133,12 +171,11 @@ test("happy path: spawn renders report, persists state, logs reasoning", async (
   assert.match(result.stdout, /Handled the requested task/);
   assert.match(result.stdout, /threadId: thr_1/);
 
-  const stateFiles = await fs.readdir(path.join(ctx.home, ".local", "state", "ception"));
-  const projectStateName = stateFiles.find((name) => name.endsWith(".json"));
-  const projectState = await readJson(path.join(ctx.home, ".local", "state", "ception", projectStateName));
-  assert.equal(projectState.labels.alpha.threadId, "thr_1");
+  const projectState = await readProjectState(ctx);
+  const entry = projectState.sessions[ctx.sessionKey].labels.alpha;
+  assert.equal(entry.threadId, "thr_1");
 
-  const log = await fs.readFile(projectState.labels.alpha.logPath, "utf8");
+  const log = await fs.readFile(entry.logPath, "utf8");
   assert.match(log, /Thinking through fixture/);
 });
 
@@ -218,10 +255,9 @@ test("server-initiated request is rejected and fails the turn", async (t) => {
   assert.equal(result.code, 4, result.stdout);
   assert.match(result.stderr, /codex sent item\/commandExecution\/requestApproval/);
 
-  const stateFiles = await fs.readdir(path.join(ctx.home, ".local", "state", "ception"));
-  const projectStateName = stateFiles.find((name) => name.endsWith(".json"));
-  const projectState = await readJson(path.join(ctx.home, ".local", "state", "ception", projectStateName));
-  const log = await fs.readFile(projectState.labels.approval.logPath, "utf8");
+  const projectState = await readProjectState(ctx);
+  const entry = projectState.sessions[ctx.sessionKey].labels.approval;
+  const log = await fs.readFile(entry.logPath, "utf8");
   assert.match(log, /\[error\] codex sent item\/commandExecution\/requestApproval/);
 
   const fakeState = await readJson(ctx.fakeState);
@@ -306,37 +342,168 @@ test("respawn after daemon death preserves spawn-time options", async (t) => {
   assert.equal(last.sandboxPolicy.type, "dangerFullAccess");
 });
 
-async function procStarttime(pid) {
-  const stat = await fs.readFile(`/proc/${pid}/stat`, "utf8");
-  const end = stat.lastIndexOf(")");
-  return stat.slice(end + 2).trim().split(/\s+/)[19];
-}
-
 test("Claude pid watch exits daemon after watched process dies", async (t) => {
   const ctx = await makeEnv("happy");
-  const watched = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
-    stdio: "ignore"
-  });
+  const session = await spawnDummySession(ctx);
   t.after(() => {
-    watched.kill("SIGTERM");
+    session.child.kill("SIGTERM");
     return cleanup(ctx);
   });
-  const starttime = await procStarttime(watched.pid);
-  const env = {
-    ...ctx.env,
-    CEPTION_WATCH_PID: String(watched.pid),
-    CEPTION_WATCH_STARTTIME: starttime,
-    CEPTION_CLAUDE_POLL_SECS: "0.1"
-  };
 
-  assert.equal((await runCeption(["spawn", "--label", "watch", "first"], { env, cwd: ctx.project })).code, 0);
-  watched.kill("SIGTERM");
+  assert.equal((await runCeption(["spawn", "--label", "watch", "first"], { env: session.env, cwd: ctx.project })).code, 0);
+  session.child.kill("SIGTERM");
 
   const row = await waitFor(async () => {
     const listed = await runCeption(["list", "--json"], { env: ctx.env, cwd: ctx.project });
     const rows = JSON.parse(listed.stdout);
     const found = rows.find((candidate) => candidate.label === "watch");
-    return found?.status === "dead" ? found : null;
+    return found?.status === "adoptable" ? found : null;
   }, 5000);
-  assert.equal(row.status, "dead");
+  assert.equal(row?.status, "adoptable");
+});
+
+test("two live sessions use the same label without collision", async (t) => {
+  const ctx = await makeEnv("happy");
+  const sessionA = await spawnDummySession(ctx);
+  const sessionB = await spawnDummySession(ctx);
+  t.after(() => {
+    sessionA.child.kill("SIGTERM");
+    sessionB.child.kill("SIGTERM");
+    return cleanup(ctx, [sessionA.env, sessionB.env]);
+  });
+
+  const first = await runCeption(["spawn", "--label", "impl", "first"], { env: sessionA.env, cwd: ctx.project });
+  assert.equal(first.code, 0, first.stderr);
+  const second = await runCeption(["spawn", "--label", "impl", "first"], { env: sessionB.env, cwd: ctx.project });
+  assert.equal(second.code, 0, second.stderr);
+
+  const fakeState = await readJson(ctx.fakeState);
+  assert.equal(fakeState.appServerStarts, 2);
+  const threads = fakeState.lastTurnStarts.map((turn) => turn.threadId);
+  assert.notEqual(threads[0], threads[1]);
+
+  // Follow-up in session A lands on A's thread, not B's.
+  const followUp = await runCeption(["send", "impl", "follow up"], { env: sessionA.env, cwd: ctx.project });
+  assert.equal(followUp.code, 0, followUp.stderr);
+  const after = await readJson(ctx.fakeState);
+  assert.equal(after.lastTurnStarts.at(-1).threadId, threads[0]);
+});
+
+test("send refuses a label owned by a live session", async (t) => {
+  const ctx = await makeEnv("happy");
+  const sessionA = await spawnDummySession(ctx);
+  t.after(() => {
+    sessionA.child.kill("SIGTERM");
+    return cleanup(ctx, [sessionA.env]);
+  });
+
+  assert.equal((await runCeption(["spawn", "--label", "impl", "first"], { env: sessionA.env, cwd: ctx.project })).code, 0);
+
+  const stolen = await runCeption(["send", "impl", "mine now"], { env: ctx.env, cwd: ctx.project });
+  assert.equal(stolen.code, 4, stolen.stdout);
+  assert.match(stolen.stderr, /belongs to live session/);
+});
+
+test("dead session's label is adopted with thread and options intact", async (t) => {
+  const ctx = await makeEnv("happy");
+  const sessionA = await spawnDummySession(ctx);
+  t.after(() => {
+    sessionA.child.kill("SIGTERM");
+    return cleanup(ctx, [sessionA.env]);
+  });
+
+  const spawned = await runCeption(
+    ["spawn", "--label", "impl", "--model", "gpt-fixture", "--effort", "low", "first"],
+    { env: sessionA.env, cwd: ctx.project }
+  );
+  assert.equal(spawned.code, 0, spawned.stderr);
+  assert.equal((await runCeption(["kill", "--all"], { env: sessionA.env, cwd: ctx.project })).code, 0);
+  sessionA.child.kill("SIGTERM");
+  await waitFor(async () => !(await fs.access(`/proc/${sessionA.child.pid}/stat`).then(() => true, () => false)));
+
+  const sent = await runCeption(["send", "impl", "follow up after death"], {
+    env: ctx.env,
+    cwd: ctx.project
+  });
+  assert.equal(sent.code, 0, sent.stderr);
+  assert.match(sent.stdout, /Resumed the prior run/);
+
+  const projectState = await readProjectState(ctx);
+  assert.ok(projectState.sessions[ctx.sessionKey].labels.impl);
+  assert.equal(projectState.sessions[sessionA.sessionKey]?.labels?.impl, undefined);
+
+  const fakeState = await readJson(ctx.fakeState);
+  assert.ok(fakeState.requests.some((request) => request.method === "thread/resume"));
+  const last = fakeState.lastTurnStarts.at(-1);
+  assert.equal(last.model, "gpt-fixture");
+  assert.equal(last.effort, "low");
+});
+
+test("kill --all only touches the calling session's daemons", async (t) => {
+  const ctx = await makeEnv("happy");
+  const sessionA = await spawnDummySession(ctx);
+  t.after(() => {
+    sessionA.child.kill("SIGTERM");
+    return cleanup(ctx, [sessionA.env]);
+  });
+
+  assert.equal((await runCeption(["spawn", "--label", "theirs", "first"], { env: sessionA.env, cwd: ctx.project })).code, 0);
+  assert.equal((await runCeption(["spawn", "--label", "mine", "first"], { env: ctx.env, cwd: ctx.project })).code, 0);
+
+  const killed = await runCeption(["kill", "--all"], { env: ctx.env, cwd: ctx.project });
+  assert.match(killed.stdout, /killed 1 daemon/);
+
+  const listed = await runCeption(["list", "--json"], { env: ctx.env, cwd: ctx.project });
+  const rows = JSON.parse(listed.stdout);
+  assert.equal(rows.find((row) => row.label === "theirs").status, "idle");
+  assert.equal(rows.find((row) => row.label === "mine").status, "dead");
+});
+
+test("labels resolve to the project root, not the invocation subdirectory", async (t) => {
+  const ctx = await makeEnv("happy");
+  t.after(() => cleanup(ctx));
+  await fs.mkdir(path.join(ctx.project, ".git"));
+  const sub = path.join(ctx.project, "src", "deep");
+  await fs.mkdir(sub, { recursive: true });
+
+  assert.equal((await runCeption(["spawn", "--label", "rooted", "first"], { env: ctx.env, cwd: sub })).code, 0);
+  const sent = await runCeption(["send", "rooted", "follow up"], { env: ctx.env, cwd: ctx.project });
+  assert.equal(sent.code, 0, sent.stderr);
+
+  const fakeState = await readJson(ctx.fakeState);
+  assert.equal(fakeState.appServerStarts, 1);
+  const threadStart = fakeState.requests.find((request) => request.method === "thread/start");
+  assert.equal(threadStart.params.cwd, await fs.realpath(ctx.project));
+  const stateDir = path.join(ctx.home, ".local", "state", "ception");
+  const stateFiles = (await fs.readdir(stateDir)).filter((name) => name.endsWith(".json"));
+  assert.equal(stateFiles.length, 1);
+});
+
+test("gc drops stale labels of dead sessions and their logs", async (t) => {
+  const ctx = await makeEnv("happy");
+  t.after(() => cleanup(ctx));
+
+  assert.equal((await runCeption(["spawn", "--label", "keep", "first"], { env: ctx.env, cwd: ctx.project })).code, 0);
+
+  const projectState = await readProjectState(ctx);
+  const staleLog = path.join(ctx.root, "stale.log");
+  await fs.writeFile(staleLog, "old\n");
+  projectState.sessions["c999999-1"] = {
+    labels: {
+      stale: {
+        threadId: "thr_gone",
+        lastUsed: new Date(Date.now() - 30 * 86400_000).toISOString(),
+        logPath: staleLog
+      }
+    }
+  };
+  const stateDir = path.join(ctx.home, ".local", "state", "ception");
+  const stateName = (await fs.readdir(stateDir)).find((name) => name.endsWith(".json"));
+  await fs.writeFile(path.join(stateDir, stateName), JSON.stringify(projectState));
+
+  const listed = await runCeption(["list", "--json"], { env: ctx.env, cwd: ctx.project });
+  const rows = JSON.parse(listed.stdout);
+  assert.equal(rows.find((row) => row.label === "stale"), undefined);
+  assert.ok(rows.find((row) => row.label === "keep"));
+  assert.equal(await fs.access(staleLog).then(() => true, () => false), false);
 });

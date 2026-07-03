@@ -61,6 +61,12 @@ EOF
 - The first stdout line is the log path; the final report arrives on
   completion (message + status/files/tokens footer). Exit codes: 0 done,
   2 failed, 3 interrupted, 4 infra/usage error.
+- Labels are scoped to the project root (nearest `.jj`/`.git` walking up, so
+  invocation cwd doesn't matter) and to this Claude Code session — another
+  session's labels are invisible to `send` and can't collide with yours. After
+  the user resumes a session, `send` transparently adopts the old session's
+  label and resumes its thread; if it instead fails with "belongs to live
+  session", pick a different label.
 - Follow-ups and course corrections go to the same thread:
   `ception send impl "..."`. If the turn is still running this steers it and
   returns immediately; if idle it starts a new turn and blocks. Steer only on
