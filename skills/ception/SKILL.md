@@ -1,6 +1,6 @@
 ---
 name: ception
-description: Delegate bulk implementation work to OpenAI Codex (GPT) running as a named background subagent. Use when a task has a crisp spec and a large diff — wide mechanical refactors, test scaffolding, first-draft modules — to keep the heavy token churn out of your own context.
+description: Delegate implementation work to OpenAI Codex (GPT) running as a named background subagent. GPT is a frontier-class implementor — delegate anything whose intent you can put in writing, hard or mechanical, to keep the token churn out of your own context. Keep only decisions that need the user context in your head.
 ---
 
 # ception: Codex as a subagent
@@ -9,43 +9,45 @@ description: Delegate bulk implementation work to OpenAI Codex (GPT) running as 
 You interact with it like a native subagent: spawn in background, get woken on
 completion, steer mid-flight, send follow-ups to the same thread.
 
-## When to delegate
+## Division of labor
 
-Delegate when the diff is large but the decisions are small, and you can state
-the spec completely:
+GPT is a peer intellect with one structural deficit: it does not share your
+conversation, so it cannot infer the user's intent or taste. Everything else —
+gnarly debugging, subtle algorithms, wide refactors, migrations, test design,
+performance hunts — is in scope. Do not reserve hard work for yourself out of
+capability doubt; reserve it only when the intent can't be transferred.
 
-- bulk implementation against a design you've already settled
-- wide mechanical refactors and API migrations
-- test scaffolding for existing behavior
-- first drafts of well-specified, self-contained modules
+Delegate when you can write the intent down: the goal, the constraints, what
+the user would object to. Keep for yourself:
 
-Keep for yourself: design, ambiguity resolution, anything where writing a
-complete spec costs as much as doing the work, tasks needing judgment you have
-already built up in context this session, and the final review — always.
-
-Codex does not share your conversation. The prompt must carry everything:
-paths, constraints, conventions, verification commands. If you can't write
-that down, the task isn't ready to delegate.
+- decisions that need judgment built up in this session, or a read on the
+  user you can't articulate
+- tasks where writing the intent down costs as much as doing the work
+- the final review — always, because the failure mode is misread intent, not
+  incompetence
 
 ## How to prompt GPT
 
-GPT executes specific instructions extremely well and handles metacognitive
-framing poorly. Write the prompt like a work order, not a discussion:
+The prompt must carry everything; there is no shared context.
 
-- One line up front: the goal and what the work feeds into.
-- Concrete file paths, function names, exact commands.
-- Acceptance criteria as a checklist, including a verification command to run
-  ("run `npm test`; all tests must pass").
-- Explicit non-goals: "do not refactor X", "do not touch files outside Y/".
-- Imperative mood. No "consider", no "you might", no options for it to weigh.
-- Never ask it to reflect, assess its confidence, or manage scope tradeoffs —
-  make those calls yourself and encode the result.
+- Lead with the actual goal and what the work feeds into — the *why* is what
+  lets it make correct micro-decisions on its own.
+- Concrete anchors: file paths, function names, and a verification command to
+  run ("run `npm test`; all tests must pass").
+- Constraints and non-goals explicitly: "do not refactor X", "no new
+  dependencies", "do not touch files outside Y/".
+- Latitude is fine and often better than over-specifying: "choose the data
+  structure" works. When you leave a decision open, ask it to state in its
+  report which way it went and why, so you can check the choice against
+  intent.
+- Taste is the one thing it cannot infer. Encode it as rules: match the
+  surrounding code's comment density and idiom, naming conventions, error
+  message style, what counts as too clever.
 - For review work, just say "review": its system prompt has a code-review
   stance built in (findings first, ordered by severity, file/line refs).
 
-The user's config defaults to a high reasoning effort. For mechanical bulk
-work, pass `--effort medium` to cut latency; leave it alone when the task has
-any subtlety.
+The user's config defaults to a high reasoning effort. Pass `--effort medium`
+only for truly mechanical bulk; leave it alone for anything with subtlety.
 
 ## Operating procedure
 
@@ -54,7 +56,7 @@ prompt from stdin). You are woken when the turn completes:
 
 ```sh
 ception spawn --label impl - <<'EOF'
-<work order>
+<goal, constraints, anchors, verification>
 EOF
 ```
 
@@ -67,15 +69,15 @@ EOF
   thread".
 - Labels are scoped to the project root (nearest `.jj`/`.git` walking up from
   the shell's cwd, so any subdirectory of the project reaches the same labels)
-  and to this Claude Code session — another
-  session's labels are invisible to `send` and can't collide with yours. After
-  the user resumes a session, `send` transparently adopts the old session's
-  label and resumes its thread; if it instead fails with "belongs to live
-  session", pick a different label.
+  and to this Claude Code session — another session's labels are invisible to
+  `send` and can't collide with yours. After the user resumes a session,
+  `send` transparently adopts the old session's label and resumes its thread;
+  if it instead fails with "belongs to live session", pick a different label.
 - Follow-ups and course corrections go to the same thread:
   `ception send impl "..."`. If the turn is still running this steers it and
-  returns immediately; if idle it starts a new turn and blocks. Steer only on
-  observed divergence, not to hover.
+  returns immediately; if idle it starts a new turn and blocks. Steer on
+  observed divergence — steering is cheap and reliably lands — but don't
+  hover.
 - Peek mid-run without ingesting reasoning spam:
   `grep -E '^\[(cmd|edit|mcp|msg)\]' <logpath> | tail -20`. The full log
   (including reasoning) is for the user, who may be tailing it.
@@ -85,9 +87,10 @@ EOF
 
 ## After completion
 
-Review the diff adversarially (`jj diff` / `git diff`) — treat the output as
-untrusted. Run the verification commands yourself; don't take the report's
-word for it. For fixes, prefer `ception send <label>` with specific corrective
-instructions ("in lib/foo.mjs:40, X happens; make it do Y") over re-explaining
-the task — the thread retains its context. Escalate to doing it yourself when
-a second corrective pass doesn't land.
+Review the diff (`jj diff` / `git diff`) against the user's intent — that is
+the gap GPT cannot close itself. Run the verification commands yourself;
+don't take the report's word for it. GPT is highly corrigible: a corrective
+`send` naming the observed divergence ("in lib/foo.mjs:40, X happens; make it
+do Y") reliably lands, and the thread retains its context — iterate there
+rather than redoing the work yourself. Take over only when the remaining gap
+is taste you can't put into words.
