@@ -20,15 +20,18 @@ ception kill worker
 
 `spawn` starts a fresh Codex thread and prints the log path on its first line.
 `send` reuses the live daemon, or transparently respawns it (resuming the
-stored thread and the original `--model`/`--effort`/sandbox options) if the
-daemon died. If a turn is already running, `send` steers that in-flight turn
-and exits immediately; the client that started the turn still blocks until
+stored thread and the original `--model`/`--effort` options) if the daemon
+died. If a turn is already running, `send` steers that in-flight turn and
+exits immediately; the client that started the turn still blocks until
 completion and delivers the report.
 
-Flags on `spawn`: `--cwd`, `--model`, `--effort`, `--read-only` /
-`--full-access` (default is a workspace-write sandbox; approvals are always
-disabled), `--report brief|items|full`. Model settings default to
-`~/.codex/config.toml`.
+Flags on `spawn`: `--cwd`, `--model`, `--effort`, `--report brief|items|full`.
+Model settings default to `~/.codex/config.toml`.
+
+Codex always runs with full access and approvals disabled; `ception` is meant
+for environments (dev containers) where Claude Code itself runs unsandboxed.
+There is no sandbox knob. If Codex ever sends an approval request anyway, the
+daemon rejects it and fails the turn with exit code 4.
 
 Report levels: `brief` (final message + status/files/tokens footer, default),
 `items` (adds one line per command/edit/tool call), `full` (everything the log

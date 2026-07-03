@@ -18,7 +18,7 @@ function usage(message) {
     console.error(message);
   }
   console.error(`usage:
-  ception spawn --label L [--cwd D] [--model M] [--effort E] [--read-only | --full-access] [--report brief|items|full] [PROMPT | -]
+  ception spawn --label L [--cwd D] [--model M] [--effort E] [--report brief|items|full] [PROMPT | -]
   ception send L [--report brief|items|full] [PROMPT | -]
   ception interrupt L
   ception kill L | --all
@@ -32,19 +32,6 @@ function normalizeReport(report) {
     throw new UsageError(`invalid --report ${value}`);
   }
   return value;
-}
-
-function sandboxFromOptions(values) {
-  if (values["read-only"] && values["full-access"]) {
-    throw new UsageError("--read-only and --full-access are mutually exclusive");
-  }
-  if (values["read-only"]) {
-    return "read-only";
-  }
-  if (values["full-access"]) {
-    return "danger-full-access";
-  }
-  return "workspace-write";
 }
 
 class UsageError extends Error {
@@ -102,8 +89,6 @@ async function main(argv) {
           cwd: { type: "string" },
           model: { type: "string" },
           effort: { type: "string" },
-          "read-only": { type: "boolean" },
-          "full-access": { type: "boolean" },
           report: { type: "string" }
         }
       });
@@ -118,7 +103,6 @@ async function main(argv) {
         prompt,
         model: values.model,
         effort: values.effort,
-        sandbox: sandboxFromOptions(values),
         report: normalizeReport(values.report)
       });
       return;

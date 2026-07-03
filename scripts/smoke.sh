@@ -12,8 +12,8 @@ ception() {
   node "$repo/bin/ception.mjs" "$@"
 }
 
-echo "== spawn (read-only, trivial prompt) =="
-ception spawn --label "$label" --cwd "$scratch" --read-only \
+echo "== spawn (trivial prompt) =="
+ception spawn --label "$label" --cwd "$scratch" \
   "Reply with exactly the single word: pong. Do not run any commands."
 
 echo

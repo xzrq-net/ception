@@ -207,7 +207,7 @@ test("dead daemon plus stored thread respawns and resumes", async (t) => {
   assert.ok(fakeState.requests.some((request) => request.method === "thread/resume"));
 });
 
-test("server-initiated request is rejected and warning reaches client and log", async (t) => {
+test("server-initiated request is rejected and fails the turn", async (t) => {
   const ctx = await makeEnv("server-request");
   t.after(() => cleanup(ctx));
 
@@ -215,17 +215,18 @@ test("server-initiated request is rejected and warning reaches client and log", 
     env: ctx.env,
     cwd: ctx.project
   });
-  assert.equal(result.code, 0, result.stderr);
-  assert.match(result.stdout, /warning: unsupported app-server request/);
+  assert.equal(result.code, 4, result.stdout);
+  assert.match(result.stderr, /codex sent item\/commandExecution\/requestApproval/);
 
   const stateFiles = await fs.readdir(path.join(ctx.home, ".local", "state", "ception"));
   const projectStateName = stateFiles.find((name) => name.endsWith(".json"));
   const projectState = await readJson(path.join(ctx.home, ".local", "state", "ception", projectStateName));
   const log = await fs.readFile(projectState.labels.approval.logPath, "utf8");
-  assert.match(log, /\[warning\] unsupported app-server request/);
+  assert.match(log, /\[error\] codex sent item\/commandExecution\/requestApproval/);
 
   const fakeState = await readJson(ctx.fakeState);
   assert.equal(fakeState.rejectedRequests, 1);
+  assert.equal(fakeState.interrupts.length, 1);
 });
 
 test("spawn race yields one daemon", async (t) => {
@@ -286,7 +287,7 @@ test("respawn after daemon death preserves spawn-time options", async (t) => {
   t.after(() => cleanup(ctx));
 
   const spawned = await runCeption(
-    ["spawn", "--label", "opts", "--model", "gpt-fixture", "--effort", "low", "--full-access", "first"],
+    ["spawn", "--label", "opts", "--model", "gpt-fixture", "--effort", "low", "first"],
     { env: ctx.env, cwd: ctx.project }
   );
   assert.equal(spawned.code, 0, spawned.stderr);

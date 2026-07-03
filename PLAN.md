@@ -56,8 +56,8 @@ provides wake-on-completion.
   Codex persists rollouts itself, so resume needs no state on our side beyond
   the thread id.
 - Server-initiated requests (e.g. approval requests; should not occur since we
-  set `approvalPolicy: "never"`): respond with a JSON-RPC error (`-32601`) and
-  write a prominent warning to the log and to the active client.
+  set `approvalPolicy: "never"`): respond with a JSON-RPC error (`-32601`),
+  interrupt and fail the active turn, and log the request prominently.
 - Unknown notification methods must never crash anything; log them at debug
   level as raw JSON.
 
@@ -110,8 +110,7 @@ README.md            short usage doc
 
 ```
 ception spawn --label L [--cwd D] [--model M] [--effort E]
-              [--read-only | --full-access] [--report brief|items|full]
-              [PROMPT | -]
+              [--report brief|items|full] [PROMPT | -]
 ception send  L [--report brief|items|full] [PROMPT | -]
 ception interrupt L
 ception kill  L | --all
@@ -138,9 +137,10 @@ ception watch L
   threadId, last-used time; `--all` spans all projects; `--json` for machine
   output.
 - `watch`: convenience `tail -f` of the label's log file (spawn `tail -F`).
-- Sandbox flags map to app-server permissions: default `workspace-write`,
-  `--read-only` and `--full-access` as the two alternatives. Always
-  `approvalPolicy: "never"`.
+- No sandbox knob: always `danger-full-access` with `approvalPolicy: "never"`.
+  ception targets environments where Claude Code itself runs unsandboxed
+  (yolo-mode dev containers), so a Codex sandbox would only add in-turn
+  command failures that Codex works around instead of surfacing.
 - `--model` / `--effort` pass through to thread/turn params per the schema;
   when absent, send nothing so `~/.codex/config.toml` governs.
 
@@ -156,9 +156,9 @@ JSONL both ways. Client sends exactly one command object, e.g.
 `{ "cmd": "turn", "prompt": "...", "report": "brief" }`, then reads events
 until a terminal object, then closes. Commands: `turn`, `steer`, `interrupt`,
 `status`, `shutdown`. Daemon responses are objects like
-`{ "type": "item", ... }` (only at report levels that need them),
-`{ "type": "warning", ... }`, and a terminal
-`{ "type": "result", status, report }` or `{ "type": "error", message }`.
+`{ "type": "item", ... }` (only at report levels that need them) and a
+terminal `{ "type": "result", status, report }` or
+`{ "type": "error", message }`.
 Multiple concurrent client connections must be safe: one turn at a time per
 daemon; a `turn` command while a turn is active is rejected with a clear error
 telling the caller to use steer or wait.
@@ -233,8 +233,8 @@ daemon must honor that override. Cover at least:
 3. `send` during an active turn issues `turn/steer` and exits immediately;
    the original blocked client still completes.
 4. Daemon dead + stored threadId: `send` respawns and issues `thread/resume`.
-5. Unexpected server-initiated request is rejected with `-32601` and a
-   warning reaches the client and the log.
+5. Unexpected server-initiated request is rejected with `-32601`, the turn
+   fails, and the error reaches the client and the log.
 6. Spawn race: two concurrent spawns for one label yield one daemon.
 7. Claude-pid watch: daemon given a watched pid exits shortly after that
    process dies (use a scratch child process as the fake Claude).
@@ -249,7 +249,7 @@ run by the user, not by CI or tests.
 - No Claude-side skill/prompt authoring (`skills/` is written separately).
 - No MCP server mode, no broker shared across labels, no TUI.
 - No macOS/Windows support.
-- No handling of Codex approval flows beyond auto-reject-and-warn.
+- No handling of Codex approval flows beyond auto-reject-and-fail-the-turn.
 - No log rotation.
 
 ## Acceptance criteria
