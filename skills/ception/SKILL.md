@@ -96,8 +96,9 @@ EOF
 On long turns Codex may auto-compact its context mid-turn. Sometimes the model
 comes out of compaction with amnesia: it re-acknowledges its instructions
 ("Instructions loaded.") and ends the turn without doing further work. The
-daemon detects this signature (compaction followed by no work items) and
-reports the turn as **failed / exit 2** with a warning in the report body.
+daemon detects this signature (a post-compaction final message consisting only
+of the instruction-loading acknowledgement) and reports the turn as **failed /
+exit 2** with a warning in the report body.
 Pre-compaction work is real and on disk — check the diff — it's just
 unreported. Recovery: `ception send <label>` with a resume prompt pointing at
 the diff and the agent's notes file; this reliably picks the work back up.
