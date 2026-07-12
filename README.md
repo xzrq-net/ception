@@ -150,3 +150,17 @@ along with their log files.
 `npm test` runs the suite against `test/fake-appserver.mjs`; no network or
 codex auth needed. `scripts/smoke.sh` is a manual end-to-end check against
 real codex.
+
+### Deploying local work
+
+The live install is the clone at `~/.claude/skills/ception`, whose `origin`
+points at this working repo. To ship commits:
+
+```sh
+jj bookmark set master -r <rev>   # point master at what should ship
+git -C ~/.claude/skills/ception pull --ff-only
+```
+
+New invocations pick up `bin/` and skill changes immediately; daemons that
+are already running keep their old code until they exit. `/reload-plugins`
+refreshes other plugin components without restarting the session.
