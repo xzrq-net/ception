@@ -1,3 +1,5 @@
+(project is 100% vibe coded btw)
+
 # ception
 
 `ception` lets Claude Code run OpenAI Codex as a named, long-lived subagent.
