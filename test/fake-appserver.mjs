@@ -32,7 +32,11 @@ function loadState() {
 
 function saveState(state) {
   fs.mkdirSync(path.dirname(STATE_PATH), { recursive: true });
-  fs.writeFileSync(STATE_PATH, `${JSON.stringify(state, null, 2)}\n`);
+  // Atomic rename: tests (and sibling fake instances) poll this file and must
+  // never see a partial write. pid-suffixed so concurrent fakes don't collide.
+  const tempPath = `${STATE_PATH}.${process.pid}.tmp`;
+  fs.writeFileSync(tempPath, `${JSON.stringify(state, null, 2)}\n`);
+  fs.renameSync(tempPath, STATE_PATH);
 }
 
 function updateState(fn) {
