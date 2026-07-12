@@ -8,6 +8,7 @@ import {
   cliList,
   cliSend,
   cliSpawn,
+  cliSpawnOrphan,
   cliWatch
 } from "../lib/client.mjs";
 import { runDaemon } from "../lib/daemon.mjs";
@@ -79,6 +80,11 @@ async function main(argv) {
 
   if (command === "daemon") {
     await runDaemon(rest);
+    return;
+  }
+
+  if (command === "spawn-orphan") {
+    await cliSpawnOrphan(rest);
     return;
   }
 

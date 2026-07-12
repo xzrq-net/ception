@@ -89,6 +89,12 @@ tail any session's log.
 
 ## Daemon lifecycle
 
+The daemon is spawned through an intermediate process that exits immediately,
+so the daemon reparents to init before the spawning client blocks on the
+turn. Killing that client — including a kill of its whole process tree, which
+is what Claude Code does when it stops a background shell — costs only the
+report; the daemon and its turn keep running.
+
 A daemon exits when any of these fires:
 
 - **Claude ancestor watch**: at spawn, the client locates the Claude Code

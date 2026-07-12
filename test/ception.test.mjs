@@ -321,6 +321,49 @@ test("interrupted turn maps to exit code 3", async (t) => {
   assert.match(completed.stdout, /status: interrupted/);
 });
 
+test("daemon is reparented at spawn and survives spawn client death mid-turn", async (t) => {
+  const ctx = await makeEnv("steer");
+  t.after(() => cleanup(ctx));
+
+  const first = spawnCeption(["spawn", "--label", "orphan", "slow turn"], {
+    env: ctx.env,
+    cwd: ctx.project
+  });
+
+  await waitFor(async () => {
+    const state = await readJson(ctx.fakeState, {});
+    return state.lastTurnStarts?.length === 1;
+  });
+
+  // The daemon must already be out of the client's process tree.
+  const projectState = await readProjectState(ctx);
+  const entry = projectState.sessions[ctx.sessionKey].labels.orphan;
+  const log = await fs.readFile(entry.logPath, "utf8");
+  const daemonPid = Number(log.match(/^\[daemon\] starting .* pid=(\d+)$/m)[1]);
+  const stat = await fs.readFile(`/proc/${daemonPid}/stat`, "utf8");
+  const ppid = Number(stat.slice(stat.lastIndexOf(")") + 2).split(/\s+/)[1]);
+  assert.notEqual(ppid, first.child.pid);
+
+  first.child.kill("SIGKILL");
+  await first.done;
+
+  // The turn is still running daemon-side; steer it to completion.
+  const steered = await runCeption(["send", "orphan", "add steering"], {
+    env: ctx.env,
+    cwd: ctx.project,
+    timeoutMs: 3000
+  });
+  assert.equal(steered.code, 0, steered.stderr);
+  assert.match(steered.stdout, /steered active turn/);
+
+  const row = await waitFor(async () => {
+    const listed = await runCeption(["list", "--json"], { env: ctx.env, cwd: ctx.project });
+    const found = JSON.parse(listed.stdout).find((candidate) => candidate.label === "orphan");
+    return found?.status === "idle" ? found : null;
+  });
+  assert.equal(row?.status, "idle");
+});
+
 test("respawn after daemon death preserves spawn-time options", async (t) => {
   const ctx = await makeEnv("happy");
   t.after(() => cleanup(ctx));
