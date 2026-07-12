@@ -57,6 +57,14 @@ Report levels: `brief` (final message + status/files/tokens/duration footer, def
 `items` (adds one line per command/edit/tool call), `full` (everything the log
 gets, including reasoning). The log file always receives the full stream.
 
+`watch` attaches to the daemon and blocks until the current turn completes,
+delivering the turn's report and exit code just as a spawn/send client would —
+the reattach tool when that client was killed mid-turn. The report level is
+the watcher's own `--report` (default `brief`), not the original client's. On an idle
+daemon it prints `no active turn` and exits 0 immediately; with no live daemon
+it fails with exit 4 (recovery is `send`, which respawns and resumes).
+`watch --follow` instead tails the raw log indefinitely, for humans.
+
 Exit codes: `0` turn completed (or steer/interrupt accepted), `2` turn failed,
 `3` turn interrupted, `4` usage or infrastructure error.
 
@@ -84,8 +92,9 @@ rather than share the rollout.
 `interrupt` and `kill` act only on the calling session's daemons; `kill --all`
 kills the calling session's daemons for the current project. `list` shows all
 sessions' labels for the project (`list --all` for every project), with a
-`session` column of `mine`, a live session key, or `adoptable`. `watch` may
-tail any session's log.
+`session` column of `mine`, a live session key, or `adoptable`. `watch`
+attaches only to the calling session's daemon; `watch --follow` may tail any
+session's log.
 
 ## Daemon lifecycle
 
@@ -115,7 +124,7 @@ along with their log files.
 ## Files
 
 - Logs: `~/.local/state/ception/logs/<cwdhash>-<session>-<label>.log` (tail
-  with `ception watch LABEL`)
+  with `ception watch --follow LABEL`)
 - State (session → label → thread id and options):
   `~/.local/state/ception/<cwdhash>.json`, guarded by a `.lock` file for
   cross-process read-modify-write

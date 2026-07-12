@@ -88,6 +88,12 @@ EOF
   `grep -E '^\[(cmd|edit|mcp|msg)\]' <logpath> | tail -20`. The full log
   (including reasoning) is for the user, who may be tailing it.
 - One turn at a time per label; use separate labels for parallel workstreams.
+- If your spawn/send shell was killed mid-turn (harness kill, user stop), the
+  daemon and its turn keep running. Reattach with `ception watch <label>`: it
+  blocks until the current turn completes and delivers the report and exit
+  code (at its own `--report` level, default brief — pass `--report full` to
+  match a full-report run). Idle daemon: prints `no active turn`, exits 0;
+  no daemon: exit 4, recover with `send`.
 - `ception interrupt <label>` cancels a runaway turn; `ception list` shows
   what's alive.
 

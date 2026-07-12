@@ -447,6 +447,10 @@ rl.on("line", (line) => {
         updateState((state) => {
           state.interrupts.push(message.params);
         });
+        if (BEHAVIOR === "interrupt-reject") {
+          send({ id: message.id, error: { code: -32000, message: "turn no longer active" } });
+          break;
+        }
         send({ id: message.id, result: {} });
         if (activeTurn) {
           completeTurn({

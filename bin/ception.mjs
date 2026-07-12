@@ -24,7 +24,7 @@ function usage(message) {
   ception interrupt L [--cwd D]
   ception kill L | --all [--cwd D]
   ception list [--all] [--json] [--cwd D]
-  ception watch L [--cwd D]
+  ception watch L [--cwd D] [--report brief|items|full] [--follow]
 
 labels are scoped to the project root resolved from the invocation cwd
 (or --cwd); a label spawned with --cwd must be addressed with the same --cwd`);
@@ -197,12 +197,16 @@ async function main(argv) {
         args: rest,
         allowPositionals: true,
         options: {
-          cwd: { type: "string" }
+          cwd: { type: "string" },
+          report: { type: "string" },
+          follow: { type: "boolean" }
         }
       });
       await cliWatch({
         label: requireLabel(positionals[0]),
-        cwd: values.cwd ?? process.cwd()
+        cwd: values.cwd ?? process.cwd(),
+        report: normalizeReport(values.report),
+        follow: Boolean(values.follow)
       });
       return;
     }

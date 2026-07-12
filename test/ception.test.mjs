@@ -364,6 +364,145 @@ test("daemon is reparented at spawn and survives spawn client death mid-turn", a
   assert.equal(row?.status, "idle");
 });
 
+test("watch attaches to the active turn and delivers its report", async (t) => {
+  const ctx = await makeEnv("steer");
+  t.after(() => cleanup(ctx));
+
+  const first = spawnCeption(["spawn", "--label", "peek", "slow turn"], {
+    env: ctx.env,
+    cwd: ctx.project
+  });
+
+  await waitFor(async () => {
+    const state = await readJson(ctx.fakeState, {});
+    return state.lastTurnStarts?.length === 1;
+  });
+
+  const watcher = spawnCeption(["watch", "peek"], { env: ctx.env, cwd: ctx.project });
+  await waitFor(() => watcher.stdout.includes("log: "));
+  await sleep(200);
+
+  const steered = await runCeption(["send", "peek", "add steering"], {
+    env: ctx.env,
+    cwd: ctx.project,
+    timeoutMs: 3000
+  });
+  assert.equal(steered.code, 0, steered.stderr);
+
+  const [starter, watched] = await Promise.all([first.done, watcher.done]);
+  assert.equal(starter.code, 0, starter.stderr);
+  assert.equal(watched.code, 0, watched.stderr);
+  assert.match(watched.stdout, /Steered response/);
+  assert.match(watched.stdout, /files touched:/);
+});
+
+test("watcher of an interrupted turn exits 3", async (t) => {
+  const ctx = await makeEnv("steer");
+  t.after(() => cleanup(ctx));
+
+  const first = spawnCeption(["spawn", "--label", "halt", "slow turn"], {
+    env: ctx.env,
+    cwd: ctx.project
+  });
+  await waitFor(async () => {
+    const state = await readJson(ctx.fakeState, {});
+    return state.lastTurnStarts?.length === 1;
+  });
+
+  const watcher = spawnCeption(["watch", "halt"], { env: ctx.env, cwd: ctx.project });
+  await waitFor(() => watcher.stdout.includes("log: "));
+  await sleep(200);
+
+  assert.equal((await runCeption(["interrupt", "halt"], { env: ctx.env, cwd: ctx.project, timeoutMs: 3000 })).code, 0);
+
+  const [starter, watched] = await Promise.all([first.done, watcher.done]);
+  assert.equal(starter.code, 3, starter.stderr);
+  assert.equal(watched.code, 3, watched.stderr);
+  assert.match(watched.stdout, /status: interrupted/);
+});
+
+test("daemon shutdown settles attached watchers instead of hanging", async (t) => {
+  const ctx = await makeEnv("steer");
+  t.after(() => cleanup(ctx));
+
+  const first = spawnCeption(["spawn", "--label", "doomed", "slow turn"], {
+    env: ctx.env,
+    cwd: ctx.project
+  });
+  await waitFor(async () => {
+    const state = await readJson(ctx.fakeState, {});
+    return state.lastTurnStarts?.length === 1;
+  });
+
+  const watcher = spawnCeption(["watch", "doomed"], { env: ctx.env, cwd: ctx.project });
+  await waitFor(() => watcher.stdout.includes("log: "));
+  await sleep(200);
+
+  assert.equal((await runCeption(["kill", "doomed"], { env: ctx.env, cwd: ctx.project, timeoutMs: 3000 })).code, 0);
+
+  // Interrupt result (3) or shutdown error (4) depending on which settles
+  // the socket first; hanging or "completed" are the failures.
+  const watched = await Promise.race([watcher.done, sleep(4000).then(() => null)]);
+  assert.ok(watched, "watcher did not settle on daemon shutdown");
+  assert.notEqual(watched.code, 0);
+  await first.done;
+});
+
+test("kill shuts the daemon down even when the interrupt is rejected", async (t) => {
+  const ctx = await makeEnv("interrupt-reject");
+  t.after(() => cleanup(ctx));
+
+  const first = spawnCeption(["spawn", "--label", "stubborn", "slow turn"], {
+    env: ctx.env,
+    cwd: ctx.project
+  });
+  await waitFor(async () => {
+    const state = await readJson(ctx.fakeState, {});
+    return state.lastTurnStarts?.length === 1;
+  });
+
+  const watcher = spawnCeption(["watch", "stubborn"], { env: ctx.env, cwd: ctx.project });
+  await waitFor(() => watcher.stdout.includes("log: "));
+  await sleep(200);
+
+  assert.equal((await runCeption(["kill", "stubborn"], { env: ctx.env, cwd: ctx.project, timeoutMs: 4000 })).code, 0);
+
+  const row = await waitFor(async () => {
+    const listed = await runCeption(["list", "--json"], { env: ctx.env, cwd: ctx.project });
+    const found = JSON.parse(listed.stdout).find((candidate) => candidate.label === "stubborn");
+    return found?.status === "dead" ? found : null;
+  });
+  assert.equal(row?.status, "dead");
+
+  const watched = await Promise.race([watcher.done, sleep(4000).then(() => null)]);
+  assert.ok(watched, "watcher did not settle after rejected interrupt");
+  assert.notEqual(watched.code, 0);
+  await first.done;
+});
+
+test("watch on an idle daemon returns immediately", async (t) => {
+  const ctx = await makeEnv("happy");
+  t.after(() => cleanup(ctx));
+
+  assert.equal((await runCeption(["spawn", "--label", "quiet", "first"], { env: ctx.env, cwd: ctx.project })).code, 0);
+
+  const watched = await runCeption(["watch", "quiet"], { env: ctx.env, cwd: ctx.project, timeoutMs: 3000 });
+  assert.equal(watched.code, 0, watched.stderr);
+  assert.match(watched.stdout, /no active turn/);
+});
+
+test("watch without a live daemon fails with exit 4", async (t) => {
+  const ctx = await makeEnv("happy");
+  t.after(() => cleanup(ctx));
+
+  assert.equal((await runCeption(["spawn", "--label", "gone", "first"], { env: ctx.env, cwd: ctx.project })).code, 0);
+  assert.equal((await runCeption(["kill", "gone"], { env: ctx.env, cwd: ctx.project })).code, 0);
+
+  const watched = await runCeption(["watch", "gone"], { env: ctx.env, cwd: ctx.project, timeoutMs: 3000 });
+  assert.equal(watched.code, 4, watched.stdout);
+  assert.match(watched.stderr, /no live daemon/);
+});
+
 test("respawn after daemon death preserves spawn-time options", async (t) => {
   const ctx = await makeEnv("happy");
   t.after(() => cleanup(ctx));
