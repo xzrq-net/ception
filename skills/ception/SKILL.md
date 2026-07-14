@@ -97,21 +97,33 @@ EOF
 - `ception interrupt <label>` cancels a runaway turn; `ception list` shows
   what's alive.
 
-## Known failure mode: mid-turn context compaction
+## When one `spawn` is more than one Codex turn
 
-On long turns Codex may auto-compact its context mid-turn. Sometimes the model
-comes out of compaction with amnesia: it re-acknowledges its instructions
-("Instructions loaded.") and ends the turn without doing further work. The
-daemon detects this signature (a post-compaction final message consisting only
-of the instruction-loading acknowledgement) and reports the turn as **failed /
-exit 2** with a warning in the report body.
-Pre-compaction work is real and on disk — check the diff — it's just
-unreported. Recovery: `ception send <label>` with a resume prompt pointing at
-the diff and the agent's notes file; this reliably picks the work back up.
+Codex sometimes keeps working after a turn ends — with an active thread goal it
+starts follow-on turns by itself, and compaction can do the same. The daemon
+follows the work across those turns and gives you a single report, so normally
+you need not care. Two things make it visible:
+
+- A `compactions: N` line in the footer means the model spent part of the run
+  working from a summary. Verify that report against the diff more carefully
+  than usual.
+- **A label showing `active` in `ception list` after you already got its
+  report.** Codex started another turn later than the daemon waited. Your
+  report covers only part of the run and the rest is still happening. Attach
+  with `ception watch <label>` — but if the continuation already finished,
+  `watch` says `no active turn` and only the log has the rest, so check the log
+  before concluding nothing happened. Do not start new work on that label, and
+  do not assume the working copy is quiescent, until it is idle.
+
+One residual failure: a turn reported **failed** with an
+`Instructions loaded.` warning means compaction wiped the context instead of
+summarising it and the turn stopped. Work done before it is on disk but
+unreported — check the diff, then `ception send <label>` with a resume prompt
+pointing at the diff and the agent's notes file. Confirm the label is idle
+first; sending into a live continuation steers it instead of resuming.
+
 Prevention: scope each turn small (one gate/phase per turn) and have the agent
-commit and update notes at intermediate milestones. A `compactions: N` line in
-the report footer means compaction happened even if the turn survived it —
-treat the report with extra suspicion and verify against the diff.
+commit and update notes at intermediate milestones.
 
 ## After completion
 

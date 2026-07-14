@@ -692,3 +692,66 @@ test("gc drops stale labels of dead sessions and their logs", async (t) => {
   assert.ok(rows.find((row) => row.label === "keep"));
   assert.equal(await fs.access(staleLog).then(() => true, () => false), false);
 });
+
+test("a compacted turn that continues in a new turn reports the continuation's result", async (t) => {
+  const ctx = await makeEnv("continuation");
+  t.after(() => cleanup(ctx));
+
+  const spawned = await runCeption(["spawn", "--label", "cont", "do the work"], {
+    env: ctx.env,
+    cwd: ctx.project
+  });
+
+  // Without continuation tracking this exits 2 with the bare acknowledgement.
+  assert.equal(spawned.code, 0);
+  assert.match(spawned.stdout, /Continued past the compaction and finished the work\./);
+  assert.doesNotMatch(spawned.stdout, /Instructions loaded/);
+  assert.match(spawned.stdout, /compactions: 1/);
+});
+
+test("an unattended continuation turn is adopted so watch and list can see it", async (t) => {
+  const ctx = await makeEnv("continuation");
+  t.after(() => cleanup(ctx));
+
+  // Grace window shorter than the continuation delay: the client is released
+  // before codex starts the follow-on turn, exactly as it happened in the wild.
+  const env = { ...ctx.env, CEPTION_CONTINUATION_GRACE_MS: "20", CEPTION_FAKE_CONTINUATION_DELAY_MS: "400" };
+  const spawned = await runCeption(["spawn", "--label", "orphan", "do the work"], { env, cwd: ctx.project });
+  assert.match(spawned.stdout, /Instructions loaded/);
+
+  await sleep(500);
+  const listed = await runCeption(["list", "--json"], { env, cwd: ctx.project });
+  const row = JSON.parse(listed.stdout).find((entry) => entry.label === "orphan");
+  const logText = await fs.readFile(row.logPath, "utf8");
+  assert.match(logText, /adopted an unattended continuation turn/);
+  assert.match(logText, /Continued past the compaction and finished the work\./);
+  assert.doesNotMatch(logText, /unknown notification.*turn\/started/);
+});
+
+test("an active goal holds the report across codex's self-started follow-on turn", async (t) => {
+  const ctx = await makeEnv("goal-continuation");
+  t.after(() => cleanup(ctx));
+
+  const spawned = await runCeption(["spawn", "--label", "goal", "do the work"], {
+    env: ctx.env,
+    cwd: ctx.project
+  });
+
+  // The first physical turn ends with "First half done." while the goal is
+  // still active; only the continuation's answer should reach the client.
+  assert.equal(spawned.code, 0);
+  assert.match(spawned.stdout, /Goal continuation finished the work\./);
+  assert.doesNotMatch(spawned.stdout, /First half done\./);
+});
+
+test("a goal that stops being active settles the turn without waiting out the grace window", async (t) => {
+  const ctx = await makeEnv("happy");
+  t.after(() => cleanup(ctx));
+
+  // happy behaviour emits no goal at all, so nothing should be held back.
+  const env = { ...ctx.env, CEPTION_GOAL_GRACE_MS: "60000" };
+  const started = Date.now();
+  const spawned = await runCeption(["spawn", "--label", "nogoal", "do the work"], { env, cwd: ctx.project });
+  assert.equal(spawned.code, 0);
+  assert.ok(Date.now() - started < 8000, "a goal-less turn must not pay the continuation grace window");
+});

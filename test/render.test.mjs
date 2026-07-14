@@ -95,3 +95,33 @@ test("only the final compaction's subsequent message determines derailment", () 
   assert.equal(turn.status, "completed");
   assert.equal(turn.derailedByCompaction, false);
 });
+
+test("a long final message survives every report level, full included", () => {
+  const turn = accumulator();
+  const long = `${"x".repeat(6000)}END`;
+  completeItem(turn, { id: "message", type: "agentMessage", text: long });
+  completeTurn(turn);
+
+  for (const level of ["brief", "items", "full"]) {
+    const report = turn.buildReport(level);
+    assert.ok(report.includes(long), `${level} report dropped part of the final message`);
+    assert.ok(!report.includes("…"), `${level} report still carries a truncation marker`);
+  }
+});
+
+test("adopting a continuation clears the derailed verdict from the compacted half", () => {
+  const turn = accumulator();
+  completeItem(turn, { id: "compaction", type: "contextCompaction" });
+  completeItem(turn, { id: "ack", type: "agentMessage", text: "Instructions loaded for `/repo`." });
+  completeTurn(turn);
+  assert.equal(turn.status, "failed");
+
+  turn.adoptContinuation("turn-2");
+  completeItem(turn, { id: "real", type: "agentMessage", text: "Actually finished the work." });
+  completeTurn(turn);
+
+  assert.equal(turn.status, "completed");
+  assert.equal(turn.derailedByCompaction, false);
+  assert.match(turn.buildReport("brief"), /Actually finished the work\./);
+  assert.match(turn.buildReport("brief"), /compactions: 1/);
+});

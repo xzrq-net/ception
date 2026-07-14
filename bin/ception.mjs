@@ -78,6 +78,14 @@ function requireLabel(label) {
 async function main(argv) {
   const [command, ...rest] = argv;
 
+  // `spawn --help` used to die on parseArgs' positional advice. Only honour
+  // the flag before `--`, so it stays usable as prompt text after it.
+  const flagArgs = rest.slice(0, rest.indexOf("--") === -1 ? rest.length : rest.indexOf("--"));
+  if (flagArgs.includes("--help") || flagArgs.includes("-h")) {
+    usage();
+    return;
+  }
+
   if (command === "daemon") {
     await runDaemon(rest);
     return;

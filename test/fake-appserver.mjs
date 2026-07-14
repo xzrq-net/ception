@@ -261,6 +261,120 @@ function startLongTurn(threadId, turnId, prompt) {
   });
 }
 
+// Reproduces the observed compaction shape: codex closes the turn with a bare
+// instruction acknowledgement, then continues the real work in a fresh turn.
+function startCompactedTurn(threadId, turnId) {
+  send({ method: "turn/started", params: { threadId, turn: buildTurn(turnId) } });
+  send({
+    method: "item/completed",
+    params: {
+      threadId,
+      turnId,
+      completedAtMs: Date.now(),
+      item: { type: "contextCompaction", id: `compact_${turnId}` }
+    }
+  });
+  send({
+    method: "item/completed",
+    params: {
+      threadId,
+      turnId,
+      completedAtMs: Date.now(),
+      item: {
+        type: "agentMessage",
+        id: `msg_${turnId}`,
+        text: "Instructions loaded for `/repo`.",
+        phase: "final_answer",
+        memoryCitation: null
+      }
+    }
+  });
+  send({ method: "turn/completed", params: { threadId, turn: buildTurn(turnId, "completed", null) } });
+
+  const continuationId = nextTurn();
+  setTimeout(() => {
+    activeTurn = { threadId, turnId: continuationId, prompt: "" };
+    send({ method: "turn/started", params: { threadId, turn: buildTurn(continuationId) } });
+    send({
+      method: "item/completed",
+      params: {
+        threadId,
+        turnId: continuationId,
+        completedAtMs: Date.now(),
+        item: {
+          type: "agentMessage",
+          id: `msg_${continuationId}`,
+          text: "Continued past the compaction and finished the work.",
+          phase: "final_answer",
+          memoryCitation: null
+        }
+      }
+    });
+    send({ method: "thread/tokenUsage/updated", params: { threadId, turnId: continuationId, tokenUsage: tokenUsage() } });
+    send({ method: "turn/completed", params: { threadId, turn: buildTurn(continuationId, "completed", null) } });
+    activeTurn = null;
+  }, Number(process.env.CEPTION_FAKE_CONTINUATION_DELAY_MS ?? 150));
+}
+
+// The real cross-turn mechanism: an active thread goal makes codex start a
+// follow-on turn by itself once the thread goes idle.
+function startGoalTurn(threadId, turnId) {
+  const goal = (status) => ({
+    method: "thread/goal/updated",
+    params: {
+      threadId,
+      turnId,
+      goal: {
+        threadId,
+        objective: "Finish the fixture work",
+        status,
+        tokenBudget: null,
+        tokensUsed: 100,
+        timeUsedSeconds: 1,
+        createdAt: 0,
+        updatedAt: 0
+      }
+    }
+  });
+  send({ method: "turn/started", params: { threadId, turn: buildTurn(turnId) } });
+  send(goal("active"));
+  send({
+    method: "item/completed",
+    params: {
+      threadId,
+      turnId,
+      completedAtMs: Date.now(),
+      item: { type: "agentMessage", id: `msg_${turnId}`, text: "First half done.", phase: "final_answer", memoryCitation: null }
+    }
+  });
+  send({ method: "turn/completed", params: { threadId, turn: buildTurn(turnId, "completed", null) } });
+
+  const continuationId = nextTurn();
+  setTimeout(() => {
+    activeTurn = { threadId, turnId: continuationId, prompt: "" };
+    send({ method: "turn/started", params: { threadId, turn: buildTurn(continuationId) } });
+    send({
+      method: "item/completed",
+      params: {
+        threadId,
+        turnId: continuationId,
+        completedAtMs: Date.now(),
+        item: {
+          type: "agentMessage",
+          id: `msg_${continuationId}`,
+          text: "Goal continuation finished the work.",
+          phase: "final_answer",
+          memoryCitation: null
+        }
+      }
+    });
+    send({ method: "thread/tokenUsage/updated", params: { threadId, turnId: continuationId, tokenUsage: tokenUsage() } });
+    send({ method: "thread/goal/updated", params: { threadId, turnId: continuationId, goal: { ...goal("complete").params.goal } } });
+    send({ method: "turn/completed", params: { threadId, turn: buildTurn(continuationId, "completed", null) } });
+    activeTurn = null;
+  }, Number(process.env.CEPTION_FAKE_CONTINUATION_DELAY_MS ?? 150));
+}
+
 function sendUnsupportedRequest(threadId, turnId) {
   send({
     id: requestId++,
@@ -400,6 +514,14 @@ rl.on("line", (line) => {
         send({ id: message.id, result: { turn: buildTurn(turnId) } });
         if (BEHAVIOR === "steer" || prompt.includes("slow")) {
           startLongTurn(message.params.threadId, turnId, prompt);
+          break;
+        }
+        if (BEHAVIOR === "continuation") {
+          startCompactedTurn(message.params.threadId, turnId);
+          break;
+        }
+        if (BEHAVIOR === "goal-continuation") {
+          startGoalTurn(message.params.threadId, turnId);
           break;
         }
         if (BEHAVIOR === "fail") {

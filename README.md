@@ -57,7 +57,10 @@ daemon rejects it and fails the turn with exit code 4.
 
 Report levels: `brief` (final message + status/files/tokens/duration footer, default),
 `items` (adds one line per command/edit/tool call), `full` (everything the log
-gets, including reasoning). The log file always receives the full stream.
+gets, including reasoning). The final message is never truncated at any level.
+The log file receives every item, but caps the bulky ones — reasoning at 4000
+characters, command output at 1600 — so it is a full trace, not a full
+transcript.
 
 `watch` attaches to the daemon and blocks until the current turn completes,
 delivering the turn's report and exit code just as a spawn/send client would —
@@ -97,6 +100,36 @@ sessions' labels for the project (`list --all` for every project), with a
 `session` column of `mine`, a live session key, or `adoptable`. `watch`
 attaches only to the calling session's daemon; `watch --follow` may tail any
 session's log.
+
+## Turns vs. runs
+
+A physical turn ending is not the same as the work being done. When codex has
+an **active thread goal** it starts follow-on turns by itself: `turn/completed`
+fires, the thread goes idle, and the goal runtime immediately starts another
+turn on the same thread. Reporting on the first `turn/completed` is how a turn
+can be reported finished while codex goes on spending tokens and editing files.
+
+The daemon therefore tracks goal status from `thread/goal/updated`. While the
+goal is `active` a completed turn does not settle: the clients stay attached
+and the accumulated report carries over, so a `spawn`/`send` blocks until the
+whole run is done and returns one report. Any non-`active` status (`complete`,
+`paused`, `blocked`, `usageLimited`, `budgetLimited`) settles it at once.
+`CEPTION_GOAL_GRACE_MS` is only a safety net for a goal that stalls without a
+status change; turns with no goal pay nothing.
+
+A continuation that still arrives after everything has settled is adopted
+anyway, without its original clients — `list` shows the label active and
+`watch` can attach — so an in-flight turn is never invisible.
+
+Compacted turns get the same treatment on a shorter
+`CEPTION_CONTINUATION_GRACE_MS` window. Current codex compacts within a single
+turn, so this is a fallback for the cross-turn shape seen on older
+app-servers. If a compacted turn ends with nothing but codex's
+`Instructions loaded for <path>.` acknowledgement, the report is marked failed
+(exit 2) with a warning: work done before the compaction is on disk but
+unreported, and `send` resumes it. That signature came from
+`experimental token_budget` clearing context on autocompaction instead of
+summarising it, and should not recur.
 
 ## Daemon lifecycle
 
@@ -144,6 +177,11 @@ along with their log files.
   through an npx download).
 - `CEPTION_GC_DAYS` — age before dead-session state entries and logs are
   collected, default 7.
+- `CEPTION_GOAL_GRACE_MS` — with an active thread goal, how long a completed
+  turn waits for codex's follow-on turn before settling anyway, default 30000.
+  A goal status change settles it sooner; turns with no goal never wait.
+- `CEPTION_CONTINUATION_GRACE_MS` — same, for the compacted-turn fallback,
+  default 2000.
 - `CEPTION_WATCH_PID` / `CEPTION_WATCH_STARTTIME` — bypass ancestor detection
   and watch this process instead (used by tests; also pins the session key).
 
