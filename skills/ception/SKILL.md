@@ -1,6 +1,6 @@
 ---
 name: ception
-description: Delegate implementation work to OpenAI Codex (GPT) running as a named background subagent. GPT is a frontier-class implementor — delegate anything whose intent you can put in writing, hard or mechanical, to keep the token churn out of your own context. Keep only decisions that need the user context in your head.
+description: Delegate implementation, investigation, and review work to OpenAI Codex (GPT) running as a named background subagent. GPT is a frontier-class implementor — delegate anything whose intent you can put in writing, hard or mechanical, to keep the token churn out of your own context. Keep only decisions that need the user context in your head.
 ---
 
 # ception: Codex as a subagent
@@ -17,8 +17,9 @@ absorb a process breakdown.
 
 ## Division of labor
 
-GPT is a peer intellect with one structural deficit: it does not share your
-conversation, so it cannot infer the user's intent or taste. Everything else —
+GPT on the default model is a peer intellect with one structural deficit: it
+does not share your conversation, so it cannot infer the user's intent or
+taste. Everything else —
 gnarly debugging, subtle algorithms, wide refactors, migrations, test design,
 performance hunts — is in scope. Do not reserve hard work for yourself out of
 capability doubt; reserve it only when the intent can't be transferred.
@@ -29,31 +30,63 @@ the user would object to. Keep for yourself:
 - decisions that need judgment built up in this session, or a read on the
   user you can't articulate
 - tasks where writing the intent down costs as much as doing the work
-- the final review — always, because the failure mode is misread intent, not
-  incompetence
+- the final review — always, because the handoff must catch both misread
+  intent and ordinary implementation error
 
 ## How to prompt GPT
 
-The prompt must carry everything; there is no shared context.
+GPT does not share your conversation or tool results, but it does get the
+repo: its own instructions, the target's `AGENTS.md`, and a working copy it
+can inspect. Transfer what it cannot recover — goal, decisions already made,
+constraints — and don't paste discoverable repo context. On `send`, give only
+the delta; the thread retains everything earlier.
 
 - Lead with the actual goal and what the work feeds into — the *why* is what
   lets it make correct micro-decisions on its own.
-- Concrete anchors: file paths, function names, and a verification command to
-  run ("run `npm test`; all tests must pass").
+- Name the work mode and stopping point: "review and report; do not edit",
+  "diagnose only", "implement and verify". Review and diagnosis are treated
+  as read-only unless you ask for the fix; say whether commits are wanted.
+- Concrete anchors you actually know: file paths, function names, failing
+  tests, a verification command ("run `npm test`; all tests must pass").
+  Guessed anchors are worse than none — if you don't know the repo's checks,
+  ask it to find and run them.
 - Constraints and non-goals explicitly: "do not refactor X", "no new
   dependencies", "do not touch files outside Y/".
 - Latitude is fine and often better than over-specifying: "choose the data
   structure" works. When you leave a decision open, ask it to state in its
   report which way it went and why, so you can check the choice against
-  intent.
+  intent. Say which ambiguities should instead stop the work and come back
+  for direction.
 - Taste is the one thing it cannot infer. Encode it as rules: match the
   surrounding code's comment density and idiom, naming conventions, error
   message style, what counts as too clever.
-- For review work, just say "review": its system prompt has a code-review
-  stance built in (findings first, ordered by severity, file/line refs).
+- For review work, say "review" plus the target and baseline (which branch,
+  diff, or dirty worktree) and whether you want findings only or fixes too.
+  The code-review stance is built in: findings first, ordered by severity,
+  file/line refs.
 
-The user's config defaults to a high reasoning effort. Pass `--effort medium`
-only for truly mechanical bulk; leave it alone for anything with subtlety.
+## Choosing model and effort
+
+GPT-5.6 comes in three SKUs; pick at `spawn` — `send` keeps the label's
+choice, so switching models means a new label:
+
+- `--model gpt-5.6-luna` — preposterously cheap. Use it when the solution is
+  already decided and correctness is mechanically checkable: rote renames,
+  formatting/lint cleanup, boilerplate, repetitive fixtures, narrow edits
+  with deterministic tests. Its failure mode is a plausible patch that
+  misses intent or edge cases, so keep Luna turns small and verifiable. If a
+  Luna task turns into discovery or design, respawn on a bigger model rather
+  than compensating with follow-ups.
+- `--model gpt-5.6-terra` — routine implementation and debugging with a
+  clear goal but real code judgment.
+- unset — the user's configured default (`gpt-5.6-sol`, frontier). Ambiguous
+  behavior, architecture, broad refactors, subtle debugging,
+  security/performance work, adversarial review.
+
+The user's config defaults to a high reasoning effort. Pair Luna with
+`--effort medium` for bounded edits; leave effort alone for anything with
+subtlety. Higher effort is not a substitute for a bigger model when the task
+needs judgment.
 
 ## Operating procedure
 
@@ -69,6 +102,10 @@ EOF
 - The first stdout line (of both `spawn` and `send`) is the log path; the
   final report arrives on completion (message + status/files/tokens/duration footer).
   Exit codes: 0 done, 2 failed, 3 interrupted, 4 infra/usage error.
+- `--report` sets how much of the turn the report carries: `brief` (default)
+  is the final message plus footer, `items` adds the command/edit trail,
+  `full` is everything including reasoning. Use `items` when you'll want to
+  audit what it did without opening the log.
 - If you spawned with `--cwd` pointing outside the current project, pass that
   same `--cwd` to `send`, `interrupt`, `kill`, and `watch` too — without it
   they look in the wrong project and fail with "no live daemon or stored
@@ -88,6 +125,9 @@ EOF
   `grep -E '^\[(cmd|edit|mcp|msg)\]' <logpath> | tail -20`. The full log
   (including reasoning) is for the user, who may be tailing it.
 - One turn at a time per label; use separate labels for parallel workstreams.
+  Labels isolate threads, not files: parallel labels in the same cwd edit the
+  same working copy. Give parallel writers disjoint paths or separate
+  worktrees, and tell each which changes belong to someone else.
 - If your spawn/send shell was killed mid-turn (harness kill, user stop), the
   daemon and its turn keep running. Reattach with `ception watch <label>`: it
   blocks until the current turn completes and delivers the report and exit
@@ -95,7 +135,8 @@ EOF
   match a full-report run). Idle daemon: prints `no active turn`, exits 0;
   no daemon: exit 4, recover with `send`.
 - `ception interrupt <label>` cancels a runaway turn; `ception list` shows
-  what's alive.
+  what's alive. Daemons exit on their own (idle timeout, or this Claude
+  session ending) — `kill` is for stuck ones, not routine cleanup.
 
 ## When one `spawn` is more than one Codex turn
 
@@ -123,7 +164,8 @@ pointing at the diff and the agent's notes file. Confirm the label is idle
 first; sending into a live continuation steers it instead of resuming.
 
 Prevention: scope each turn small (one gate/phase per turn) and have the agent
-commit and update notes at intermediate milestones.
+update notes at intermediate milestones — plus milestone commits where the
+target repo permits agent commits.
 
 ## After completion
 
