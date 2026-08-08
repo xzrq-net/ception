@@ -67,21 +67,20 @@ the delta; the thread retains everything earlier.
 
 ## Choosing model and effort
 
-GPT-5.6 comes in three SKUs; pick at `spawn` — `send` keeps the label's
-choice, so switching models means a new label:
+Pick the model at `spawn` — `send` keeps the label's choice, so switching
+models means a new label:
 
 - `--model gpt-5.6-luna` — preposterously cheap. Use it when the solution is
   already decided and correctness is mechanically checkable: rote renames,
   formatting/lint cleanup, boilerplate, repetitive fixtures, narrow edits
   with deterministic tests. Its failure mode is a plausible patch that
   misses intent or edge cases, so keep Luna turns small and verifiable. If a
-  Luna task turns into discovery or design, respawn on a bigger model rather
-  than compensating with follow-ups.
-- `--model gpt-5.6-terra` — routine implementation and debugging with a
-  clear goal but real code judgment.
-- unset — the user's configured default (`gpt-5.6-sol`, frontier). Ambiguous
-  behavior, architecture, broad refactors, subtle debugging,
-  security/performance work, adversarial review.
+  Luna task turns into discovery or design, respawn on Sol rather than
+  compensating with follow-ups.
+- unset — the user's configured default (`gpt-5.6-sol`, frontier).
+  Everything else: any implementation or debugging needing real code
+  judgment, ambiguity, architecture, broad refactors, security/performance
+  work, adversarial review.
 
 The user's config defaults to a high reasoning effort. Pair Luna with
 `--effort medium` for bounded edits; leave effort alone for anything with
