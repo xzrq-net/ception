@@ -295,24 +295,33 @@ function startCompactedTurn(threadId, turnId) {
   setTimeout(() => {
     activeTurn = { threadId, turnId: continuationId, prompt: "" };
     send({ method: "turn/started", params: { threadId, turn: buildTurn(continuationId) } });
-    send({
-      method: "item/completed",
-      params: {
-        threadId,
-        turnId: continuationId,
-        completedAtMs: Date.now(),
-        item: {
-          type: "agentMessage",
-          id: `msg_${continuationId}`,
-          text: "Continued past the compaction and finished the work.",
-          phase: "final_answer",
-          memoryCitation: null
+    const finish = () => {
+      send({
+        method: "item/completed",
+        params: {
+          threadId,
+          turnId: continuationId,
+          completedAtMs: Date.now(),
+          item: {
+            type: "agentMessage",
+            id: `msg_${continuationId}`,
+            text: "Continued past the compaction and finished the work.",
+            phase: "final_answer",
+            memoryCitation: null
+          }
         }
-      }
-    });
-    send({ method: "thread/tokenUsage/updated", params: { threadId, turnId: continuationId, tokenUsage: tokenUsage() } });
-    send({ method: "turn/completed", params: { threadId, turn: buildTurn(continuationId, "completed", null) } });
-    activeTurn = null;
+      });
+      send({ method: "thread/tokenUsage/updated", params: { threadId, turnId: continuationId, tokenUsage: tokenUsage() } });
+      send({ method: "turn/completed", params: { threadId, turn: buildTurn(continuationId, "completed", null) } });
+      activeTurn = null;
+    };
+    // Optionally keep the continuation running so tests can observe it live.
+    const runMs = Number(process.env.CEPTION_FAKE_CONTINUATION_RUN_MS ?? 0);
+    if (runMs > 0) {
+      setTimeout(finish, runMs);
+    } else {
+      finish();
+    }
   }, Number(process.env.CEPTION_FAKE_CONTINUATION_DELAY_MS ?? 150));
 }
 

@@ -715,13 +715,26 @@ test("an unattended continuation turn is adopted so watch and list can see it", 
 
   // Grace window shorter than the continuation delay: the client is released
   // before codex starts the follow-on turn, exactly as it happened in the wild.
-  const env = { ...ctx.env, CEPTION_CONTINUATION_GRACE_MS: "20", CEPTION_FAKE_CONTINUATION_DELAY_MS: "400" };
+  // The continuation then stays live long enough to observe it from outside.
+  const env = {
+    ...ctx.env,
+    CEPTION_CONTINUATION_GRACE_MS: "20",
+    CEPTION_FAKE_CONTINUATION_DELAY_MS: "400",
+    CEPTION_FAKE_CONTINUATION_RUN_MS: "3000"
+  };
   const spawned = await runCeption(["spawn", "--label", "orphan", "do the work"], { env, cwd: ctx.project });
   assert.match(spawned.stdout, /Instructions loaded/);
 
-  await sleep(500);
+  await sleep(600);
   const listed = await runCeption(["list", "--json"], { env, cwd: ctx.project });
   const row = JSON.parse(listed.stdout).find((entry) => entry.label === "orphan");
+  assert.equal(row.status, "active", "the adopted continuation must show as active in list");
+
+  // watch attaches to the adopted turn and blocks until it completes.
+  const watched = await runCeption(["watch", "orphan"], { env, cwd: ctx.project });
+  assert.equal(watched.code, 0);
+  assert.match(watched.stdout, /Continued past the compaction and finished the work\./);
+
   const logText = await fs.readFile(row.logPath, "utf8");
   assert.match(logText, /adopted an unattended continuation turn/);
   assert.match(logText, /Continued past the compaction and finished the work\./);
