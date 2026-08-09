@@ -13,6 +13,7 @@ import {
   cliWatch
 } from "../lib/client.mjs";
 import { runDaemon } from "../lib/daemon.mjs";
+import { cliQuota } from "../lib/quota.mjs";
 import { validateLabel } from "../lib/state.mjs";
 
 function usage(message) {
@@ -27,6 +28,7 @@ function usage(message) {
   ception interrupt L [--cwd D]
   ception kill L | --all [--cwd D]
   ception list [--all] [--json] [--cwd D]
+  ception quota [--json] [--cwd D]
   ception watch L [--cwd D] [--report brief|items|full] [--follow]
 
 labels are scoped to the project root resolved from the invocation cwd
@@ -232,6 +234,18 @@ async function main(argv) {
         json: Boolean(values.json),
         cwd: values.cwd ?? process.cwd()
       });
+      return;
+    }
+
+    case "quota": {
+      const { values } = parseArgs({
+        args: rest,
+        options: {
+          json: { type: "boolean" },
+          cwd: { type: "string" }
+        }
+      });
+      await cliQuota({ cwd: values.cwd ?? process.cwd(), json: Boolean(values.json) });
       return;
     }
 

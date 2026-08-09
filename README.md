@@ -34,6 +34,7 @@ ception goal worker - < arc.md
 ception goal worker --resume
 ception interrupt worker
 ception list
+ception quota
 ception watch worker
 ception kill worker
 ```
@@ -123,6 +124,25 @@ long arc that may sit stopped unattended.
 Without that, freeing the thread is precisely what makes the goal start the
 next turn, and "interrupt" would not stop the run.
 
+## Quota
+
+`ception quota` reports the account's rate-limit windows — the quota part of
+what codex's `/status` shows interactively:
+
+```
+primary              7d   47% used, resets in 5d 22h (2026-08-15 20:34Z)
+secondary            not reported
+GPT-5.3-Codex-Spark  7d   0% used, resets in 7d 0h (2026-08-16 22:27Z)
+credits              none
+```
+
+`primary` and `secondary` are the server's own slots; which real window lives
+in each changes as OpenAI reshuffles them, so every line carries its own
+length. Per-model limits, credits, and any limit actually reached get rows
+when the account reports them; `--json` prints the raw response. No label, no
+daemon, no tokens spent: a throwaway app-server answers it without disturbing
+running work.
+
 ## Scoping: project × session
 
 Labels are namespaced by **project root** and **session**:
@@ -131,11 +151,18 @@ Labels are namespaced by **project root** and **session**:
   nearest `.jj`/`.git`/`.hg`; without one, the directory itself is the root.
   Running `ception` from a subdirectory therefore hits the same labels as
   running it at the root. `--cwd` overrides the starting point.
-- The session is the Claude Code process the client runs under (pid +
-  starttime). Two concurrent Claude Code sessions in the same project can both
-  use the label `impl` and get independent daemons and independent Codex
-  threads — no shared rollout, ever. Outside Claude Code, all invocations
-  share the `default` session.
+- The session is the **outermost** Claude Code process the client runs under
+  (pid + starttime). Two separately launched Claude Code sessions in the same
+  project can both use the label `impl` and get independent daemons and
+  independent Codex threads. Outside Claude Code, all invocations share the
+  `default` session.
+
+  Outermost because Claude Code nests shorter-lived claude-looking helpers (a
+  transient `claude daemon run`, a forked background session) under the real
+  session; keying on the nearest one would change the session mid-run. The
+  cost: a `claude` launched from inside another session shares its parent's
+  labels and dies with it. Run independent sessions from separate terminals,
+  or pin `CEPTION_WATCH_PID` / `CEPTION_WATCH_STARTTIME`.
 
 **Adoption.** When `send` doesn't find the label in its own session, it looks
 at other sessions' entries for the project. If the owning session is dead

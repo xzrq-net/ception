@@ -125,6 +125,9 @@ EOF
   `ception send impl "..."`. If the turn is still running this steers it and
   returns immediately; if idle it starts a new turn and blocks. Steer on
   observed divergence — steering is cheap and reliably lands — but don't hover.
+- `ception quota` shows the account's rate-limit windows (no label, no tokens).
+  Worth a look before committing to a long arc, and the first thing to check if
+  a run stops with `usageLimited`.
 - Peek mid-run without ingesting reasoning spam:
   `grep -E '^\[(cmd|edit|mcp|msg)\]' <logpath> | tail -20`. The full log
   (including reasoning) is for the user, who may be tailing it.

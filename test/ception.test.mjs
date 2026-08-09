@@ -1025,6 +1025,21 @@ test("a goal met by the turn already running still reports to its client", async
   assert.equal((await running.done).code, 0);
 });
 
+test("quota reports a codex that fails to start instead of exiting clean", async (t) => {
+  const ctx = await makeEnv("happy");
+  t.after(() => cleanup(ctx));
+
+  // Closing a never-spawned app-server used to await an exit that never
+  // comes, and the CLI fell off the event loop reporting success.
+  const result = await runCeption(["quota"], {
+    env: { ...ctx.env, CEPTION_CODEX_CMD: " " },
+    cwd: ctx.project
+  });
+
+  assert.notEqual(result.code, 0);
+  assert.match(`${result.stderr}${result.stdout}`, /CEPTION_CODEX_CMD is empty/);
+});
+
 test("a subagent thread's goal does not settle this thread's run", async (t) => {
   const ctx = await makeEnv("goal-continuation");
   t.after(() => cleanup(ctx));
