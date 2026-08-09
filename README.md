@@ -30,6 +30,8 @@ put the clone's `bin/` on your PATH.
 ception spawn --label worker "inspect this repo"
 ception send worker "continue with the fix"
 ception send worker - < long-prompt.md
+ception goal worker - < arc.md
+ception goal worker --resume
 ception interrupt worker
 ception list
 ception watch worker
@@ -73,6 +75,54 @@ it fails with exit 4 (recovery is `send`, which respawns and resumes).
 Exit codes: `0` turn completed (or steer/interrupt accepted), `2` turn failed,
 `3` turn interrupted, `4` usage or infrastructure error.
 
+## Goals: runs codex drives itself
+
+A **thread goal** is codex's own long-run driver. With one active, codex starts
+turn after turn by itself until the objective is met — no prompt per turn.
+`ception goal` is the whole interface to it:
+
+```sh
+ception goal audit "<the arc: what done looks like>"   # set, and block on the run
+ception goal audit -  < arc.md                          # objective from stdin
+ception goal audit --resume                             # restart a stopped goal
+ception goal audit --pause                              # stop starting new turns
+ception goal audit --show                               # objective + status
+ception goal audit --clear
+```
+
+`goal` with an objective, and `--resume`, behave like `spawn`: they print the
+log path, then block until the run settles and deliver one report covering the
+turns codex ran. Setting a goal while a turn is already running is fine: codex
+steers the objective into the running turn, and the client attaches to it. The
+other forms answer immediately. A goal is enough to start a label —
+`ception goal` on a name that has no daemon yet starts one, and codex works
+from the objective with no opening prompt. Such a label uses the configured
+default model and effort; `spawn` first to choose them.
+
+Goal status is the answer to "is codex done?", and the turn report alone is not:
+
+- `active` — codex will start another turn. The daemon holds the report until
+  this stops being true, or until `CEPTION_GOAL_GRACE_MS` passes with no
+  follow-on turn; that escape hatch is the one way a client returns mid-run
+  (see *Turns vs. runs*).
+- `complete` — the objective is met. This is the only status that means done.
+- `paused`, `blocked`, `usageLimited`, `budgetLimited` — codex stopped short.
+  A turn error blocks the goal (this is how a server-side policy stop lands:
+  the turn fails, `error code:` in the footer names it, and the goal goes
+  `blocked`); rate and budget ceilings have their own statuses.
+
+Every turn report ends with the goal line, and a stopped-short goal also prints
+the `ception goal <label> --resume` that restarts the run. `ception list` has a
+`goal=` column. Resuming keeps the same daemon, app-server and thread, so
+codex's background shells and subagents are exactly where it left them — but a
+stopped goal leaves the daemon idle, so `CEPTION_IDLE_TIMEOUT_SECS` (4h by
+default) is the real deadline for resuming with those intact. Raise it for a
+long arc that may sit stopped unattended.
+
+`ception interrupt` pauses an active goal before interrupting the turn.
+Without that, freeing the thread is precisely what makes the goal start the
+next turn, and "interrupt" would not stop the run.
+
 ## Scoping: project × session
 
 Labels are namespaced by **project root** and **session**:
@@ -103,8 +153,9 @@ session's log.
 
 ## Turns vs. runs
 
-A physical turn ending is not the same as the work being done. When codex has
-an **active thread goal** it starts follow-on turns by itself: `turn/completed`
+The mechanics behind the goal section above. A physical turn ending is not the
+same as the work being done. When codex has an
+**active thread goal** it starts follow-on turns by itself: `turn/completed`
 fires, the thread goes idle, and the goal runtime immediately starts another
 turn on the same thread. Reporting on the first `turn/completed` is how a turn
 can be reported finished while codex goes on spending tokens and editing files.
@@ -180,6 +231,9 @@ along with their log files.
 - `CEPTION_GOAL_GRACE_MS` — with an active thread goal, how long a completed
   turn waits for codex's follow-on turn before settling anyway, default 30000.
   A goal status change settles it sooner; turns with no goal never wait.
+- `CEPTION_GOAL_START_MS` — how long `ception goal`/`--resume` waits for codex
+  to start the goal's turn before returning the goal state instead, default
+  30000.
 - `CEPTION_CONTINUATION_GRACE_MS` — same, for the compacted-turn fallback,
   default 2000.
 - `CEPTION_WATCH_PID` / `CEPTION_WATCH_STARTTIME` — bypass ancestor detection

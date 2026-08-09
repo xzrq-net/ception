@@ -3,6 +3,7 @@ import process from "node:process";
 import { parseArgs } from "node:util";
 
 import {
+  cliGoal,
   cliInterrupt,
   cliKill,
   cliList,
@@ -21,6 +22,8 @@ function usage(message) {
   console.error(`usage:
   ception spawn --label L [--cwd D] [--model M] [--effort E] [--report brief|items|full] [PROMPT | -]
   ception send L [--cwd D] [--report brief|items|full] [PROMPT | -]
+  ception goal L [--cwd D] [--report brief|items|full] [OBJECTIVE | -]
+  ception goal L --resume | --pause | --show | --clear [--cwd D]
   ception interrupt L [--cwd D]
   ception kill L | --all [--cwd D]
   ception list [--all] [--json] [--cwd D]
@@ -143,6 +146,38 @@ async function main(argv) {
         label,
         cwd: values.cwd ?? process.cwd(),
         prompt,
+        report: normalizeReport(values.report)
+      });
+      return;
+    }
+
+    case "goal": {
+      const { values, positionals } = parseArgs({
+        args: rest,
+        allowPositionals: true,
+        options: {
+          cwd: { type: "string" },
+          report: { type: "string" },
+          resume: { type: "boolean" },
+          pause: { type: "boolean" },
+          show: { type: "boolean" },
+          clear: { type: "boolean" }
+        }
+      });
+      const label = requireLabel(positionals[0]);
+      const chosen = ["resume", "pause", "show", "clear"].filter((name) => values[name]);
+      if (chosen.length > 1) {
+        throw new UsageError(`goal takes one of --${chosen.join(", --")}`);
+      }
+      const objective = chosen.length > 0 ? "" : await promptFromPositionals(positionals, 1);
+      if (chosen.length === 0 && !objective.trim()) {
+        throw new UsageError("goal requires an objective, or one of --resume/--pause/--show/--clear");
+      }
+      await cliGoal({
+        label,
+        cwd: values.cwd ?? process.cwd(),
+        action: chosen[0] ?? "set",
+        objective: objective.trim() || null,
         report: normalizeReport(values.report)
       });
       return;

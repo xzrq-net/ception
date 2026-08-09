@@ -125,3 +125,22 @@ test("adopting a continuation clears the derailed verdict from the compacted hal
   assert.match(turn.buildReport("brief"), /Actually finished the work\./);
   assert.match(turn.buildReport("brief"), /compactions: 1/);
 });
+
+test("a turn that ends without an agent message reports what it did instead", () => {
+  const accumulator = new TurnAccumulator({
+    label: "audit",
+    cwd: "/repo",
+    threadId: "t1",
+    turnId: "turn1",
+    prompt: "",
+    logPath: "/tmp/x.log"
+  });
+  accumulator.handleNotification("item/completed", {
+    item: { type: "commandExecution", id: "c1", command: "rg TODO", status: "completed", exitCode: 0 }
+  });
+  accumulator.handleNotification("turn/completed", { turn: { status: "completed" } });
+
+  const report = accumulator.buildReport("brief");
+  assert.match(report, /no final message/);
+  assert.match(report, /rg TODO/);
+});

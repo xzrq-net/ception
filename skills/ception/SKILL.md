@@ -139,8 +139,61 @@ EOF
   full-report run). Idle daemon: prints `no active turn`, exits 0; no daemon:
   exit 4, recover with `send`.
 - `ception interrupt <label>` cancels a runaway turn; `ception list` shows
-  what's alive. Daemons exit on their own (idle timeout, or this Claude session
-  ending) — `kill` is for stuck ones, not routine cleanup.
+  what's alive, including each label's goal status. Daemons exit on their own
+  (idle timeout, or this Claude session ending) — `kill` is for stuck ones, not
+  routine cleanup. Killing a daemon takes codex's background shells and
+  subagents with it; interrupting or pausing does not.
+
+## Long arcs: goals
+
+For work measured in hours rather than turns — an audit, a migration, a sweep
+across a large surface — set a **goal** instead of prompting turn by turn. Codex
+then starts its own turns, back to back, until the objective is met:
+
+```sh
+ception goal audit - <<'EOF'
+<the arc: what done looks like, the boundaries, what to report>
+EOF
+```
+
+This blocks like `spawn` and returns one report for the whole run. Everything
+above about prompting applies to the objective, with more weight: it is the
+standing instruction for every turn codex starts, and you will not be consulted
+between them. Say what done looks like, what is out of bounds, and what to
+write down as it goes. Notes on disk are how a long run survives its own
+compactions.
+
+`goal` also works on a name with no daemon yet — the objective alone starts the
+run, on the configured default model. `spawn` first when you want a different
+model, or an opening turn on a different footing from the arc (a scoping pass,
+say) before the goal takes over.
+
+**Read the goal line, not just the report.** Every turn report ends with one:
+
+- `goal: complete` — the objective is met. The only status that means done.
+- `goal: paused | blocked | usageLimited | budgetLimited` — codex stopped
+  short. The report also prints the `--resume` command. `blocked` is what a
+  failed turn produces, including a server-side policy stop: the turn fails,
+  the footer's `error code:` names it, and codex stops starting turns.
+- `goal: active` after you already have the report means codex is still going
+  (see the section below).
+
+Resuming is `ception goal <label> --resume`: it blocks on the run codex
+restarts, and keeps the same daemon, app-server and thread — so background
+shells, subagents and everything else codex had in flight survive the stop. The
+deadline is the daemon's idle timeout (4h by default), which starts running the
+moment the goal stops, not any property of the stop itself. Resume when you have
+decided the run should continue; for an arc that may sit stopped longer than
+that, spawn it under a raised `CEPTION_IDLE_TIMEOUT_SECS`.
+A stop that keeps recurring at the same place is a signal about the work, not
+noise to be retried around; read the log before resuming again.
+
+Steering mid-run works as usual — `ception send <label> "..."` steers whatever
+turn is live. To change the standing instruction rather than the current turn,
+set the objective again with `ception goal <label> "<revised arc>"`.
+`ception interrupt <label>` pauses the goal and then interrupts, so it really
+does stop the run; `ception goal <label> --pause` lets the current turn finish
+and stops the next one.
 
 ## When one `spawn` is more than one Codex turn
 

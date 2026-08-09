@@ -22,6 +22,19 @@ ception send "$label" --cwd "$scratch" \
   "Reply with exactly the single word: pong2. Do not run any commands."
 
 echo
+echo "== goal: codex drives its own turns from the objective =="
+ception goal "$label" --cwd "$scratch" \
+  "Create a file named done.txt in the working directory whose only content is the word ok. Once that file exists with that content the objective is met and nothing further is needed. Do not do anything else."
+test -f "$scratch/done.txt" || { echo "goal did not produce done.txt"; exit 1; }
+
+echo
+echo "== goal --pause / --show / --resume =="
+ception goal "$label" --cwd "$scratch" --pause
+ception goal "$label" --cwd "$scratch" --show
+ception goal "$label" --cwd "$scratch" --resume
+ception goal "$label" --cwd "$scratch" --clear
+
+echo
 echo "== list =="
 ception list --cwd "$scratch"
 

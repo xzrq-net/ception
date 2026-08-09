@@ -768,3 +768,275 @@ test("a goal that stops being active settles the turn without waiting out the gr
   assert.equal(spawned.code, 0);
   assert.ok(Date.now() - started < 8000, "a goal-less turn must not pay the continuation grace window");
 });
+
+test("goal on a fresh label starts a daemon and blocks on the run codex starts", async (t) => {
+  const ctx = await makeEnv("happy");
+  t.after(() => cleanup(ctx));
+
+  const result = await runCeption(["goal", "audit", "review every module and report findings"], {
+    env: ctx.env,
+    cwd: ctx.project
+  });
+
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout, /^log: .+audit\.log/m);
+  assert.match(result.stdout, /Objective met; work finished\./);
+  assert.match(result.stdout, /goal: complete — review every module/);
+
+  const fakeState = await readJson(ctx.fakeState);
+  const goalSet = fakeState.requests.find((entry) => entry.method === "thread/goal/set");
+  assert.equal(goalSet.params.objective, "review every module and report findings");
+  assert.equal(goalSet.params.status, "active");
+  // No prompt turn was needed: the objective alone drove the work.
+  assert.equal(fakeState.lastTurnStarts.length, 0);
+});
+
+test("a policy-stopped goal reports the stop, keeps the daemon, and resumes", async (t) => {
+  const ctx = await makeEnv("goal-stopped");
+  t.after(() => cleanup(ctx));
+
+  const stopped = await runCeption(["goal", "audit", "keep grinding on the objective"], {
+    env: ctx.env,
+    cwd: ctx.project
+  });
+
+  // The turn fails and the goal goes to blocked; both facts have to reach the
+  // report, along with the command that restarts the run.
+  assert.equal(stopped.code, 2, stopped.stderr);
+  assert.match(stopped.stdout, /status: failed/);
+  assert.match(stopped.stdout, /error code: policyStop/);
+  assert.match(stopped.stdout, /goal: blocked/);
+  assert.match(stopped.stdout, /ception goal audit --resume/);
+
+  const listed = await runCeption(["list"], { env: ctx.env, cwd: ctx.project });
+  assert.match(listed.stdout, /audit\tmine\tidle\tgoal=blocked/);
+
+  const resumed = await runCeption(["goal", "audit", "--resume"], { env: ctx.env, cwd: ctx.project });
+  assert.equal(resumed.code, 0, resumed.stderr);
+  assert.match(resumed.stdout, /Objective met; work finished\./);
+  assert.match(resumed.stdout, /goal: complete/);
+
+  // The whole point of resuming rather than respawning: one app-server across
+  // the stop, so codex's background shells and subagents are still there.
+  const fakeState = await readJson(ctx.fakeState);
+  assert.equal(fakeState.appServerStarts, 1);
+  const statuses = fakeState.requests
+    .filter((entry) => entry.method === "thread/goal/set")
+    .map((entry) => entry.params.status);
+  assert.deepEqual(statuses, ["active", "active"]);
+});
+
+test("goal --pause stops codex starting more turns, and --show reports the goal", async (t) => {
+  const ctx = await makeEnv("happy");
+  t.after(() => cleanup(ctx));
+
+  assert.equal(
+    (await runCeption(["goal", "arc", "the long objective"], { env: ctx.env, cwd: ctx.project })).code,
+    0
+  );
+
+  const paused = await runCeption(["goal", "arc", "--pause"], { env: ctx.env, cwd: ctx.project });
+  assert.equal(paused.code, 0, paused.stderr);
+  assert.match(paused.stdout, /goal: paused/);
+  assert.doesNotMatch(paused.stdout, /^log: /m);
+
+  const shown = await runCeption(["goal", "arc", "--show"], { env: ctx.env, cwd: ctx.project });
+  assert.match(shown.stdout, /goal: paused — the long objective/);
+
+  const cleared = await runCeption(["goal", "arc", "--clear"], { env: ctx.env, cwd: ctx.project });
+  assert.match(cleared.stdout, /goal cleared/);
+  assert.match(
+    (await runCeption(["goal", "arc", "--show"], { env: ctx.env, cwd: ctx.project })).stdout,
+    /no goal set/
+  );
+});
+
+test("send steers the turn a goal started", async (t) => {
+  const ctx = await makeEnv("steer");
+  t.after(() => cleanup(ctx));
+
+  // "steer" behaviour parks the goal's turn open until something steers it.
+  const running = spawnCeption(["goal", "arc", "the long objective"], { env: ctx.env, cwd: ctx.project });
+  await waitFor(async () => {
+    const listed = await runCeption(["list"], { env: ctx.env, cwd: ctx.project });
+    return /arc\tmine\tactive/.test(listed.stdout);
+  });
+
+  const steer = await runCeption(["send", "arc", "stop polishing the parser"], {
+    env: ctx.env,
+    cwd: ctx.project
+  });
+  assert.equal(steer.code, 0, steer.stderr);
+  assert.match(steer.stdout, /steered active turn/);
+
+  const finished = await running.done;
+  assert.equal(finished.code, 0, finished.stderr);
+  assert.match(finished.stdout, /Steer: stop polishing the parser/);
+});
+
+test("interrupt pauses an active goal so the run actually stops", async (t) => {
+  const ctx = await makeEnv("steer");
+  t.after(() => cleanup(ctx));
+
+  const running = spawnCeption(["goal", "arc", "the long objective"], { env: ctx.env, cwd: ctx.project });
+  await waitFor(async () => {
+    const listed = await runCeption(["list"], { env: ctx.env, cwd: ctx.project });
+    return /arc\tmine\tactive/.test(listed.stdout);
+  });
+
+  const interrupted = await runCeption(["interrupt", "arc"], { env: ctx.env, cwd: ctx.project });
+  assert.equal(interrupted.code, 0, interrupted.stderr);
+  assert.match(interrupted.stdout, /goal: paused/);
+  assert.equal((await running.done).code, 3);
+
+  // Without the pause, codex would start another turn on the freed thread.
+  const fakeState = await readJson(ctx.fakeState);
+  const sets = fakeState.requests.filter((entry) => entry.method === "thread/goal/set");
+  assert.deepEqual(sets.map((entry) => entry.params.status), ["active", "paused"]);
+});
+
+test("a goal turn that starts and fails in one batch still reaches the client", async (t) => {
+  const ctx = await makeEnv("goal-instant");
+  t.after(() => cleanup(ctx));
+
+  // The fixture writes the turn's whole lifecycle in the same batch of lines
+  // as the goal/set response, so the daemon dispatches all of it before its
+  // own request await resumes. The client must still get the failure.
+  const result = await runCeption(["goal", "audit", "the objective"], {
+    env: { ...ctx.env, CEPTION_GOAL_START_MS: "2000" },
+    cwd: ctx.project
+  });
+
+  assert.equal(result.code, 2, result.stdout);
+  assert.match(result.stdout, /error code: policyStop/);
+  assert.match(result.stdout, /goal: blocked/);
+  assert.doesNotMatch(result.stdout, /started no turn/);
+
+  // The same batch also carries the newer goal status. The reply to goal/set
+  // says "active" and arrives later in program order, so a daemon that trusts
+  // it keeps advertising a run that has already stopped.
+  const listed = await runCeption(["list"], { env: ctx.env, cwd: ctx.project });
+  assert.match(listed.stdout, /goal=blocked/);
+});
+
+test("a rejected goal reaches its client even as another turn ends in the same write", async (t) => {
+  const ctx = await makeEnv("goal-set-error");
+  t.after(() => cleanup(ctx));
+
+  // The fixture ends the running turn and rejects the goal in one write; the
+  // goal client must get the rejection, not the other turn's report.
+  const running = spawnCeption(["spawn", "--label", "arc", "slow work"], { env: ctx.env, cwd: ctx.project });
+  await waitFor(async () => {
+    const listed = await runCeption(["list"], { env: ctx.env, cwd: ctx.project });
+    return /arc\tmine\tactive/.test(listed.stdout);
+  });
+
+  const goal = await runCeption(["goal", "arc", "the objective"], { env: ctx.env, cwd: ctx.project });
+  assert.equal(goal.code, 4, goal.stdout);
+  assert.match(goal.stderr, /goal rejected by fixture/);
+  assert.doesNotMatch(goal.stdout, /Handled the requested task/);
+
+  // The turn that was already running still reports to the client that started it.
+  const spawned = await running.done;
+  assert.equal(spawned.code, 0, spawned.stderr);
+  assert.match(spawned.stdout, /Handled the requested task/);
+
+  const shown = await runCeption(["goal", "arc", "--show"], { env: ctx.env, cwd: ctx.project });
+  assert.equal(shown.code, 0, shown.stderr);
+  assert.match(shown.stdout, /no goal set/);
+});
+
+test("a goal set mid-turn reports the turn codex starts for it, not the running one", async (t) => {
+  const ctx = await makeEnv("goal-during-turn");
+  t.after(() => cleanup(ctx));
+
+  const running = spawnCeption(["spawn", "--label", "arc", "slow work"], { env: ctx.env, cwd: ctx.project });
+  await waitFor(async () => {
+    const listed = await runCeption(["list"], { env: ctx.env, cwd: ctx.project });
+    return /arc\tmine\tactive/.test(listed.stdout);
+  });
+
+  const goal = await runCeption(["goal", "arc", "the objective"], { env: ctx.env, cwd: ctx.project });
+  assert.equal(goal.code, 0, goal.stderr);
+  assert.match(goal.stdout, /Goal turn finished the work\./);
+  assert.doesNotMatch(goal.stdout, /Parked turn finished\./);
+  assert.equal((await running.done).code, 0);
+});
+
+test("a goal that stops before starting a turn answers its client at once", async (t) => {
+  const ctx = await makeEnv("goal-stalls");
+  t.after(() => cleanup(ctx));
+
+  // The goal stops without ever starting a turn; the status change is the
+  // answer, not the start clock running out.
+  const started = Date.now();
+  const result = await runCeption(["goal", "arc", "the objective"], {
+    env: { ...ctx.env, CEPTION_GOAL_START_MS: "6000" },
+    cwd: ctx.project
+  });
+
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout, /goal: usageLimited/);
+  assert.match(result.stdout, /started no turn/);
+  assert.ok(Date.now() - started < 5000, "waited out the start clock instead of using the status");
+});
+
+test("a turn that ends before the goal takes effect is not reported as the goal's", async (t) => {
+  const ctx = await makeEnv("goal-late-active");
+  t.after(() => cleanup(ctx));
+
+  // The running turn finishes between the goal/set reply and the goal taking
+  // effect; its work predates the objective and must not be reported as it.
+  const running = spawnCeption(["spawn", "--label", "arc", "slow work"], { env: ctx.env, cwd: ctx.project });
+  await waitFor(async () => {
+    const listed = await runCeption(["list"], { env: ctx.env, cwd: ctx.project });
+    return /arc\tmine\tactive/.test(listed.stdout);
+  });
+
+  const goal = await runCeption(["goal", "arc", "the objective"], {
+    env: { ...ctx.env, CEPTION_GOAL_START_MS: "3000" },
+    cwd: ctx.project
+  });
+  assert.equal(goal.code, 0, goal.stderr);
+  assert.match(goal.stdout, /Continuation after the late goal\./);
+  assert.doesNotMatch(goal.stdout, /Parked turn finished\./);
+  assert.equal((await running.done).code, 0);
+});
+
+test("a goal met by the turn already running still reports to its client", async (t) => {
+  const ctx = await makeEnv("goal-in-running-turn");
+  t.after(() => cleanup(ctx));
+
+  // Codex folds a goal set mid-turn into that turn; a client watching only
+  // for a fresh turn would time out while the work happens in front of it.
+  const running = spawnCeption(["spawn", "--label", "arc", "slow work"], { env: ctx.env, cwd: ctx.project });
+  await waitFor(async () => {
+    const listed = await runCeption(["list"], { env: ctx.env, cwd: ctx.project });
+    return /arc\tmine\tactive/.test(listed.stdout);
+  });
+
+  const goal = await runCeption(["goal", "arc", "the objective"], {
+    env: { ...ctx.env, CEPTION_GOAL_START_MS: "3000" },
+    cwd: ctx.project
+  });
+  assert.equal(goal.code, 0, goal.stderr);
+  assert.match(goal.stdout, /Objective met inside the running turn\./);
+  assert.doesNotMatch(goal.stdout, /started no turn/);
+  assert.equal((await running.done).code, 0);
+});
+
+test("a subagent thread's goal does not settle this thread's run", async (t) => {
+  const ctx = await makeEnv("goal-continuation");
+  t.after(() => cleanup(ctx));
+
+  // The fixture completes a foreign thread's goal while our report is held for
+  // the continuation. Acting on it would cut the run short at "First half".
+  const spawned = await runCeption(["spawn", "--label", "sub", "do the work"], {
+    env: { ...ctx.env, CEPTION_FAKE_CONTINUATION_DELAY_MS: "600" },
+    cwd: ctx.project
+  });
+
+  assert.equal(spawned.code, 0, spawned.stderr);
+  assert.match(spawned.stdout, /Goal continuation finished the work\./);
+  assert.doesNotMatch(spawned.stdout, /First half done\./);
+});
