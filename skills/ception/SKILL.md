@@ -49,26 +49,29 @@ the delta; the thread retains everything earlier.
 - Lead with the actual goal and what the work feeds into — the _why_ is what
   lets it make correct micro-decisions on its own.
 - Name the work mode and stopping point: "review and report; do not edit",
-  "diagnose only", "implement and verify". Review and diagnosis are treated as
-  read-only unless you ask for the fix; say whether commits are wanted.
+  "diagnose only", "implement and verify". The stopping point is load-bearing:
+  GPT is a relentless executor, and driven accordingly it will keep grinding
+  past any reasonable point rather than stop and ask. Review and diagnosis are
+  treated as read-only unless you ask for the fix; say whether commits are
+  wanted.
 - Concrete anchors you actually know: file paths, function names, failing tests,
-  a verification command ("run `npm test`; all tests must pass"). Guessed
-  anchors are worse than none — if you don't know the repo's checks, ask it to
-  find and run them.
+  a verification command. Guessed anchors are worse than none — if you don't
+  know the repo's checks, ask it to find and run them.
 - Constraints and non-goals explicitly: "do not refactor X", "no new
-  dependencies", "do not touch files outside Y/".
+  dependencies". GPT is fantastically instruction-compliant — an imperative
+  outranks its own judgment — so reserve imperatives for what you mean
+  categorically and soften the rest to defaults ("prefer X unless..."), or it
+  will comply even where compliance is plainly wrong.
 - Latitude is fine and often better than over-specifying: "choose the data
-  structure" works. When you leave a decision open, ask it to state in its
-  report which way it went and why, so you can check the choice against intent.
-  Say which ambiguities should instead stop the work and come back for
-  direction.
+  structure" works. When you leave a decision open, ask it to report which way
+  it went and why. Say which ambiguities should instead stop the work and come
+  back for direction.
 - Taste is the one thing it cannot infer. Encode it as rules: match the
   surrounding code's comment density and idiom, naming conventions, error
   message style, what counts as too clever.
 - For review work, say "review" plus the target and baseline (which branch,
-  diff, or dirty worktree) and whether you want findings only or fixes too. The
-  code-review stance is built in: findings first, ordered by severity, file/line
-  refs.
+  diff, or dirty worktree) and whether you want findings only or fixes too; the
+  findings-first, severity-ordered, file/line-ref stance is built in.
 
 ## Choosing model and effort
 
