@@ -78,9 +78,8 @@ Exit codes: `0` turn completed (or steer/interrupt accepted), `2` turn failed,
 
 ## Goals: runs codex drives itself
 
-A **thread goal** is codex's own long-run driver. With one active, codex starts
-turn after turn by itself until the objective is met — no prompt per turn.
-`ception goal` is the whole interface to it:
+A **thread goal** makes codex start turn after turn by itself until the
+objective is met — no prompt per turn:
 
 ```sh
 ception goal audit "<the arc: what done looks like>"   # set, and block on the run
@@ -91,38 +90,28 @@ ception goal audit --show                               # objective + status
 ception goal audit --clear
 ```
 
-`goal` with an objective, and `--resume`, behave like `spawn`: they print the
-log path, then block until the run settles and deliver one report covering the
-turns codex ran. Setting a goal while a turn is already running is fine: codex
-steers the objective into the running turn, and the client attaches to it. The
-other forms answer immediately. A goal is enough to start a label —
-`ception goal` on a name that has no daemon yet starts one, and codex works
-from the objective with no opening prompt. Such a label uses the configured
-default model and effort; `spawn` first to choose them.
+Setting an objective, and `--resume`, behave like `spawn`: print the log path,
+block until the run settles, deliver one report covering the whole run. While
+a goal is `active` the daemon holds the report across turn boundaries
+(`CEPTION_GOAL_GRACE_MS` is the stall safety net). Set during a running turn,
+the objective is steered into it. The other forms answer immediately. A goal
+alone can start a label that has no daemon yet, on the default model and
+effort; `spawn` first to choose them.
 
-Goal status is the answer to "is codex done?", and the turn report alone is not:
+Every report ends with a goal line, and `ception list` has a `goal=` column:
 
-- `active` — codex will start another turn. The daemon holds the report until
-  this stops being true, or until `CEPTION_GOAL_GRACE_MS` passes with no
-  follow-on turn; that escape hatch is the one way a client returns mid-run
-  (see *Turns vs. runs*).
-- `complete` — the objective is met. This is the only status that means done.
-- `paused`, `blocked`, `usageLimited`, `budgetLimited` — codex stopped short.
-  A turn error blocks the goal (this is how a server-side policy stop lands:
-  the turn fails, `error code:` in the footer names it, and the goal goes
-  `blocked`); rate and budget ceilings have their own statuses.
+- `active` — codex will start another turn.
+- `complete` — the objective is met. The only status that means done.
+- `paused`, `blocked`, `usageLimited`, `budgetLimited` — stopped short. A turn
+  error blocks the goal (`error code:` in the footer names it), and the
+  report prints the `--resume` that restarts the run.
 
-Every turn report ends with the goal line, and a stopped-short goal also prints
-the `ception goal <label> --resume` that restarts the run. `ception list` has a
-`goal=` column. Resuming keeps the same daemon, app-server and thread, so
-codex's background shells and subagents are exactly where it left them — but a
-stopped goal leaves the daemon idle, so `CEPTION_IDLE_TIMEOUT_SECS` (4h by
-default) is the real deadline for resuming with those intact. Raise it for a
-long arc that may sit stopped unattended.
+Resuming keeps the same daemon, app-server and thread — codex's background
+shells and subagents survive the stop — but a stopped goal leaves the daemon
+idle, so `CEPTION_IDLE_TIMEOUT_SECS` (4h default) is the real resume deadline.
 
-`ception interrupt` pauses an active goal before interrupting the turn.
-Without that, freeing the thread is precisely what makes the goal start the
-next turn, and "interrupt" would not stop the run.
+`ception interrupt` pauses an active goal before interrupting the turn;
+otherwise freeing the thread would just start the goal's next turn.
 
 ## Quota
 
@@ -136,12 +125,10 @@ GPT-5.3-Codex-Spark  7d   0% used, resets in 7d 0h (2026-08-16 22:27Z)
 credits              none
 ```
 
-`primary` and `secondary` are the server's own slots; which real window lives
-in each changes as OpenAI reshuffles them, so every line carries its own
-length. Per-model limits, credits, and any limit actually reached get rows
-when the account reports them; `--json` prints the raw response. No label, no
-daemon, no tokens spent: a throwaway app-server answers it without disturbing
-running work.
+`primary`/`secondary` are the server's own slots (OpenAI reshuffles which
+real window sits in each, hence per-line lengths). Per-model limits, credits,
+and any limit reached get rows when reported; `--json` prints the raw
+response. Answered by a throwaway app-server: no label, no daemon, no tokens.
 
 ## Scoping: project × session
 
@@ -157,12 +144,10 @@ Labels are namespaced by **project root** and **session**:
   independent Codex threads. Outside Claude Code, all invocations share the
   `default` session.
 
-  Outermost because Claude Code nests shorter-lived claude-looking helpers (a
-  transient `claude daemon run`, a forked background session) under the real
-  session; keying on the nearest one would change the session mid-run. The
-  cost: a `claude` launched from inside another session shares its parent's
-  labels and dies with it. Run independent sessions from separate terminals,
-  or pin `CEPTION_WATCH_PID` / `CEPTION_WATCH_STARTTIME`.
+  Outermost, because Claude Code nests short-lived claude-looking helpers
+  under the real session. The cost: a `claude` launched inside another session
+  shares its parent's labels and dies with it; pin `CEPTION_WATCH_PID` /
+  `CEPTION_WATCH_STARTTIME` to override.
 
 **Adoption.** When `send` doesn't find the label in its own session, it looks
 at other sessions' entries for the project. If the owning session is dead
@@ -178,28 +163,14 @@ sessions' labels for the project (`list --all` for every project), with a
 attaches only to the calling session's daemon; `watch --follow` may tail any
 session's log.
 
-## Turns vs. runs
+## Continuations
 
-The mechanics behind the goal section above. A physical turn ending is not the
-same as the work being done. When codex has an
-**active thread goal** it starts follow-on turns by itself: `turn/completed`
-fires, the thread goes idle, and the goal runtime immediately starts another
-turn on the same thread. Reporting on the first `turn/completed` is how a turn
-can be reported finished while codex goes on spending tokens and editing files.
+A turn that arrives after everything has settled (a goal turn whose waiter
+timed out, say) is adopted anyway, without its original clients — `list`
+shows the label active and `watch` can attach — so an in-flight turn is never
+invisible.
 
-The daemon therefore tracks goal status from `thread/goal/updated`. While the
-goal is `active` a completed turn does not settle: the clients stay attached
-and the accumulated report carries over, so a `spawn`/`send` blocks until the
-whole run is done and returns one report. Any non-`active` status (`complete`,
-`paused`, `blocked`, `usageLimited`, `budgetLimited`) settles it at once.
-`CEPTION_GOAL_GRACE_MS` is only a safety net for a goal that stalls without a
-status change; turns with no goal pay nothing.
-
-A continuation that still arrives after everything has settled is adopted
-anyway, without its original clients — `list` shows the label active and
-`watch` can attach — so an in-flight turn is never invisible.
-
-Compacted turns get the same treatment on a shorter
+Compacted turns get the goal treatment on a shorter
 `CEPTION_CONTINUATION_GRACE_MS` window. Current codex compacts within a single
 turn, so this is a fallback for the cross-turn shape seen on older
 app-servers. If a compacted turn ends with nothing but codex's
