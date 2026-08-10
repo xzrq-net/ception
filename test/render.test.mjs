@@ -144,3 +144,18 @@ test("a turn that ends without an agent message reports what it did instead", ()
   assert.match(report, /no final message/);
   assert.match(report, /rg TODO/);
 });
+
+test("a reasoning summary streamed as deltas and repeated by the completed item renders once", () => {
+  const turn = accumulator();
+  turn.handleNotification("item/reasoning/summaryTextDelta", {
+    itemId: "r1",
+    summaryIndex: 0,
+    delta: "Planning the fix"
+  });
+  completeItem(turn, { id: "r1", type: "reasoning", summary: ["Planning the fix"], content: [] });
+  completeItem(turn, { id: "message", type: "agentMessage", text: "Done." });
+  completeTurn(turn);
+
+  const occurrences = turn.buildReport("items").split("Planning the fix").length - 1;
+  assert.equal(occurrences, 1);
+});
