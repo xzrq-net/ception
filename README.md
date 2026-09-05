@@ -250,9 +250,11 @@ points at this working repo. To ship commits:
 
 ```sh
 jj bookmark set master -r <rev>   # point master at what should ship
-git -C ~/.claude/skills/ception pull --ff-only
+scripts/deploy.sh                 # reset the clone to master, run its tests
 ```
 
-New invocations pick up `bin/` and skill changes immediately; daemons that
-are already running keep their old code until they exit. `/reload-plugins`
-refreshes other plugin components without restarting the session.
+The script refuses if the clone is dirty and prints the rollback command if
+tests fail at the new rev. New invocations pick up `bin/` and skill changes
+immediately; daemons that are already running keep their old code until they
+exit. `/reload-plugins` refreshes other plugin components without restarting
+the session.
