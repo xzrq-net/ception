@@ -83,9 +83,9 @@ means a new label:
   formatting/lint cleanup, boilerplate, repetitive fixtures, narrow edits with
   deterministic tests. Its failure mode is a plausible patch that misses intent
   or edge cases, so keep Luna turns small and verifiable. If a Luna task turns
-  into discovery or design, respawn on Sol rather than compensating with
+  into discovery or design, respawn on Astra rather than compensating with
   follow-ups.
-- unset — the user's configured default (`gpt-5.6-sol`, frontier). Everything
+- unset — the user's configured default (`gpt-6-astra`, frontier). Everything
   else: any implementation or debugging needing real code judgment, ambiguity,
   architecture, broad refactors, security/performance work, adversarial review.
 
