@@ -89,10 +89,9 @@ means a new label:
   else: any implementation or debugging needing real code judgment, ambiguity,
   architecture, broad refactors, security/performance work, adversarial review.
 
-The user's config defaults to a high reasoning effort. Pair Luna with
-`--effort medium` for bounded edits; leave effort alone for anything with
-subtlety. Higher effort is not a substitute for a bigger model when the task
-needs judgment.
+The user's config defaults to medium reasoning effort. Leave it alone unless
+the task has real subtlety and you want `--effort high`. Higher effort is not a
+substitute for a bigger model when the task needs judgment.
 
 ## Operating procedure
 
