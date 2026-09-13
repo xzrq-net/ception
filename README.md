@@ -211,7 +211,12 @@ along with their log files.
   with `ception watch --follow LABEL`)
 - State (session → label → thread id and options):
   `~/.local/state/ception/<cwdhash>.json`, guarded by a `.lock` file for
-  cross-process read-modify-write
+  cross-process read-modify-write. The lock records pid, process start time
+  and pid namespace, so a lock left by a killed process (or by another
+  container sharing the home directory) is recognised as debris and stolen
+  instead of being mistaken for a live holder with a reused pid. Locks from
+  a namespace we cannot inspect are believed for a few seconds only.
+  Leftover `.tmp` files older than an hour are swept on the next invocation.
 - Sockets/locks: `$XDG_RUNTIME_DIR/ception/`, falling back to
   `~/.local/state/ception/run/`
 

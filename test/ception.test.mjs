@@ -364,6 +364,27 @@ test("daemon is reparented at spawn and survives spawn client death mid-turn", a
   assert.equal(row?.status, "idle");
 });
 
+test("a daemon that cannot register its thread shuts down instead of lingering", async (t) => {
+  const ctx = await makeEnv("happy");
+  t.after(() => cleanup(ctx));
+  // Logs stay writable; the state file's lock and temp files do not.
+  const stateDir = path.join(ctx.home, ".local", "state", "ception");
+  await fs.mkdir(path.join(stateDir, "logs"), { recursive: true });
+  await fs.chmod(stateDir, 0o555);
+  t.after(() => fs.chmod(stateDir, 0o700));
+
+  const result = await runCeption(["spawn", "--label", "ghost", "hello"], { env: ctx.env, cwd: ctx.project });
+  assert.equal(result.code, 4, result.stdout);
+  assert.match(result.stderr, /EACCES/);
+
+  const runDir = path.join(ctx.runtime, "ception");
+  const sockets = await waitFor(async () => {
+    const names = await fs.readdir(runDir);
+    return names.some((name) => name.endsWith(".sock")) ? null : names;
+  });
+  assert.ok(sockets, "daemon socket still present: daemon lingered after failing to register");
+});
+
 test("watch attaches to the active turn and delivers its report", async (t) => {
   const ctx = await makeEnv("steer");
   t.after(() => cleanup(ctx));
@@ -685,12 +706,21 @@ test("gc drops stale labels of dead sessions and their logs", async (t) => {
   const stateDir = path.join(ctx.home, ".local", "state", "ception");
   const stateName = (await fs.readdir(stateDir)).find((name) => name.endsWith(".json"));
   await fs.writeFile(path.join(stateDir, stateName), JSON.stringify(projectState));
+  // Debris of writes and lock publications that a SIGKILL cut short.
+  const oldTemp = path.join(stateDir, `${stateName}.lock.2476.tmp`);
+  const freshTemp = path.join(stateDir, `${stateName}.abc123.tmp`);
+  await fs.writeFile(oldTemp, "2476\n");
+  const dayAgo = new Date(Date.now() - 86400_000);
+  await fs.utimes(oldTemp, dayAgo, dayAgo);
+  await fs.writeFile(freshTemp, "{}\n");
 
   const listed = await runCeption(["list", "--json"], { env: ctx.env, cwd: ctx.project });
   const rows = JSON.parse(listed.stdout);
   assert.equal(rows.find((row) => row.label === "stale"), undefined);
   assert.ok(rows.find((row) => row.label === "keep"));
   assert.equal(await fs.access(staleLog).then(() => true, () => false), false);
+  assert.equal(await fs.access(oldTemp).then(() => true, () => false), false);
+  assert.equal(await fs.access(freshTemp).then(() => true, () => false), true);
 });
 
 test("a compacted turn that continues in a new turn reports the continuation's result", async (t) => {
