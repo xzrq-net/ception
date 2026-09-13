@@ -2,10 +2,9 @@
 name: ception
 description:
   Delegate implementation, investigation, and review work to OpenAI Codex (GPT)
-  running as a named background subagent. GPT is a frontier-class implementor —
-  delegate anything whose intent you can put in writing, hard or mechanical, to
-  keep the token churn out of your own context. Keep only decisions that need
-  the user context in your head.
+  running as a named background subagent. GPT works at your level; what it
+  lacks is the user. Hand it the goal, the reasons and the bounds, not a spec,
+  and keep the token churn out of your own context.
 ---
 
 # ception: Codex as a subagent
@@ -14,84 +13,76 @@ description:
 You interact with it like a native subagent: spawn in background, get woken on
 completion, steer mid-flight, send follow-ups to the same thread.
 
-**WIP.** This is the user's personal utility under active iteration. If the tool
-itself misbehaves — confusing errors, hangs, reports that don't match what
-happened, docs that disagree with behavior — tell the user what you hit instead
-of silently working around it. They would rather fix the tool than absorb a
-process breakdown.
+**WIP.** If the tool itself misbehaves — confusing errors, hangs, reports that
+don't match what happened, docs that disagree with behavior — tell the user
+what you hit instead of working around it. They would rather fix the tool.
 
 ## Division of labor
 
-GPT on the default model is a peer intellect with one structural deficit: it
-does not share your conversation, so it cannot infer the user's intent or taste.
-Everything else — gnarly debugging, subtle algorithms, wide refactors,
-migrations, test design, performance hunts — is in scope. Do not reserve hard
-work for yourself out of capability doubt; reserve it only when the intent can't
-be transferred.
+GPT works at your level: debugging, algorithms, wide refactors, migrations,
+test design, performance work, adversarial review. Do not keep hard work for
+yourself out of capability doubt.
 
-Delegate when you can write the intent down: the goal, the constraints, what the
-user would object to. Keep for yourself:
+What it lacks is the user. Pasting the conversation does not transfer that;
+reading the user's intent and taste is your job.
+
+Keep for yourself:
 
 - decisions that need judgment built up in this session, or a read on the user
   you can't articulate
 - tasks where writing the intent down costs as much as doing the work
-- the final review — always, because the handoff must catch both misread intent
-  and ordinary implementation error
+- the final review, always (delegated reviews feed it)
 
-## How to prompt GPT
+## Prompting
 
-GPT does not share your conversation or tool results, but it does get the repo:
-its own instructions, the target's `AGENTS.md`, and a working copy it can
-inspect. Transfer what it cannot recover — goal, decisions already made,
-constraints — and don't paste discoverable repo context. On `send`, give only
-the delta; the thread retains everything earlier.
+GPT does not see your conversation or tool results. It does see the working
+copy, its `AGENTS.md`, and its own codex instructions. Send what it cannot
+recover and leave out what it can. On `send`, give only the delta; the thread
+keeps everything earlier unless the footer shows compactions.
 
-- Lead with the actual goal and what the work feeds into — the _why_ is what
-  lets it make correct micro-decisions on its own.
-- Name the work mode and stopping point: "review and report; do not edit",
-  "diagnose only", "implement and verify". The stopping point is load-bearing:
-  GPT is a relentless executor, and driven accordingly it will keep grinding
-  past any reasonable point rather than stop and ask. Review and diagnosis are
-  treated as read-only unless you ask for the fix; say whether commits are
-  wanted.
-- Concrete anchors you actually know: file paths, function names, failing tests,
-  a verification command. Guessed anchors are worse than none — if you don't
-  know the repo's checks, ask it to find and run them.
-- Constraints and non-goals explicitly: "do not refactor X", "no new
-  dependencies". GPT is fantastically instruction-compliant — an imperative
-  outranks its own judgment — so reserve imperatives for what you mean
-  categorically and soften the rest to defaults ("prefer X unless..."), or it
-  will comply even where compliance is plainly wrong.
-- Latitude is fine and often better than over-specifying: "choose the data
-  structure" works. When you leave a decision open, ask it to report which way
-  it went and why. Say which ambiguities should instead stop the work and come
-  back for direction.
-- Taste is the one thing it cannot infer. Encode it as rules: match the
-  surrounding code's comment density and idiom, naming conventions, error
-  message style, what counts as too clever.
-- For review work, say "review" plus the target and baseline (which branch,
-  diff, or dirty worktree) and whether you want findings only or fixes too; the
-  findings-first, severity-ordered, file/line-ref stance is built in.
+What it cannot recover:
+
+- the goal and what it feeds into, in the user's terms
+- decisions already made, by the user or in this session, and what the user
+  would object to
+- the work mode and stopping point ("review and report; do not edit",
+  "diagnose only", "implement and verify") and whether commits are wanted
+- taste the repo does not already show, where a sensible default would be
+  wrong for this user
+- for review: the target and baseline, and findings-only or fixes too
+
+What it can recover, so leave it out: the shape of the solution, which library,
+what the tests should assert, the order of steps, how to run the checks. If the
+prompt runs much longer than the user's request plus the items above, or you
+are numbering implementation steps, you are specifying the solution; send the
+goal instead. Anchors you happen to know (a path, a failing test, the line a
+review found) are fine.
+
+Imperatives outrank GPT's own judgment, and it complies where compliance is
+plainly wrong. Use them only for what you mean categorically and phrase the
+rest as defaults ("prefer X unless..."). Open decisions are fine; ask it to
+report which way it went, and say which ambiguities should stop the work
+instead.
+
+The first report is also a signal about your prompt. If corrections don't
+shrink each round, the framing is wrong; restate the goal. When you want a
+check on a design of your own, ask for its take before showing yours.
 
 ## Choosing model and effort
 
 Pick the model at `spawn` — `send` keeps the label's choice, so switching models
 means a new label:
 
-- `--model gpt-5.6-luna` — preposterously cheap. Use it when the solution is
-  already decided and correctness is mechanically checkable: rote renames,
-  formatting/lint cleanup, boilerplate, repetitive fixtures, narrow edits with
-  deterministic tests. Its failure mode is a plausible patch that misses intent
-  or edge cases, so keep Luna turns small and verifiable. If a Luna task turns
-  into discovery or design, respawn on Astra rather than compensating with
-  follow-ups.
-- unset — the user's configured default (`gpt-6-astra`, frontier). Everything
-  else: any implementation or debugging needing real code judgment, ambiguity,
-  architecture, broad refactors, security/performance work, adversarial review.
+- `--model gpt-5.6-luna` — cheap. For work where the solution is already
+  decided and correctness is mechanically checkable: rote renames, lint
+  cleanup, narrow edits with deterministic tests. Its failure mode is a
+  plausible patch that misses intent or an edge case. If a Luna task turns into
+  discovery or design, respawn on the default model rather than compensating
+  with follow-ups.
+- unset — the user's configured default (`gpt-6-astra`). Everything else.
 
-The user's config defaults to medium reasoning effort. Leave it alone unless
-the task has real subtlety and you want `--effort high`. Higher effort is not a
-substitute for a bigger model when the task needs judgment.
+Do not pass `--effort` unless the user names a level; the codex config default
+applies.
 
 ## Operating procedure
 
@@ -100,7 +91,7 @@ prompt from stdin). You are woken when the turn completes:
 
 ```sh
 ception spawn --label impl - <<'EOF'
-<goal, constraints, anchors, verification>
+<goal, bounds, anchors, stopping point>
 EOF
 ```
 
@@ -122,12 +113,12 @@ EOF
   instead fails with "belongs to live session", pick a different label.
 - Follow-ups and course corrections go to the same thread:
   `ception send impl "..."`. If the turn is still running this steers it and
-  returns immediately; if idle it starts a new turn and blocks. Steer on
-  observed divergence — steering is cheap and reliably lands — but don't hover.
+  returns immediately; if idle it starts a new turn and blocks. Steer when you
+  see divergence; don't poll.
 - `ception quota` shows the account's rate-limit windows (no label, no tokens).
-  Worth a look before committing to a long arc, and the first thing to check if
-  a run stops with `usageLimited`.
-- Peek mid-run without ingesting reasoning spam:
+  Check it before committing to a long arc, and first if a run stops with
+  `usageLimited`.
+- Peek mid-run without ingesting reasoning:
   `grep -E '^\[(cmd|edit|mcp|msg)\]' <logpath> | tail -20`. The full log
   (including reasoning) is for the user, who may be tailing it.
 - One turn at a time per label; use separate labels for parallel workstreams.
@@ -162,7 +153,7 @@ This blocks like `spawn` and returns one report for the whole run. Everything
 above about prompting applies to the objective, with more weight: it is the
 standing instruction for every turn, and you will not be consulted between
 them. Say what done looks like, what is out of bounds, and what to write down
-as it goes — notes on disk are how a long run survives its own compactions.
+as it goes; notes on disk survive compaction.
 
 `goal` also works on a name with no daemon yet, on the default model. `spawn`
 first for a different model, or for an opening turn on a different footing
@@ -182,8 +173,8 @@ than the arc (a scoping pass, say).
 daemon, app-server and thread, so codex's background shells and subagents
 survive the stop. The deadline is the daemon's idle timeout (4h by default);
 for an arc that may sit stopped longer, spawn under a raised
-`CEPTION_IDLE_TIMEOUT_SECS`. A stop that recurs at the same place is a signal
-about the work; read the log before resuming again.
+`CEPTION_IDLE_TIMEOUT_SECS`. If it stops at the same place twice, read the log
+before resuming again.
 
 Steering mid-run works as usual — `ception send <label> "..."` steers the live
 turn; setting the objective again changes the standing instruction.
@@ -221,14 +212,15 @@ target repo permits agent commits.
 
 ## After completion
 
-Review the diff (`jj diff` / `git diff`) against the user's intent — that is the
-gap GPT cannot close itself. Run the verification commands yourself; don't take
-the report's word for it. Two failure modes to look for, both of which produce a
-confident report and passing checks: the brilliant solution to a subtly
-different problem, and the intellectual shortcut — a special-cased test, a
-stubbed hard branch, a weakened assertion. Check _how_ the acceptance criteria
-were met, not just that they pass. GPT is highly corrigible: a corrective `send`
-naming the observed divergence ("in lib/foo.mjs:40, X happens; make it do Y")
-reliably lands, and the thread retains its context — iterate there rather than
-redoing the work yourself. Take over only when the remaining gap is taste you
-can't put into words.
+Review the diff (`jj diff` / `git diff`) against the user's intent. Run the
+verification commands yourself. Check how the acceptance criteria were met, not
+just that they pass: a special-cased test, a stubbed hard branch, a weakened
+assertion, or a good solution to a slightly different problem all produce a
+confident report and green checks.
+
+When the report argues for deviating from your prompt, weigh it: GPT is often
+right about the code and wrong about the user.
+
+Corrections go back to the thread: the file and line, what happens instead of
+what should, and the boundary that was crossed. Take over only when the
+remaining gap is taste you can't put into words.
