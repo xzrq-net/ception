@@ -36,9 +36,11 @@ Keep for yourself:
 ## Prompting
 
 GPT does not see your conversation or tool results. It does see the working
-copy, its `AGENTS.md`, and its own codex instructions. Send what it cannot
-recover and leave out what it can. On `send`, give only the delta; the thread
-keeps everything earlier unless the footer shows compactions.
+copy, its `AGENTS.md`, and its own codex instructions. The user-level ones
+(`~/.codex/AGENTS.md`) are the same text as your `~/.claude/CLAUDE.md`, so
+tone, autonomy and engineering preferences need no restating. Send what it
+cannot recover and leave out what it can. On `send`, give only the delta; the
+thread keeps everything earlier unless the footer shows compactions.
 
 What it cannot recover:
 
