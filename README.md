@@ -149,6 +149,10 @@ Labels are namespaced by **project root** and **session**:
   shares its parent's labels and dies with it; pin `CEPTION_WATCH_PID` /
   `CEPTION_WATCH_STARTTIME` to override.
 
+  A client orphaned from Claude Code (`ception send ... &` outliving the Bash
+  tool's shell) has no claude ancestor left; it falls back to the `CLAUDE_PID`
+  that Claude Code exports.
+
 **Adoption.** When `send` doesn't find the label in its own session, it looks
 at other sessions' entries for the project. If the owning session is dead
 (typical after exiting and resuming Claude Code), the label is moved into the

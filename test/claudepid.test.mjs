@@ -59,6 +59,32 @@ test("the nearest claude-looking ancestor does not win over an outer one", async
   assert.notEqual(detected.pid, chain.leafPid);
 });
 
+test("an orphaned client falls back to CLAUDE_PID", async (t) => {
+  // sh exits right away, so sleep is reparented to a subreaper outside any claude.
+  const sh = spawn("sh", ["-c", "sleep 30 >/dev/null 2>&1 & echo $!"], {
+    stdio: ["ignore", "pipe", "ignore"]
+  });
+  const orphanPid = await new Promise((resolve) => {
+    sh.stdout.setEncoding("utf8");
+    sh.stdout.once("data", (chunk) => resolve(Number(chunk.trim())));
+  });
+  await new Promise((resolve) => sh.once("exit", resolve));
+  const saved = process.env.CLAUDE_PID;
+  process.env.CLAUDE_PID = String(process.pid);
+  t.after(() => {
+    process.kill(orphanPid, "SIGKILL");
+    if (saved === undefined) {
+      delete process.env.CLAUDE_PID;
+    } else {
+      process.env.CLAUDE_PID = saved;
+    }
+  });
+
+  const detected = await detectClaudeAncestor(orphanPid);
+
+  assert.equal(detected?.pid, process.pid);
+});
+
 test("an explicit pin short-circuits ancestor detection", async () => {
   process.env.CEPTION_WATCH_PID = "4242";
   process.env.CEPTION_WATCH_STARTTIME = "99";
