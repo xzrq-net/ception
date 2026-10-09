@@ -11,3 +11,4 @@ Rust, Linux only. Build and test inside the dev shell:
 `tests/cli.rs` drives the real binary against the fake app-server in
 `src/bin/ception-fake-appserver.rs`; new daemon behavior gets a fake behavior
 and an integration test. `nix build` runs the same suite in the sandbox.
+Format with `cargo fmt` (rustfmt.toml: 120 columns); keep clippy clean.
