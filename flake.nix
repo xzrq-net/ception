@@ -1,12 +1,12 @@
 {
-  description = "Run OpenAI Codex as a named background subagent from Claude Code";
+  description = "Run OpenAI Codex as a named background subagent";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
   outputs =
     { self, nixpkgs }:
     let
-      # Linux only: session and lock identity come from /proc.
+      # Linux only: process tracking uses /proc and pidfds.
       forAllSystems = nixpkgs.lib.genAttrs [
         "x86_64-linux"
         "aarch64-linux"
@@ -17,49 +17,39 @@
         system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
-          inherit (pkgs) lib nodejs;
+          inherit (pkgs) lib;
         in
         {
-          default = pkgs.stdenvNoCC.mkDerivation {
+          default = pkgs.rustPlatform.buildRustPackage {
             pname = "ception";
-            version = (lib.importJSON ./package.json).version;
+            version = (lib.importTOML ./Cargo.toml).package.version;
 
             src = lib.fileset.toSource {
               root = ./.;
               fileset = lib.fileset.unions [
-                ./bin
-                ./lib
-                ./test
+                ./Cargo.toml
+                ./Cargo.lock
+                ./src
+                ./tests
                 ./SKILL.md
-                ./package.json
               ];
             };
+            cargoLock.lockFile = ./Cargo.lock;
 
             nativeBuildInputs = [ pkgs.makeWrapper ];
-            nativeCheckInputs = [ nodejs ];
 
-            dontBuild = true;
-            doCheck = true;
-            checkPhase = ''
-              runHook preCheck
-              node --test test/
-              runHook postCheck
-            '';
-
-            # npx on PATH for the default codex command (npx -y @openai/codex);
+            # The check phase runs the integration suite against the fake
+            # app-server, which is a test fixture and not shipped. npx on
+            # PATH for the default codex command (npx -y @openai/codex);
             # suffixed so the user's own node toolchain wins.
-            installPhase = ''
-              runHook preInstall
-              mkdir -p $out/lib/ception
-              cp -r bin lib SKILL.md package.json $out/lib/ception/
-              makeWrapper ${lib.getExe nodejs} $out/bin/ception \
-                --add-flags $out/lib/ception/bin/ception.mjs \
-                --suffix PATH : ${lib.makeBinPath [ nodejs ]}
-              runHook postInstall
+            postInstall = ''
+              rm $out/bin/ception-fake-appserver
+              wrapProgram $out/bin/ception \
+                --suffix PATH : ${lib.makeBinPath [ pkgs.nodejs ]}
             '';
 
             meta = {
-              description = "Run OpenAI Codex as a named background subagent from Claude Code";
+              description = "Run OpenAI Codex as a named background subagent";
               license = lib.licenses.asl20;
               platforms = lib.platforms.linux;
               mainProgram = "ception";
@@ -81,7 +71,6 @@
               clippy
               rustfmt
               rust-analyzer
-              nodejs
             ];
           };
         }
