@@ -997,6 +997,136 @@ fn a_crashed_app_server_reaches_the_waiting_client_with_its_stderr() {
     assert!(ctx.wait_status("crash", "dead", WAIT), "daemon outlived its app-server");
 }
 
+// ----- --timeout and watch --run --------------------------------------------------------------
+
+#[test]
+fn spawn_timeout_hands_back_a_run_that_watch_run_delivers() {
+    let ctx = Ctx::new("steer");
+
+    let started = Instant::now();
+    let out = ctx.ception(&["spawn", "park", "--timeout", "1", "slow turn"]).run().expect_code(5);
+    let elapsed = started.elapsed();
+    assert!(elapsed >= secs(1) && elapsed < secs(5), "gave up after {elapsed:?}");
+    let run = still_running_run(&out, "park");
+    assert_eq!(ctx.status("park").as_deref(), Some("active"));
+
+    // Blocks on the live run...
+    let mut live = ctx.ception(&["watch", "park", "--run", &run]).spawn();
+    live.wait_stdout("log: ");
+    std::thread::sleep(ms(200));
+    ctx.ception(&["send", "park", "add steering"]).run().expect_code(0);
+    let watched = live.wait().expect_code(0);
+    assert_has(&watched.stdout, "Steered response");
+
+    // ...and once it has settled, hands out the retained report.
+    let again = ctx.ception(&["watch", "park", "--run", &run]).timeout(secs(3)).run().expect_code(0);
+    assert_has(&again.stdout, "Steered response");
+}
+
+#[test]
+fn timeout_zero_returns_once_the_turn_runs_and_the_turn_keeps_going() {
+    let ctx = Ctx::new("steer");
+
+    let started = Instant::now();
+    let out = ctx.ception(&["spawn", "park", "--timeout", "0", "slow turn"]).run().expect_code(5);
+    assert!(started.elapsed() < secs(1), "took {:?}", started.elapsed());
+    still_running_run(&out, "park");
+    assert_eq!(ctx.status("park").as_deref(), Some("active"));
+    assert_eq!(ctx.turn_starts(), 1);
+}
+
+/// The timeout only counts once the turn is running: here turn/start answers
+/// a second late, and even a zero timeout waits for it.
+#[test]
+fn timeout_waits_for_a_turn_that_is_slow_to_start() {
+    let ctx = Ctx::new("slow-turn-start");
+
+    let started = Instant::now();
+    let out = ctx.ception(&["spawn", "slow", "--timeout", "0", "work"]).run().expect_code(5);
+    assert!(started.elapsed() >= secs(1), "gave up after {:?}, before the turn started", started.elapsed());
+    still_running_run(&out, "slow");
+    assert_eq!(ctx.status("slow").as_deref(), Some("active"));
+}
+
+#[test]
+fn a_turn_that_settles_inside_the_timeout_reports_as_usual() {
+    let ctx = Ctx::new("fail");
+
+    let out = ctx.ception(&["spawn", "boom", "--timeout", "5", "explode"]).run().expect_code(2);
+    assert_has(&out.stdout, "status: failed");
+    assert_lacks(&out.stdout, "still running");
+}
+
+/// The record write fails between thread start and turn start; even a zero
+/// timeout must not turn that into "still running".
+#[test]
+fn a_spawn_failing_before_its_turn_starts_reports_the_error_despite_the_timeout() {
+    let ctx = Ctx::new("happy");
+    let record = ctx.record_path(SESSION, "ghost");
+    fs::create_dir_all(&record).unwrap();
+
+    let out = ctx.ception(&["spawn", "ghost", "--timeout", "0", "hello"]).run().expect_code(4);
+    assert_has(&out.stderr, &format!("write {}: Is a directory", record.display()));
+    assert_lacks(&out.stdout, "still running");
+}
+
+#[test]
+fn a_goal_rejected_before_its_turn_starts_reports_the_error_despite_the_timeout() {
+    let ctx = Ctx::new("goal-set-error");
+
+    let mut running = ctx.ception(&["spawn", "arc", "slow work"]).spawn();
+    ctx.wait_listed("arc\tmine\tactive");
+
+    let goal = ctx.ception(&["goal", "arc", "--timeout", "0", "the objective"]).run().expect_code(4);
+    assert_has(&goal.stderr, "goal rejected by fixture");
+    assert_lacks(&goal.stdout, "still running");
+    running.wait().expect_code(0);
+}
+
+#[test]
+fn goal_timeout_hands_back_the_goal_turns_run() {
+    let ctx = Ctx::new("steer");
+
+    // "steer" parks the turn the goal starts until something steers it.
+    let started = Instant::now();
+    let out = ctx.ception(&["goal", "arc", "--timeout", "1", "the long objective"]).run().expect_code(5);
+    assert!(started.elapsed() >= secs(1), "gave up after {:?}", started.elapsed());
+    let run = still_running_run(&out, "arc");
+
+    ctx.ception(&["send", "arc", "stop polishing the parser"]).run().expect_code(0);
+    let watched = ctx.ception(&["watch", "arc", "--run", &run]).run().expect_code(0);
+    assert_has(&watched.stdout, "Steer: stop polishing the parser");
+}
+
+#[test]
+fn watch_run_of_an_unknown_run_fails_with_exit_4() {
+    let ctx = Ctx::new("happy");
+
+    ctx.ception(&["spawn", "quiet", "first"]).run().expect_code(0);
+    let out = ctx.ception(&["watch", "quiet", "--run", "999"]).timeout(secs(3)).run().expect_code(4);
+    assert_has(&out.stderr, "not known");
+}
+
+#[test]
+fn watch_timeout_on_a_parked_turn_hands_back_its_run() {
+    let ctx = Ctx::new("steer");
+
+    let mut first = ctx.ception(&["spawn", "park", "slow turn"]).spawn();
+    ctx.wait_turn_starts(1);
+
+    let started = Instant::now();
+    let out = ctx.ception(&["watch", "park", "--timeout", "1"]).run().expect_code(5);
+    assert!(started.elapsed() >= secs(1), "gave up after {:?}", started.elapsed());
+    let run = still_running_run(&out, "park");
+
+    // It is the run the spawn client is waiting on.
+    ctx.ception(&["send", "park", "add steering"]).run().expect_code(0);
+    let spawned = first.wait().expect_code(0);
+    assert_has(&spawned.stdout, "Steered response");
+    let watched = ctx.ception(&["watch", "park", "--run", &run]).timeout(secs(3)).run().expect_code(0);
+    assert_has(&watched.stdout, "Steered response");
+}
+
 // ----- helpers ---------------------------------------------------------------------------
 
 fn requests<'a>(state: &'a Value, method: &'a str) -> impl Iterator<Item = &'a Value> + 'a {
@@ -1009,6 +1139,17 @@ fn goal_set_statuses(state: &Value) -> Vec<String> {
 
 fn last_turn_start(state: &Value) -> &Value {
     state["lastTurnStarts"].as_array().and_then(|turns| turns.last()).expect("a turn start")
+}
+
+/// The run id from a `--timeout` exit, checking the whole reattach line.
+#[track_caller]
+fn still_running_run(out: &Output, label: &str) -> String {
+    let lines = out.lines_starting("still running: run ");
+    assert_eq!(lines.len(), 1, "{out}");
+    let run = lines[0]["still running: run ".len()..].split(';').next().unwrap().to_string();
+    assert!(run.parse::<u64>().is_ok(), "{out}");
+    assert_eq!(lines[0], format!("still running: run {run}; reattach with `ception watch {label} --run {run}`"));
+    run
 }
 
 /// Pids of the long-lived processes the fake left behind.
