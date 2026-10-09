@@ -1421,9 +1421,10 @@ impl Daemon {
     }
 
     fn finish_active_turn(&mut self) {
-        let Some(turn) = self.active.take() else {
+        let Some(mut turn) = self.active.take() else {
             return;
         };
+        turn.acc.settle();
         self.log(&turn.acc.footer_line());
         for client in turn.clients {
             let reply = turn_reply(&turn.acc, self.goal.clone(), client.report);

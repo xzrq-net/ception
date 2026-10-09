@@ -239,6 +239,9 @@ pub struct TurnAccumulator {
     /// Wall clock for the log header; `started` times the turn.
     started_at: jiff::Timestamp,
     started: Instant,
+    /// Set when the run settles, so a report built later (`watch --run`)
+    /// keeps the run's own duration.
+    settled: Option<Duration>,
     /// What `items` reports carry: one line per completed item.
     item_lines: Vec<String>,
     /// What `full` reports and the log carry: started items too.
@@ -268,6 +271,7 @@ impl TurnAccumulator {
             derailed_by_compaction: false,
             started_at: jiff::Timestamp::now(),
             started: Instant::now(),
+            settled: None,
             item_lines: Vec::new(),
             full_lines: Vec::new(),
             reasoning_summary_deltas: HashMap::new(),
@@ -295,6 +299,15 @@ impl TurnAccumulator {
         )
     }
 
+    /// Stop the clock: the run is over.
+    pub fn settle(&mut self) {
+        self.settled.get_or_insert(self.started.elapsed());
+    }
+
+    fn elapsed(&self) -> Duration {
+        self.settled.unwrap_or_else(|| self.started.elapsed())
+    }
+
     pub fn footer_line(&self) -> String {
         let error_info = match &self.error_info {
             Some(info) => format!(" errorCode={info}"),
@@ -309,7 +322,7 @@ impl TurnAccumulator {
             "=== status={}{error_info}{compactions} tokens={} durationMs={} ===",
             self.status,
             format_token_usage(&self.token_usage),
-            self.started.elapsed().as_millis(),
+            self.elapsed().as_millis(),
         )
     }
 
@@ -557,7 +570,7 @@ impl TurnAccumulator {
         let files = if files.is_empty() { "none".to_string() } else { files.join(", ") };
         footer.push(format!("files touched: {files}"));
         footer.push(format!("tokens: {}", format_token_usage(&self.token_usage)));
-        footer.push(format!("duration: {}", format_duration(self.started.elapsed())));
+        footer.push(format!("duration: {}", format_duration(self.elapsed())));
         let footer = footer.join("\n");
 
         let no_message = format!("(turn {}, no final message)", self.status);
@@ -806,6 +819,14 @@ mod tests {
         assert_eq!(one_line("  a \n\t b\u{a0}c\u{feff} ", 200), "a b c");
         // U+0085 is not `\s` in JS.
         assert_eq!(one_line("a\u{85}b", 200), "a\u{85}b");
+    }
+
+    #[test]
+    fn a_settled_run_keeps_its_duration_for_later_reports() {
+        let mut turn = accumulator();
+        turn.settle();
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(turn.build_report(ReportLevel::Brief).contains("duration: 0.0s"));
     }
 
     #[test]
