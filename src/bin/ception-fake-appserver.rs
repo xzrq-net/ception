@@ -18,6 +18,7 @@
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, ErrorKind, Write};
+use std::os::fd::FromRawFd;
 use std::panic;
 use std::path::PathBuf;
 use std::process::{self, Stdio};
@@ -465,12 +466,14 @@ fn write_out(text: &str) {
 
 static TIMERS: Mutex<Vec<JoinHandle<()>>> = Mutex::new(Vec::new());
 
-/// Set by "deaf": the stdin reader stops for good, so the client's writes back
-/// up once the pipe buffer is full.
+/// Set by "deaf" and "close-stdin": the stdin reader stops for good. Deaf
+/// leaves the pipe open, so the client's writes back up once its buffer is
+/// full; close-stdin closes it, so they fail.
 static DEAF: AtomicBool = AtomicBool::new(false);
 
 /// A long-lived process in the fake's process group, the way codex's shells
 /// and tools are. Never reaped by the fake; recorded for tests to check on.
+#[allow(clippy::zombie_processes)]
 fn spawn_descendant(script: &str, stdout: Stdio) {
     let child = process::Command::new("sh")
         .args(["-c", script])
@@ -813,15 +816,29 @@ impl Server {
     fn handle(&mut self, message: &Value) -> Result<(), String> {
         let params = &message["params"];
         match message["method"].as_str().unwrap_or_default() {
-            "initialize" => self.send(reply(
-                message,
-                json!({ "userAgent": "fake", "codexHome": "/tmp/fake", "platformFamily": "unix", "platformOs": "linux" }),
-            )),
+            "initialize" => {
+                let answer = reply(
+                    message,
+                    json!({ "userAgent": "fake", "codexHome": "/tmp/fake", "platformFamily": "unix", "platformOs": "linux" }),
+                );
+                // A server slow to come up, as npx fetching codex can be.
+                if *BEHAVIOR == "slow-initialize" {
+                    set_timeout(1500, move |s| s.send(answer));
+                } else {
+                    self.send(answer);
+                }
+            }
 
             "initialized" => {}
 
             "thread/start" => {
                 let thread = create_thread(given(&params["cwd"]).unwrap_or_else(|| json!(cwd())));
+                if *BEHAVIOR == "close-stdin" {
+                    // Stops reading for good but keeps running, stdout open:
+                    // every later write from the client fails.
+                    drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(0) });
+                    DEAF.store(true, Ordering::SeqCst);
+                }
                 self.send(reply(message, json!({ "thread": build_thread(&thread) })));
                 self.send(json!({ "method": "thread/started", "params": { "thread": build_thread(&thread) } }));
             }
@@ -959,6 +976,22 @@ impl Server {
                 self.send(turn_started(&turn.thread_id, &turn.turn_id));
                 eprintln!("fake: rollout file corrupt (distinctive-crash-7731)");
                 process::exit(3);
+            }
+            // Codex runs a turn of its own (U) on the thread, then rejects ours.
+            "unsolicited-then-reject" => {
+                let unrelated = Turn::unprompted(&turn.thread_id);
+                let Turn { thread_id, turn_id, .. } = &unrelated;
+                self.send(turn_started(thread_id, turn_id));
+                self.send(agent_message(thread_id, turn_id, "Unrelated work."));
+                self.send(turn_completed(thread_id, turn_id, "completed", Value::Null));
+                self.send(reply_error(message, -32000, "turn rejected by fixture"));
+            }
+            // Parks the turn, then asks for an approval half a second later.
+            "late-server-request" => {
+                self.send(reply(message, started(&turn)));
+                let parked = turn.clone();
+                self.start_long_turn(turn);
+                set_timeout(500, move |s| s.send_unsupported_request(&parked));
             }
             // The reply comes a second late; the turn then stays open.
             "slow-turn-start" => {

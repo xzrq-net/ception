@@ -165,9 +165,7 @@ fn daemon_is_reparented_at_spawn_and_survives_spawn_client_death_mid_turn() {
     ctx.wait_turn_starts(1);
 
     // The daemon must already be out of the client's process tree.
-    let log = ctx.log(SESSION, "orphan");
-    let starting = log.lines().find(|line| line.starts_with("[daemon] starting ")).expect("starting line");
-    let daemon_pid: u32 = starting.rsplit_once(" pid=").expect("pid=").1.parse().unwrap();
+    let daemon_pid = daemon_pid(&ctx.log(SESSION, "orphan"));
     assert_ne!(ppid(daemon_pid), first.pid());
 
     first.kill();
@@ -1149,6 +1147,160 @@ fn watch_timeout_on_a_parked_turn_hands_back_its_run() {
     assert_has(&watched.stdout, "Steered response");
 }
 
+// ----- regressions found in the second review ------------------------------------------------
+
+/// A SIGKILLed daemon runs no cleanup; its app-server's descendants used to
+/// outlive it for good, overlapping whatever the next daemon started.
+#[test]
+fn a_revived_daemon_first_kills_what_a_sigkilled_predecessor_left_running() {
+    let ctx = Ctx::new("stubborn-child");
+
+    ctx.ception(&["spawn", "shell", "start a tool"]).run().expect_code(0);
+    let tool = children(&ctx)[0];
+    let _reap = Reap::new(&[tool]);
+    let daemon = daemon_pid(&ctx.log(SESSION, "shell"));
+    unsafe { libc::kill(daemon as libc::pid_t, libc::SIGKILL) };
+    let lock = ctx.lock_path(SESSION, "shell");
+    assert!(wait_until(WAIT, || lock_free(&lock)), "SIGKILLed daemon still holds the label");
+    assert!(alive(tool), "the tool should outlive its SIGKILLed daemon (it ignores SIGTERM)");
+
+    ctx.ception(&["send", "shell", "follow up"]).run().expect_code(0);
+    let _reap_new = Reap::new(&children(&ctx));
+    assert!(!alive(tool), "the predecessor's tool {tool} survived the revival");
+
+    // Taken down before the new daemon started serving.
+    let log = ctx.log(SESSION, "shell");
+    let lines: Vec<&str> = log.lines().collect();
+    let started = lines.iter().rposition(|line| line.starts_with("[daemon] starting ")).unwrap();
+    let killed = lines
+        .iter()
+        .position(|line| line.contains("killing leftover app-server process group"))
+        .unwrap_or_else(|| panic!("no leftover kill logged:\n{log}"));
+    let listening = started + lines[started..].iter().position(|line| line.starts_with("[daemon] listening")).unwrap();
+    assert!(started < killed && killed < listening, "{log}");
+}
+
+/// A turn codex started by itself used to be taken for the requested one, so
+/// a rejected turn/start reported that unrelated turn as success.
+#[test]
+fn an_unsolicited_turn_does_not_answer_a_rejected_turn_start() {
+    let ctx = Ctx::new("unsolicited-then-reject");
+
+    let out = ctx.ception(&["spawn", "reject", "work"]).run().expect_code(4);
+    assert_has(&out.stderr, "turn rejected by fixture");
+    assert_lacks(&out.stdout, "Unrelated work.");
+
+    // Nor is the unrelated turn "the turn is running".
+    let out = ctx.ception(&["spawn", "reject0", "--timeout", "0", "work"]).run().expect_code(4);
+    assert_has(&out.stderr, "turn rejected by fixture");
+    assert_lacks(&out.stdout, "still running");
+}
+
+/// A failed write to the app-server used to be dropped silently, leaving the
+/// request (and its client) waiting forever.
+#[test]
+fn a_server_that_closes_its_stdin_fails_the_turn_promptly() {
+    let ctx = Ctx::new("close-stdin");
+
+    for args in [&["spawn", "closed", "work"][..], &["spawn", "closed0", "--timeout", "0", "work"]] {
+        let started = Instant::now();
+        let out = ctx.ception(args).timeout(secs(10)).run().expect_code(4);
+        assert!(started.elapsed() < secs(5), "took {:?}", started.elapsed());
+        assert_has(&out.stderr, "write to codex app-server");
+    }
+}
+
+/// A daemon on its way out used to fail the requests queued on it; now it
+/// refuses them and the client revives the label and retries. The send waits
+/// behind a held report, then the daemon's watched process dies.
+#[test]
+fn a_send_refused_by_a_daemon_on_its_way_out_revives_the_label_and_succeeds() {
+    let ctx = Ctx::new("continuation");
+    let mut dummy = Dummy::start();
+
+    // The compacted turn's report is held for a continuation that won't come
+    // while the test runs.
+    let first_env = ctx
+        .env
+        .set("CEPTION_WATCH_PID", dummy.pid())
+        .set("CEPTION_CONTINUATION_GRACE_MS", 20000)
+        .set("CEPTION_FAKE_CONTINUATION_DELAY_MS", 20000);
+    let mut first = ctx.ception(&["spawn", "hold", "do the work"]).env(&first_env).spawn();
+    let log = ctx.log_path(SESSION, "hold");
+    assert!(
+        wait_until(WAIT, || fs::read_to_string(&log).is_ok_and(|log| log.contains("holding the report"))),
+        "the report was never held"
+    );
+
+    // Same session from a new process; the revived daemon plays it straight.
+    let second_env = ctx.env.set("CEPTION_FAKE_BEHAVIOR", "happy");
+    let mut sent = ctx.ception(&["send", "hold", "follow up after the handover"]).env(&second_env).spawn();
+    sent.wait_stdout("log: ");
+    std::thread::sleep(ms(300));
+    dummy.kill();
+
+    let sent = sent.wait().expect_code(0);
+    assert_has(&sent.stdout, "Resumed the prior run");
+    assert_eq!(sent.lines_starting("log: ").len(), 1, "{sent}");
+    let state = ctx.fake_state();
+    assert_eq!(state["appServerStarts"], 2);
+    assert_eq!(requests(&state, "thread/resume").count(), 1);
+    // The held client goes down with its daemon.
+    assert_ne!(first.wait().code, Some(0));
+}
+
+/// A run that ended in an infrastructure failure (here a server request,
+/// which fails the turn) used to vanish: `watch --run` said it was unknown.
+#[test]
+fn a_run_lost_to_an_infrastructure_failure_stays_watchable() {
+    let ctx = Ctx::new("late-server-request");
+
+    let out = ctx.ception(&["spawn", "lost", "--timeout", "0", "work"]).run().expect_code(5);
+    let run = still_running_run(&out, "lost");
+    assert!(
+        wait_until(WAIT, || ctx.log(SESSION, "lost").contains("[error] codex sent")),
+        "the fixture's approval request never arrived"
+    );
+
+    let watched = ctx.ception(&["watch", "lost", "--run", &run]).timeout(secs(3)).run().expect_code(4);
+    assert_has(&watched.stderr, "codex sent item/commandExecution/requestApproval");
+    assert_lacks(&watched.stderr, "not retained");
+}
+
+/// A retained report used to carry the goal as it is now, not as it stood
+/// when the run settled.
+#[test]
+fn a_retained_report_keeps_the_goal_as_it_stood_when_the_run_settled() {
+    let ctx = Ctx::new("steer");
+
+    // "steer" parks each goal turn until something steers it.
+    let out = ctx.ception(&["goal", "arc", "--timeout", "0", "first objective"]).run().expect_code(5);
+    let run = still_running_run(&out, "arc");
+    ctx.ception(&["send", "arc", "finish it"]).run().expect_code(0);
+    ctx.wait_listed("arc\tmine\tidle\tgoal=complete");
+
+    let out = ctx.ception(&["goal", "arc", "--timeout", "0", "second objective"]).run().expect_code(5);
+    still_running_run(&out, "arc");
+
+    let watched = ctx.ception(&["watch", "arc", "--run", &run]).timeout(secs(3)).run().expect_code(0);
+    assert_has(&watched.stdout, "goal: complete — first objective");
+    assert_lacks(&watched.stdout, "second objective");
+}
+
+/// The timeout used to start counting only once the daemon was up, so a slow
+/// app-server start was paid on top of it.
+#[test]
+fn timeout_counts_from_the_start_of_the_command() {
+    let ctx = Ctx::new("slow-initialize");
+
+    // initialize answers after 1.5s; the turn then parks.
+    let started = Instant::now();
+    let out = ctx.ception(&["spawn", "park", "--timeout", "1", "slow turn"]).run().expect_code(5);
+    let elapsed = started.elapsed();
+    assert!(elapsed >= ms(1500) && elapsed < ms(2200), "took {elapsed:?}");
+    still_running_run(&out, "park");
+}
+
 // ----- helpers ---------------------------------------------------------------------------
 
 fn requests<'a>(state: &'a Value, method: &'a str) -> impl Iterator<Item = &'a Value> + 'a {
@@ -1174,6 +1326,12 @@ fn still_running_run(out: &Output, label: &str) -> String {
     assert!(generation.len() == 4 && n.parse::<u64>().is_ok(), "{out}");
     assert_eq!(lines[0], format!("still running: run {run}; reattach with `ception watch {label} --run {run}`"));
     run
+}
+
+/// The pid in the log's last `[daemon] starting ... pid=N` line.
+fn daemon_pid(log: &str) -> u32 {
+    let starting = log.lines().rfind(|line| line.starts_with("[daemon] starting ")).expect("starting line");
+    starting.rsplit_once(" pid=").expect("pid=").1.parse().unwrap()
 }
 
 /// Pids of the long-lived processes the fake left behind.
