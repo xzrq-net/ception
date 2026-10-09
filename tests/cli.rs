@@ -5,7 +5,9 @@
 mod support;
 
 use std::fs;
-use std::time::{Duration, Instant};
+use std::os::unix::process::CommandExt;
+use std::process::Command;
+use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::Value;
 use support::*;
@@ -1301,6 +1303,126 @@ fn timeout_counts_from_the_start_of_the_command() {
     still_running_run(&out, "park");
 }
 
+// ----- regressions found in the third review -------------------------------------------------
+
+/// Leftover cleanup used to trust a recorded process-group id, which an
+/// unrelated group can reuse once the app-server's is gone. Now only
+/// processes carrying the label's owner token are touched. The planted
+/// `.pgid` file is the old design's record, naming an unrelated group of ours.
+#[test]
+fn leftover_cleanup_kills_only_processes_carrying_the_owner_token() {
+    let ctx = Ctx::new("happy");
+    let lock = ctx.lock_path(SESSION, "victim");
+    fs::create_dir_all(lock.parent().unwrap()).unwrap();
+
+    let mut bystander = Command::new("sleep").arg("1000").process_group(0).spawn().unwrap();
+    let bystander_pid = bystander.id();
+    let _reap = Reap::new(&[bystander_pid]);
+    let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
+    let pid_ns = fs::read_link("/proc/self/ns/pid").unwrap();
+    let namespace = format!("{}/{}", boot_id.trim(), pid_ns.display());
+    fs::write(lock.with_extension("pgid"), format!("{bystander_pid} {namespace}\n")).unwrap();
+
+    // Unique, so concurrent runs of the suite can't see each other's.
+    let nanos = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos();
+    let token = format!("{:08x}{:024x}", std::process::id(), nanos);
+    fs::write(lock.with_extension("owner"), &token).unwrap();
+    let leftover = Command::new("sleep").arg("1000").env("CEPTION_OWNER", &token).spawn().unwrap();
+    let leftover_pid = leftover.id();
+    let _reap_leftover = Reap::new(&[leftover_pid]);
+    reap_in_background(leftover);
+
+    ctx.ception(&["spawn", "victim", "work"]).run().expect_code(0);
+    assert!(!alive(leftover_pid), "the leftover carrying the owner token survived");
+    assert!(alive(bystander_pid), "an unrelated process was killed");
+    assert_has(&ctx.log(SESSION, "victim"), "killed 1 process(es) a previous daemon left running");
+
+    let _ = bystander.kill();
+    let _ = bystander.wait();
+}
+
+/// A turn that ran to completion before its turn/start reply used to be
+/// waited on forever, or under --timeout reported as a run that never ends.
+#[test]
+fn a_turn_finished_before_its_turn_start_reply_is_reported() {
+    let ctx = Ctx::new("finished-before-reply");
+
+    let out = ctx.ception(&["spawn", "early", "work"]).timeout(secs(10)).run().expect_code(0);
+    assert_has(&out.stdout, "Finished before the reply.");
+
+    let out = ctx.ception(&["spawn", "early0", "--timeout", "0", "work"]).timeout(secs(10)).run().expect_code(0);
+    assert_has(&out.stdout, "Finished before the reply.");
+    assert_lacks(&out.stdout, "still running");
+}
+
+/// Same, with codex starting a parked turn of its own before the reply: the
+/// requester still gets its turn's report, and the other turn stays tracked.
+#[test]
+fn a_turn_finished_before_its_reply_is_reported_while_another_turn_runs() {
+    let ctx = Ctx::new("finished-before-reply-parked");
+
+    let out = ctx.ception(&["spawn", "early", "work"]).timeout(secs(10)).run().expect_code(0);
+    assert_has(&out.stdout, "Finished before the reply.");
+    assert_eq!(ctx.status("early").as_deref(), Some("active"), "the unsolicited turn must stay tracked");
+}
+
+/// Connections arriving once shutdown had begun used to sit unanswered until
+/// the daemon exited. Now they are refused at once, and a send waits out the
+/// old daemon and is served by its successor.
+#[test]
+fn a_daemon_in_its_shutdown_window_refuses_at_once_and_send_reaches_a_successor() {
+    let ctx = Ctx::new("slow-interrupt");
+
+    let mut first = ctx.ception(&["spawn", "slow", "slow turn"]).spawn();
+    ctx.wait_turn_starts(1);
+    ctx.wait_listed("slow\tmine\tactive");
+    // Returns once accepted; the daemon then waits 2s on the fixture's interrupt.
+    ctx.ception(&["kill", "slow"]).run().expect_code(0);
+
+    let started = Instant::now();
+    assert_eq!(ctx.status("slow").as_deref(), Some("dead"));
+    assert!(started.elapsed() < secs(1), "list waited {:?} on a daemon shutting down", started.elapsed());
+
+    let sent = ctx.ception(&["send", "slow", "follow up"]).run().expect_code(0);
+    assert_has(&sent.stdout, "Resumed the prior run");
+    assert_eq!(ctx.fake_state()["appServerStarts"], 2);
+    assert_ne!(first.wait().code, Some(0));
+}
+
+/// An interrupt used to wait for a pending turn/start reply even when
+/// turn/started had already named the turn.
+#[test]
+fn interrupt_reaches_a_known_turn_without_waiting_for_its_start_reply() {
+    let ctx = Ctx::new("started-before-slow-reply");
+
+    let mut spawned = ctx.ception(&["spawn", "early", "work"]).spawn();
+    ctx.wait_turn_starts(1);
+    let interrupted = ctx.ception(&["interrupt", "early"]).run().expect_code(0);
+    assert_has(&interrupted.stdout, "interrupt requested");
+    spawned.wait().expect_code(3);
+
+    let state = ctx.fake_state();
+    let interrupt_at = state["requests"].as_array().unwrap().iter().position(|r| r["method"] == "turn/interrupt").unwrap();
+    let mark = state["marks"].as_array().unwrap().iter().find(|m| m["mark"] == "turn/start replied").unwrap();
+    let requests_before_reply = mark["requests"].as_u64().unwrap() as usize;
+    assert!(
+        interrupt_at < requests_before_reply,
+        "interrupt sent only after the turn/start reply (request #{interrupt_at}, reply after #{requests_before_reply})"
+    );
+}
+
+/// Startup used to go ahead without the owner token on disk; now failing to
+/// record it fails startup before any app-server exists.
+#[test]
+fn a_daemon_that_cannot_record_its_owner_token_fails_before_starting_codex() {
+    let ctx = Ctx::new("happy");
+    fs::create_dir_all(ctx.lock_path(SESSION, "token").with_extension("owner")).unwrap();
+
+    let out = ctx.ception(&["spawn", "token", "work"]).run().expect_code(4);
+    assert_has(&out.stderr, "record the app-server owner token");
+    assert_eq!(ctx.fake_state()["appServerStarts"], Value::Null, "an app-server was started");
+}
+
 // ----- helpers ---------------------------------------------------------------------------
 
 fn requests<'a>(state: &'a Value, method: &'a str) -> impl Iterator<Item = &'a Value> + 'a {
@@ -1332,6 +1454,11 @@ fn still_running_run(out: &Output, label: &str) -> String {
 fn daemon_pid(log: &str) -> u32 {
     let starting = log.lines().rfind(|line| line.starts_with("[daemon] starting ")).expect("starting line");
     starting.rsplit_once(" pid=").expect("pid=").1.parse().unwrap()
+}
+
+/// Reap a child as soon as it dies, so it doesn't linger as a zombie.
+fn reap_in_background(mut child: std::process::Child) {
+    std::thread::spawn(move || child.wait());
 }
 
 /// Pids of the long-lived processes the fake left behind.

@@ -872,10 +872,19 @@ impl Server {
                     self.send(reply_error(message, -32000, "turn no longer active"));
                     return Ok(());
                 }
-                self.send(reply(message, json!({})));
-                if let Some(active) = self.active_turn.clone() {
-                    self.complete_turn(&active, "interrupted", Some("Interrupted by fixture."));
+                fn interrupt(s: &mut Server, request: &Value) {
+                    s.send(reply(request, json!({})));
+                    if let Some(active) = s.active_turn.clone() {
+                        s.complete_turn(&active, "interrupted", Some("Interrupted by fixture."));
+                    }
                 }
+                // Takes two seconds to answer and stop the turn.
+                if *BEHAVIOR == "slow-interrupt" {
+                    let request = message.clone();
+                    set_timeout(2000, move |s| interrupt(s, &request));
+                    return Ok(());
+                }
+                interrupt(self, message);
             }
 
             "account/rateLimits/read" => self.send(reply(message, rate_limits())),
@@ -992,6 +1001,33 @@ impl Server {
                 let parked = turn.clone();
                 self.start_long_turn(turn);
                 set_timeout(500, move |s| s.send_unsupported_request(&parked));
+            }
+            // The turn runs to completion before the reply naming it goes out.
+            // "-parked": codex then starts a parked turn of its own (W) first.
+            behavior @ ("finished-before-reply" | "finished-before-reply-parked") => {
+                let Turn { thread_id, turn_id, .. } = &turn;
+                self.send(turn_started(thread_id, turn_id));
+                self.send(agent_message(thread_id, turn_id, "Finished before the reply."));
+                self.send(turn_completed(thread_id, turn_id, "completed", Value::Null));
+                if behavior == "finished-before-reply-parked" {
+                    let unsolicited = Turn::unprompted(thread_id);
+                    self.start_long_turn(unsolicited);
+                }
+                self.send(reply(message, started(&turn)));
+            }
+            // The turn starts at once; the reply naming it comes two seconds
+            // late, marked like slow-turn-start's.
+            "started-before-slow-reply" => {
+                let request = message.clone();
+                let answer = started(&turn);
+                self.start_long_turn(turn);
+                set_timeout(2000, move |s| {
+                    update_state(|state| {
+                        let requests = state.requests.len();
+                        state.marks.push(json!({ "mark": "turn/start replied", "requests": requests }));
+                    });
+                    s.send(reply(&request, answer));
+                });
             }
             // The reply comes a second late; the turn then stays open.
             "slow-turn-start" => {
