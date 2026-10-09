@@ -30,6 +30,23 @@ impl PidWatch {
     /// `None` if the process is already gone, including when its pid now
     /// belongs to someone else.
     pub fn open(pid: u32, expected_starttime: u64) -> Result<Option<Self>> {
+        let Some(watch) = Self::pidfd(pid)? else {
+            return Ok(None);
+        };
+        // Checked after opening: the pidfd pins this pid to whatever process
+        // holds it now, so a matching starttime proves it is the right one.
+        if starttime(pid).ok() != Some(expected_starttime) {
+            return Ok(None);
+        }
+        Ok(Some(watch))
+    }
+
+    /// For our own unreaped child, whose pid cannot have been reused.
+    pub fn child(pid: u32) -> Result<Option<Self>> {
+        Self::pidfd(pid)
+    }
+
+    fn pidfd(pid: u32) -> Result<Option<Self>> {
         let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
         if raw < 0 {
             let error = io::Error::last_os_error();
@@ -39,11 +56,6 @@ impl PidWatch {
             return Err(error).context("pidfd_open");
         }
         let fd = unsafe { OwnedFd::from_raw_fd(raw as i32) };
-        // Checked after opening: the pidfd pins this pid to whatever process
-        // holds it now, so a matching starttime proves it is the right one.
-        if starttime(pid).ok() != Some(expected_starttime) {
-            return Ok(None);
-        }
         Ok(Some(Self { fd: AsyncFd::with_interest(fd, Interest::READABLE)? }))
     }
 

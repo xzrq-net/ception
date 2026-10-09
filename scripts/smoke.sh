@@ -1,19 +1,21 @@
 #!/usr/bin/env bash
 # Manual end-to-end smoke test against real codex (npx -y @openai/codex).
-# Requires codex auth. Run by hand; not part of `npm test`.
+# Requires codex auth. Run by hand; not part of `cargo test`. Uses
+# CEPTION_BIN if set, else the debug build.
 set -euo pipefail
 
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 scratch="$(mktemp -d)"
 label="smoke-$$"
-trap 'node "$repo/bin/ception.mjs" kill "$label" --cwd "$scratch" >/dev/null 2>&1 || true; rm -rf "$scratch"' EXIT
+bin="${CEPTION_BIN:-$repo/target/debug/ception}"
+trap '"$bin" kill "$label" --cwd "$scratch" >/dev/null 2>&1 || true; rm -rf "$scratch"' EXIT
 
 ception() {
-  node "$repo/bin/ception.mjs" "$@"
+  "$bin" "$@"
 }
 
 echo "== spawn (trivial prompt) =="
-ception spawn --label "$label" --cwd "$scratch" \
+ception spawn "$label" --cwd "$scratch" \
   "Reply with exactly the single word: pong. Do not run any commands."
 
 echo

@@ -112,8 +112,12 @@ enum Command {
     Watch {
         label: String,
         /// Tail the log instead, indefinitely.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "run")]
         follow: bool,
+        /// A run reported by `--timeout`: block on it, or print its retained
+        /// report if it already settled.
+        #[arg(long)]
+        run: Option<u64>,
         #[command(flatten)]
         wait: WaitArgs,
     },
@@ -136,6 +140,10 @@ struct WaitArgs {
     at: AtArgs,
     #[arg(long, value_enum, default_value_t)]
     report: ReportLevel,
+    /// Once the turn has started, stop waiting after SECS and exit 5; the
+    /// turn keeps running (reattach with `watch --run`).
+    #[arg(long, value_name = "SECS")]
+    timeout: Option<u64>,
 }
 
 fn main() -> ExitCode {

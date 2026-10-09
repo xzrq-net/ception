@@ -81,7 +81,8 @@ EOF
 
 - The first stdout line (of both `spawn` and `send`) is the log path; the final
   report arrives on completion (message + status/files/tokens/duration footer).
-  Exit codes: 0 done, 2 failed, 3 interrupted, 4 infra/usage error.
+  Exit codes: 0 done, 2 failed, 3 interrupted, 4 infra/usage error, 5 still
+  running after `--timeout`.
 - `--report` sets how much of the turn the report carries: `brief` (default) is
   the final message plus footer, `items` adds the command/edit trail, `full` is
   everything including reasoning. Use `items` when you'll want to audit what it
@@ -112,6 +113,11 @@ EOF
   Labels isolate threads, not files: parallel labels in the same cwd edit the
   same working copy. Give parallel writers disjoint paths or separate worktrees,
   and tell each which changes belong to someone else.
+- No background shells in your harness, or tool calls that time out? Pass
+  `--timeout SECS` to `spawn`/`send`/`goal`/`watch`: once the turn is running
+  and SECS have passed, the call prints `still running: run N` and exits 5;
+  collect the result later with `ception watch <label> --run N` (blocks, or
+  prints the retained report if the run already settled).
 - If your spawn/send shell was killed mid-turn (harness kill, user stop), the
   daemon and its turn keep running. Reattach with `ception watch <label>`: it
   blocks until the current turn completes and delivers the report and exit code

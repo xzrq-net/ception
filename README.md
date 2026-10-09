@@ -2,16 +2,18 @@
 
 # ception
 
-`ception` lets Claude Code run OpenAI Codex as a named, long-lived subagent.
-Each label maps to one daemon that owns a `codex app-server` child and one
-Codex thread. Thin CLI calls talk to that daemon over a Unix socket and exit
-when the turn completes, so Claude Code's background-Bash wakeup remains the
-synchronization mechanism.
+`ception` lets an agent harness (built for Claude Code, usable from others)
+run OpenAI Codex as a named, long-lived subagent. Each label maps to one
+daemon that owns a `codex app-server` child and one Codex thread. Thin CLI
+calls talk to that daemon over a unix socket and exit when the turn
+completes, so a harness's background-shell wakeup is the synchronization
+mechanism.
 
 ## Install
 
-`flake.nix` packages the CLI (Linux only: session tracking reads `/proc`).
-`nix build` runs the test suite as its check phase. With home-manager:
+`flake.nix` packages the CLI (Linux only: process tracking uses `/proc` and
+pidfds). `nix build` runs the test suite as its check phase. With
+home-manager:
 
 ```nix
 inputs.ception.url = "github:xzrq-net/ception";
@@ -19,15 +21,18 @@ inputs.ception.url = "github:xzrq-net/ception";
 home.packages = [ inputs.ception.packages.${pkgs.stdenv.hostPlatform.system}.default ];
 ```
 
-Then tell the agent about it; see `ception skill` below. Without nix, run
-`bin/ception.mjs` with `node` on PATH. Either way the default codex command
-is `npx -y @openai/codex app-server`; the package puts its own `npx` at the
-end of PATH.
+The default codex command is `npx -y @openai/codex app-server`; the package
+appends its own node to PATH so `npx` resolves.
+
+Nothing loads the agent-facing guide automatically. `ception skill` prints it
+([SKILL.md](SKILL.md)); point the agent at it from its own instructions, e.g.
+in `~/.claude/CLAUDE.md`: "To delegate work to Codex, use `ception`; run
+`ception skill` before first use and again after compaction."
 
 ## Usage
 
 ```sh
-ception spawn --label worker "inspect this repo"
+ception spawn worker "inspect this repo"
 ception send worker "continue with the fix"
 ception send worker - < long-prompt.md
 ception goal worker - < arc.md
@@ -40,59 +45,66 @@ ception kill worker
 ception skill
 ```
 
-`skill` prints [SKILL.md](SKILL.md), the operating guide for the agent
-driving ception. Nothing loads it automatically: point the agent at it from
-its own instructions (CLAUDE.md or similar), e.g. "run `ception skill` before
-first use and again after compaction".
+`spawn` starts a fresh Codex thread under the label; it refuses a label whose
+daemon is live. `send` reuses the live daemon, or respawns it if it died: the
+daemon resumes the label's recorded thread with its original `--model` and
+`--effort`. The daemon decides atomically what a `send` means: with a turn
+running it steers that turn and the sender exits at once (the client that
+started the turn still gets the report); idle, it starts a new turn and
+blocks. Prompts are the remaining words, or stdin for a lone `-`.
 
-`spawn` starts a fresh Codex thread. Both `spawn` and `send` print the log
-path on their first stdout line. `send` reuses the live daemon, or
-transparently respawns it (resuming the stored thread and the original
-`--model`/`--effort` options) if the daemon died. The daemon decides atomically what a `send` means: if a turn is running
-it steers that turn and the sender exits immediately (the client that started
-the turn still blocks until completion and delivers the report); if idle it
-starts a new turn and blocks.
+Both `spawn` and `send` print the log path on their first stdout line.
 
-Flags on `spawn`: `--cwd`, `--model`, `--effort`, `--report brief|items|full`.
-Model settings default to `~/.codex/config.toml`. Every other command also
-accepts `--cwd`; since labels are scoped by the project root resolved from the
-invocation cwd, a label spawned with `--cwd` must be addressed with the same
-`--cwd` (or from inside that project).
+Flags on `spawn`: `--model`, `--effort`; model settings default to
+`~/.codex/config.toml`. `spawn`, `send`, `goal` and `watch` take
+`--report brief|items|full` and `--timeout SECS`; every command takes `--cwd`.
+Labels are scoped by the project root resolved from the invocation directory,
+so a label spawned with `--cwd` must be addressed with the same `--cwd` (or
+from inside that project).
 
-Codex always runs with full access and approvals disabled; `ception` is meant
-for environments (dev containers) where Claude Code itself runs unsandboxed.
-There is no sandbox knob. If Codex ever sends an approval request anyway, the
-daemon rejects it and fails the turn with exit code 4.
+Codex always runs with full access and approvals disabled; ception is meant
+for environments where the harness itself runs unsandboxed. If Codex sends an
+approval request anyway, the daemon rejects it and fails the turn (exit 4).
 
-Report levels: `brief` (final message + status/files/tokens/duration footer, default),
-`items` (adds one line per command/edit/tool call), `full` (everything the log
-gets, including reasoning). The final message is never truncated at any level.
-The log file receives every item, but caps the bulky ones — reasoning at 4000
-characters, command output at 1600 — so it is a full trace, not a full
-transcript.
+Report levels: `brief` (final message and a status/files/tokens/duration
+footer, the default), `items` (adds one line per command, edit and tool
+call), `full` (everything the log gets, reasoning included). The final
+message is never truncated. The log receives every item but caps the bulky
+ones (reasoning at 4000 characters, command output at 1600): a full trace,
+not a full transcript.
 
 `watch` attaches to the daemon and blocks until the current turn completes,
-delivering the turn's report and exit code just as a spawn/send client would —
-the reattach tool when that client was killed mid-turn. The report level is
-the watcher's own `--report` (default `brief`), not the original client's. On an idle
-daemon it prints `no active turn` and exits 0 immediately; with no live daemon
-it fails with exit 4 (recovery is `send`, which respawns and resumes).
-`watch --follow` instead tails the raw log indefinitely, for humans.
+delivering that turn's report and exit code as a spawn/send client would; it
+is how to reattach when that client was killed. Its report level is its own
+`--report`. Idle daemon: prints `no active turn`, exits 0. No daemon: exit 4
+(`send` respawns and resumes). `watch --follow` tails the raw log instead.
 
-Exit codes: `0` turn completed (or steer/interrupt accepted), `2` turn failed,
-`3` turn interrupted, `4` usage or infrastructure error.
+Exit codes: `0` turn completed (or steer/interrupt accepted), `2` turn
+failed, `3` turn interrupted, `4` usage or infrastructure error, `5` still
+running after `--timeout`.
+
+### Harnesses without background shells
+
+A blocking call that outlives the harness's tool timeout gets killed; the
+daemon and its turn carry on. `--timeout SECS` makes that explicit: the client
+waits at most SECS (or until the turn has started, if that takes longer), then
+prints `still running: run N; reattach with ception watch LABEL --run N` and
+exits 5. `--timeout 0` returns as soon as the turn is running. `watch --run N`
+blocks on that run if it is still going and otherwise delivers its retained
+report (the daemon keeps the last 16). Failures before the turn starts are
+reported directly, as without the flag.
 
 ## Goals: runs codex drives itself
 
-A **thread goal** makes codex start turn after turn by itself until the
-objective is met — no prompt per turn:
+A thread goal makes codex start turn after turn by itself until the objective
+is met:
 
 ```sh
 ception goal audit "<the arc: what done looks like>"   # set, and block on the run
-ception goal audit -  < arc.md                          # objective from stdin
+ception goal audit - < arc.md                           # objective from stdin
 ception goal audit --resume                             # restart a stopped goal
 ception goal audit --pause                              # stop starting new turns
-ception goal audit --show                               # objective + status
+ception goal audit --show                               # objective and status
 ception goal audit --clear
 ```
 
@@ -100,29 +112,31 @@ Setting an objective, and `--resume`, behave like `spawn`: print the log path,
 block until the run settles, deliver one report covering the whole run. While
 a goal is `active` the daemon holds the report across turn boundaries
 (`CEPTION_GOAL_GRACE_MS` is the stall safety net). Set during a running turn,
-the objective is steered into it. The other forms answer immediately. A goal
-alone can start a label that has no daemon yet, on the default model and
-effort; `spawn` first to choose them.
+the objective is folded into that turn. The other forms answer at once. A
+goal alone can start a label that has no thread yet, on the default model;
+`spawn` first to choose one.
 
-Every report ends with a goal line, and `ception list` has a `goal=` column:
+Every turn report ends with a goal line, and `ception list` has a `goal=`
+column:
 
-- `active` — codex will start another turn.
-- `complete` — the objective is met. The only status that means done.
-- `paused`, `blocked`, `usageLimited`, `budgetLimited` — stopped short. A turn
+- `active`: codex will start another turn.
+- `complete`: the objective is met. The only status that means done.
+- `paused`, `blocked`, `usageLimited`, `budgetLimited`: stopped short. A turn
   error blocks the goal (`error code:` in the footer names it), and the
-  report prints the `--resume` that restarts the run.
+  report prints the `--resume` command that restarts the run.
 
-Resuming keeps the same daemon, app-server and thread — codex's background
-shells and subagents survive the stop — but a stopped goal leaves the daemon
-idle, so `CEPTION_IDLE_TIMEOUT_SECS` (4h default) is the real resume deadline.
+Resuming keeps the same daemon, app-server and thread, so codex's background
+shells and subagents survive the stop; a stopped goal leaves the daemon idle,
+so `CEPTION_IDLE_TIMEOUT_SECS` (4h) is the real resume deadline.
 
-`ception interrupt` pauses an active goal before interrupting the turn;
-otherwise freeing the thread would just start the goal's next turn.
+`ception interrupt` pauses an active goal before interrupting, even with no
+turn running; otherwise freeing the thread would just start the goal's next
+turn.
 
 ## Quota
 
-`ception quota` reports the account's rate-limit windows — the quota part of
-what codex's `/status` shows interactively:
+`ception quota` reports the account's rate-limit windows, the quota part of
+codex's interactive `/status`:
 
 ```
 primary              7d   47% used, resets in 5d 22h (2026-08-15 20:34Z)
@@ -131,132 +145,116 @@ GPT-5.3-Codex-Spark  7d   0% used, resets in 7d 0h (2026-08-16 22:27Z)
 credits              none
 ```
 
-`primary`/`secondary` are the server's own slots (OpenAI reshuffles which
-real window sits in each, hence per-line lengths). Per-model limits, credits,
-and any limit reached get rows when reported; `--json` prints the raw
-response. Answered by a throwaway app-server: no label, no daemon, no tokens.
+`primary`/`secondary` are the server's own slots (OpenAI reshuffles which real
+window sits in each, hence per-line lengths). Per-model limits, credits, and
+any limit reached get rows when reported; `--json` prints the raw response.
+Answered by a throwaway app-server: no label, no daemon, no tokens.
 
 ## Scoping: project × session
 
-Labels are namespaced by **project root** and **session**:
+Labels are namespaced by project root and session.
 
-- The project root is found by walking up from the invocation directory to the
-  nearest `.jj`/`.git`/`.hg`; without one, the directory itself is the root.
-  Running `ception` from a subdirectory therefore hits the same labels as
-  running it at the root. `--cwd` overrides the starting point.
-- The session is the **outermost** Claude Code process the client runs under
-  (pid + starttime). Two separately launched Claude Code sessions in the same
-  project can both use the label `impl` and get independent daemons and
-  independent Codex threads. Outside Claude Code, all invocations share the
-  `default` session.
+- The project root is the nearest ancestor of the invocation directory with a
+  `.jj`, `.git` or `.hg`; without one, the directory itself. `--cwd` changes
+  the starting point.
+- The session is `CEPTION_SESSION` if set, else Claude Code's
+  `CLAUDE_CODE_SESSION_ID`, else `default`. Claude Code keeps the session id
+  across `--resume` (with a new process), so a resumed session finds its
+  labels and `send` revives their threads. A nested `claude` gets its own.
+  Other harnesses share one `default` session per project unless they set
+  `CEPTION_SESSION`.
+- A daemon watches the process in `CEPTION_WATCH_PID`, else `CLAUDE_PID`, and
+  exits when it dies. Without either it lives until its idle timeout.
 
-  Outermost, because Claude Code nests short-lived claude-looking helpers
-  under the real session. The cost: a `claude` launched inside another session
-  shares its parent's labels and dies with it; pin `CEPTION_WATCH_PID` /
-  `CEPTION_WATCH_STARTTIME` to override.
-
-  A client orphaned from Claude Code (`ception send ... &` outliving the Bash
-  tool's shell) has no claude ancestor left; it falls back to the `CLAUDE_PID`
-  that Claude Code exports.
-
-**Adoption.** When `send` doesn't find the label in its own session, it looks
-at other sessions' entries for the project. If the owning session is dead
-(typical after exiting and resuming Claude Code), the label is moved into the
-current session and its thread resumed — options, thread history, and log file
-carry over. If the owner is still alive, `send` refuses with exit code 4
-rather than share the rollout.
-
-`interrupt` and `kill` act only on the calling session's daemons; `kill --all`
-kills the calling session's daemons for the current project. `list` shows all
-sessions' labels for the project (`list --all` for every project), with a
-`session` column of `mine`, a live session key, or `adoptable`. `watch`
-attaches only to the calling session's daemon; `watch --follow` may tail any
-session's log.
+Another session's labels are invisible to `send`, `interrupt`, `kill` and
+`watch`; `send` to a label only another session has fails naming that
+session. Taking it over is deliberate: run with `CEPTION_SESSION=<that id>`.
+`list` shows every session's labels for the project (`list --all` for every
+project), with a `session` column of `mine` or the session id. `kill --all`
+stops the calling session's daemons in the project.
 
 ## Continuations
 
-A turn that arrives after everything has settled (a goal turn whose waiter
-timed out, say) is adopted anyway, without its original clients — `list`
-shows the label active and `watch` can attach — so an in-flight turn is never
-invisible.
+Codex can start a turn on its own: an active goal's next turn, or the
+continuation of a compacted turn on older app-servers. While a client waits,
+the daemon folds such turns into one report (compacted turns get the shorter
+`CEPTION_CONTINUATION_GRACE_MS` hold). A turn that arrives after everything
+settled is still tracked, without clients: `list` shows the label active and
+`watch` can attach, so an in-flight turn is never invisible.
 
-Compacted turns get the goal treatment on a shorter
-`CEPTION_CONTINUATION_GRACE_MS` window. Current codex compacts within a single
-turn, so this is a fallback for the cross-turn shape seen on older
-app-servers. If a compacted turn ends with nothing but codex's
-`Instructions loaded for <path>.` acknowledgement, the report is marked failed
-(exit 2) with a warning: work done before the compaction is on disk but
-unreported, and `send` resumes it. That signature came from
-`experimental token_budget` clearing context on autocompaction instead of
-summarising it, and should not recur.
+If a compacted turn ends with nothing but codex's `Instructions loaded for
+<path>.` acknowledgement, the report is marked failed (exit 2) with a warning:
+work done before the compaction is on disk but unreported, and `send` resumes
+it.
 
 ## Daemon lifecycle
 
-The daemon is spawned through an intermediate process that exits immediately,
-so the daemon reparents to init before the spawning client blocks on the
-turn. Killing that client — including a kill of its whole process tree, which
-is what Claude Code does when it stops a background shell — costs only the
-report; the daemon and its turn keep running.
+The client starts a daemon by re-executing itself with a double fork, so the
+daemon is reparented before the client blocks on the turn. Killing that
+client, including a kill of its whole process tree (what Claude Code does to
+a background shell), costs only the report. The daemon answers the client on
+a readiness pipe: ready, busy (another daemon holds the label), or the
+startup error.
 
-A daemon exits when any of these fires:
+A daemon holds its label's lock (`flock`) for its whole life; that is the
+one-daemon-per-label guarantee, and the kernel releases it however the daemon
+dies. It owns the app-server's process group and takes it down on exit,
+codex's shells and subagents included, before releasing the lock.
 
-- **Claude ancestor watch**: at spawn, the client locates the Claude Code
-  process among its ancestors and the daemon polls it (pid + starttime, so pid
-  reuse doesn't fool it). When that process dies, the daemon interrupts any
-  active turn and exits. Spawned outside Claude Code, this watch is skipped.
-- **Idle timeout**: no turns and no connected clients for
-  `CEPTION_IDLE_TIMEOUT_SECS` (default 14400).
-- **Explicit**: `ception kill LABEL` or `ception kill --all`.
+A daemon exits when:
+
+- its watched process dies (a pidfd, so immediately); it interrupts any
+  running turn first;
+- it has had no turn, client or pending work for `CEPTION_IDLE_TIMEOUT_SECS`
+  (default 14400); `list`/`watch` probes don't count as use;
+- `ception kill LABEL` or `kill --all` asks it to.
 
 Daemon death is cheap: thread history persists in Codex's own rollout store,
 and the next `send` respawns and resumes.
 
-State entries whose owning session is dead and that have been idle for
-`CEPTION_GC_DAYS` (default 7) are garbage-collected on the next invocation,
-along with their log files.
-
 ## Files
 
-- Logs: `~/.local/state/ception/logs/<cwdhash>-<session>-<label>.log` (tail
-  with `ception watch --follow LABEL`)
-- State (session → label → thread id and options):
-  `~/.local/state/ception/<cwdhash>.json`, guarded by a `.lock` file for
-  cross-process read-modify-write. The lock records pid, process start time
-  and pid namespace, so a lock left by a killed process (or by another
-  container sharing the home directory) is recognised as debris and stolen
-  instead of being mistaken for a live holder with a reused pid. Locks from
-  a namespace we cannot inspect are believed for a few seconds only.
-  Leftover `.tmp` files older than an hour are swept on the next invocation.
-- Sockets/locks: `$XDG_RUNTIME_DIR/ception/`, falling back to
-  `~/.local/state/ception/run/`
+Under `${XDG_STATE_HOME:-~/.local/state}/ception-rs/`:
+
+- `projects/<projhash>/<session>/<label>.json`: the label's record (project
+  path, thread id, model, effort); its mtime is "last used". Written only by
+  the label's daemon while it holds the lock.
+- `projects/<projhash>/<session>/<label>.log`: the turn log (tail with
+  `ception watch --follow LABEL`).
+- `run/<key>.lock`, `run/<key>.sock`: label locks and sockets, `key` a hash of
+  project, session and label. Kept under the state root, not
+  `$XDG_RUNTIME_DIR`, so containers on one kernel sharing the state root share
+  the locks and can reach each other's daemons.
+
+Labels of other sessions idle longer than `CEPTION_GC_DAYS` (7) with no live
+daemon are deleted (record and log) on the next spawn/send/goal/list in that
+project, under the label lock.
 
 ## Environment variables
 
-- `CEPTION_CODEX_CMD` — override the app-server command line (default
-  `npx -y @openai/codex app-server`); used by tests to substitute a fake.
-- `CEPTION_IDLE_TIMEOUT_SECS` — daemon idle timeout, default 14400.
-- `CEPTION_CLAUDE_POLL_SECS` — ancestor liveness poll interval, default 30.
-- `CEPTION_SPAWN_TIMEOUT_SECS` — how long the client waits for a spawned
-  daemon's socket, default 120 (generous because the first spawn may sit
-  through an npx download).
-- `CEPTION_GC_DAYS` — age before dead-session state entries and logs are
-  collected, default 7.
-- `CEPTION_GOAL_GRACE_MS` — with an active thread goal, how long a completed
-  turn waits for codex's follow-on turn before settling anyway, default 30000.
-  A goal status change settles it sooner; turns with no goal never wait.
-- `CEPTION_GOAL_START_MS` — how long `ception goal`/`--resume` waits for codex
-  to start the goal's turn before returning the goal state instead, default
-  30000.
-- `CEPTION_CONTINUATION_GRACE_MS` — same, for the compacted-turn fallback,
-  default 2000.
-- `CEPTION_WATCH_PID` / `CEPTION_WATCH_STARTTIME` — bypass ancestor detection
-  and watch this process instead (used by tests; also pins the session key).
+- `CEPTION_SESSION`, `CEPTION_WATCH_PID`: session and watched process; see
+  Scoping.
+- `CEPTION_CODEX_CMD`: the app-server command line (default
+  `npx -y @openai/codex app-server`); tests substitute a fake.
+- `CEPTION_IDLE_TIMEOUT_SECS`: daemon idle timeout, default 14400.
+- `CEPTION_SPAWN_TIMEOUT_SECS`: daemon startup bound, default 120 (the first
+  spawn may sit through an npx download).
+- `CEPTION_GC_DAYS`: age before other sessions' idle labels are collected,
+  default 7.
+- `CEPTION_GOAL_GRACE_MS`: with an active goal, how long a completed turn
+  waits for codex's follow-on turn before settling anyway, default 30000. A
+  goal status change settles it sooner.
+- `CEPTION_GOAL_START_MS`: how long `goal`/`--resume` waits for codex to start
+  the goal's turn before answering with the goal state, default 30000.
+- `CEPTION_CONTINUATION_GRACE_MS`: the same for compacted turns, default 2000.
 
 ## Development
 
-`npm test` runs the suite against `test/fake-appserver.mjs`; no network or
-codex auth needed. `scripts/smoke.sh` is a manual end-to-end check against
-real codex.
+`nix develop` provides the toolchain. `cargo test` runs unit tests and the
+integration suite (`tests/cli.rs`), which drives the real binary against
+`src/bin/ception-fake-appserver.rs`, a scriptable stand-in for the app-server
+(behaviors chosen by `CEPTION_FAKE_BEHAVIOR`); no network or codex auth
+needed. `scripts/smoke.sh` is a manual end-to-end check against real codex.
 
 Daemons that are already running keep the code they started with until they
 exit; new invocations get the new build.

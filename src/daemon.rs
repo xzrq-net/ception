@@ -23,7 +23,6 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
-use tokio::sync::oneshot;
 use tokio::time::Instant;
 
 use crate::appserver::{AppEvent, AppServer, Incoming};
@@ -244,15 +243,28 @@ fn thread_params(project: &std::path::Path, model: Option<&str>) -> Value {
 
 /// Someone waiting on a reply.
 struct Client {
-    reply: oneshot::Sender<Reply>,
+    reply: UnboundedSender<Reply>,
     report: ReportLevel,
+    /// Told which run it is waiting on.
+    acked: bool,
 }
 
 impl Client {
+    /// The final reply.
     fn answer(self, reply: Reply) {
         let _ = self.reply.send(reply);
     }
+
+    fn accept(&mut self, run: u64) {
+        if !self.acked {
+            self.acked = true;
+            let _ = self.reply.send(Reply::Accepted { run });
+        }
+    }
 }
+
+/// Settled runs kept for `watch --run`.
+const RETAINED_RUNS: usize = 16;
 
 /// One logical run: a turn plus any continuation turns folded into it.
 struct ActiveTurn {
@@ -266,6 +278,9 @@ struct ActiveTurn {
     /// Compactions that already paid a grace hold, so a continuation that
     /// ends clean doesn't wait again.
     compactions_held: u32,
+    /// Continuation turns folded in. Once the run has moved on, a late
+    /// turn/start reply must not point it back at its first turn.
+    continued: bool,
 }
 
 /// A request's continuation, run when its response arrives.
@@ -297,7 +312,7 @@ enum Deferred {
 }
 
 enum Event {
-    Command { request: Request, reply: oneshot::Sender<Reply> },
+    Command { request: Request, reply: UnboundedSender<Reply> },
     Disconnected,
     GraceExpired(u64),
     GoalStartExpired(u64),
@@ -336,14 +351,18 @@ struct Daemon {
     pending: HashMap<u64, Pending>,
     deferred: VecDeque<Deferred>,
     turns_settled: u64,
-    /// For a goal whose reply arrived after the turn it started had settled.
-    last_settled: Option<TurnAccumulator>,
+    /// Recently settled runs, newest last: for `watch --run`, and for a goal
+    /// whose reply arrived after the turn it started had settled.
+    settled: VecDeque<(u64, TurnAccumulator)>,
 
     next_id: u64,
+    next_run: u64,
     connections: usize,
     last_activity: Instant,
     last_rate_line: String,
     shutdown_request: Option<String>,
+    /// Shutdown has begun: new commands are refused.
+    stopping: bool,
     shutting_down: bool,
 }
 
@@ -373,12 +392,14 @@ impl Daemon {
             pending: HashMap::new(),
             deferred: VecDeque::new(),
             turns_settled: 0,
-            last_settled: None,
+            settled: VecDeque::new(),
             next_id: 0,
+            next_run: 0,
             connections: 0,
             last_activity: Instant::now(),
             last_rate_line: String::new(),
             shutdown_request: None,
+            stopping: false,
             shutting_down: false,
         }
     }
@@ -432,14 +453,39 @@ impl Daemon {
                 signal = signals.recv() => self.shutdown_request = Some(signal.into()),
             }
             if let Some(reason) = self.shutdown_request.take() {
-                self.interrupt_for_shutdown(&mut app_events).await;
+                self.stopping = true;
+                self.interrupt_for_shutdown(&mut app_events, &mut events).await;
                 self.shutdown(&reason).await;
                 break;
             }
             self.drain_deferred().await;
+            self.ack_active();
         }
         drop(listener);
         let _ = std::fs::remove_file(&self.paths.socket);
+        self.drain_connections(&mut events).await;
+    }
+
+    /// Replies are written by connection tasks; give them a moment before
+    /// the process exits under them.
+    async fn drain_connections(&mut self, events: &mut UnboundedReceiver<Event>) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while self.connections > 0 {
+            tokio::select! {
+                Some(event) = events.recv() => self.on_event(event).await,
+                _ = tokio::time::sleep_until(deadline) => return,
+            }
+        }
+    }
+
+    /// Tell the clients of a started turn which run they are waiting on.
+    fn ack_active(&mut self) {
+        if let Some(turn) = self.active.as_mut().filter(|turn| turn.turn_id.is_some()) {
+            let run = turn.op;
+            for client in &mut turn.clients {
+                client.accept(run);
+            }
+        }
     }
 
     fn idle_eligible(&self) -> bool {
@@ -462,6 +508,12 @@ impl Daemon {
     fn next_id(&mut self) -> u64 {
         self.next_id += 1;
         self.next_id
+    }
+
+    /// Run ids are shown to users, so they count runs only.
+    fn next_run(&mut self) -> u64 {
+        self.next_run += 1;
+        self.next_run
     }
 
     fn goal_status(&self) -> Option<&str> {
@@ -503,8 +555,8 @@ impl Daemon {
         });
     }
 
-    async fn request(&mut self, method: &str, params: Value, pending: Pending) -> Result<()> {
-        let id = self.app.request(method, params).await?;
+    fn request(&mut self, method: &str, params: Value, pending: Pending) -> Result<()> {
+        let id = self.app.request(method, params)?;
         self.pending.insert(id, pending);
         Ok(())
     }
@@ -520,11 +572,13 @@ impl Daemon {
                     self.last_activity = Instant::now();
                 }
                 let report = match &request {
-                    Request::Send { report, .. } | Request::Goal { report, .. } | Request::Watch { report } => *report,
+                    Request::Send { report, .. } | Request::Goal { report, .. } | Request::Watch { report, .. } => {
+                        *report
+                    }
                     _ => ReportLevel::Brief,
                 };
-                let client = Client { reply, report };
-                if self.shutting_down {
+                let client = Client { reply, report, acked: false };
+                if self.stopping || self.shutting_down {
                     client.answer(Reply::error("daemon shutting down"));
                     return;
                 }
@@ -571,11 +625,11 @@ impl Daemon {
                 GoalAction::Pause | GoalAction::Clear => starting,
                 GoalAction::Show => false,
             },
-            // An active goal is paused at once, which settles any hold; a
-            // compaction hold has to play out to know what to interrupt.
-            Deferred::Command(Request::Interrupt, _) | Deferred::Interrupt { .. } => {
-                starting || unsettled || (held && !self.goal_active())
-            }
+            // An active goal is paused at once (which also settles a goal
+            // hold); only the turn interrupt after it waits, for a turn id or
+            // for a compaction hold to show what is running.
+            Deferred::Command(Request::Interrupt, _) => starting,
+            Deferred::Interrupt { .. } => starting || unsettled || (held && !self.goal_active()),
             Deferred::Command(..) => false,
         }
     }
@@ -603,10 +657,23 @@ impl Daemon {
                 Request::Send { prompt, .. } => self.send(prompt, client).await,
                 Request::Goal { action, objective, .. } => self.goal_command(action, objective, client).await,
                 Request::Interrupt => self.interrupt(client).await,
-                Request::Watch { .. } => {
+                Request::Watch { run: None, .. } => {
                     match &mut self.active {
                         Some(turn) => turn.clients.push(client),
                         None => client.answer(Reply::ok("idle", "no active turn")),
+                    }
+                    Ok(())
+                }
+                Request::Watch { run: Some(run), .. } => {
+                    if let Some(turn) = self.active.as_mut().filter(|turn| turn.op == run) {
+                        turn.clients.push(client);
+                    } else if let Some((_, acc)) = self.settled.iter().find(|(op, _)| *op == run) {
+                        let reply = self.turn_reply(acc, client.report);
+                        client.answer(reply);
+                    } else {
+                        client.answer(Reply::error(format!(
+                            "run {run} is not known to this daemon (it restarted, or the run is older than the last {RETAINED_RUNS})"
+                        )));
                     }
                     Ok(())
                 }
@@ -632,8 +699,6 @@ impl Daemon {
                 state: if self.active.is_some() { "active" } else { "idle" }.into(),
                 goal: self.goal.clone(),
                 log: self.paths.log.clone(),
-                watch_pid: self.options.watch_pid,
-                watch_starttime: self.options.watch_starttime,
             }),
             ..Default::default()
         })
@@ -651,11 +716,11 @@ impl Daemon {
                 "expectedTurnId": turn_id,
                 "input": [text_input(&prompt)],
             });
-            return self.request("turn/steer", params, Pending::Steer { client }).await;
+            return self.request("turn/steer", params, Pending::Steer { client });
         }
         // Claim the slot first, so commands arriving while the thread or turn
         // starts wait for it instead of racing.
-        let op = self.next_id();
+        let op = self.next_run();
         let thread_id = self.thread_id.clone().unwrap_or_default();
         self.active = Some(ActiveTurn {
             op,
@@ -664,6 +729,7 @@ impl Daemon {
             clients: vec![client],
             header_logged: false,
             compactions_held: 0,
+            continued: false,
         });
         if self.thread_id.is_some() {
             self.start_turn(op).await
@@ -675,7 +741,7 @@ impl Daemon {
     async fn start_thread(&mut self, then: AfterThread) -> Result<()> {
         self.thread_starting = true;
         let params = thread_params(&self.options.project, self.model.as_deref());
-        let id = match self.app.request("thread/start", params).await {
+        let id = match self.app.request("thread/start", params) {
             Ok(id) => id,
             Err(error) => {
                 self.thread_starting = false;
@@ -704,7 +770,7 @@ impl Daemon {
         if let Some(effort) = &self.effort {
             params["effort"] = json!(effort);
         }
-        if let Err(error) = self.request("turn/start", params, Pending::TurnStart { op }).await {
+        if let Err(error) = self.request("turn/start", params, Pending::TurnStart { op }) {
             self.fail_active(&format!("{error:#}"));
             return Err(error);
         }
@@ -745,11 +811,11 @@ impl Daemon {
         match action {
             GoalAction::Show => {
                 let pending = Pending::GoalGet { client, goal_updates };
-                self.request("thread/goal/get", json!({ "threadId": thread_id }), pending).await
+                self.request("thread/goal/get", json!({ "threadId": thread_id }), pending)
             }
             GoalAction::Clear => {
                 let pending = Pending::GoalClear { client, goal_updates };
-                self.request("thread/goal/clear", json!({ "threadId": thread_id }), pending).await
+                self.request("thread/goal/clear", json!({ "threadId": thread_id }), pending)
             }
             GoalAction::Set | GoalAction::Resume | GoalAction::Pause => {
                 let status = if action == GoalAction::Pause { "paused" } else { "active" };
@@ -759,7 +825,7 @@ impl Daemon {
                 }
                 let turns_settled = self.turns_settled;
                 let pending = Pending::GoalSet { client, action, goal_updates, turns_settled };
-                self.request("thread/goal/set", params, pending).await?;
+                self.request("thread/goal/set", params, pending)?;
                 if let Some(objective) = &objective {
                     self.log(&format!("[goal] objective: {objective}"));
                 }
@@ -775,7 +841,7 @@ impl Daemon {
             if let Some(thread_id) = self.thread_id.clone() {
                 let params = json!({ "threadId": thread_id, "status": "paused" });
                 let pending = Pending::InterruptPause { client, goal_updates: self.goal_updates };
-                return self.request("thread/goal/set", params, pending).await;
+                return self.request("thread/goal/set", params, pending);
             }
         }
         self.interrupt_current(client, false).await
@@ -800,7 +866,7 @@ impl Daemon {
         };
         let params = json!({ "threadId": thread_id, "turnId": turn_id });
         let pending = Pending::Interrupt { client: Some(client), turn_id, paused };
-        self.request("turn/interrupt", params, pending).await
+        self.request("turn/interrupt", params, pending)
     }
 
     // ----- app-server ------------------------------------------------------
@@ -892,6 +958,9 @@ impl Daemon {
                         // turn/started, and keeping its id would filter out
                         // every event of the turn we asked for.
                         let started = response["turn"]["id"].as_str().map(str::to_string);
+                        if turn.continued {
+                            return Ok(());
+                        }
                         let raced = match (&started, &turn.turn_id) {
                             (Some(started), Some(claimed)) if started != claimed => Some(format!(
                                 "[turn] unsolicited turn {claimed} raced our start; re-targeting to {started}"
@@ -1020,7 +1089,7 @@ impl Daemon {
     fn attach_goal_client(&mut self, client: Client, turns_settled_before: u64) {
         let goal_active = self.goal_active();
         if self.turns_settled > turns_settled_before && !goal_active {
-            if let Some(turn) = &self.last_settled {
+            if let Some((_, turn)) = self.settled.back() {
                 let reply = self.turn_reply(turn, client.report);
                 self.log("[goal] the goal's turn ran and stopped while it was being set");
                 client.answer(reply);
@@ -1216,6 +1285,7 @@ impl Daemon {
         if let Some(turn_id) = turn_id {
             turn.turn_id = Some(turn_id);
         }
+        turn.continued = true;
         let turn_id = turn.turn_id.clone().unwrap_or_else(|| "unknown".into());
         turn.acc.adopt_continuation(&turn_id);
         self.absorb_goal_waiters();
@@ -1239,7 +1309,7 @@ impl Daemon {
                 "[turn] adopted an unattended continuation turn; attach with `ception watch`",
             )
         };
-        let op = self.next_id();
+        let op = self.next_run();
         self.active = Some(ActiveTurn {
             op,
             turn_id: Some(turn_id.clone()),
@@ -1247,6 +1317,7 @@ impl Daemon {
             clients,
             header_logged: false,
             compactions_held: 0,
+            continued: false,
         });
         self.log_turn_header();
         self.log(note);
@@ -1290,7 +1361,10 @@ impl Daemon {
             let reply = self.turn_reply(&turn.acc, client.report);
             client.answer(reply);
         }
-        self.last_settled = Some(turn.acc);
+        self.settled.push_back((turn.op, turn.acc));
+        if self.settled.len() > RETAINED_RUNS {
+            self.settled.pop_front();
+        }
         self.turns_settled += 1;
         // With the goal stopped no further turn is coming.
         if !self.goal_active() {
@@ -1303,7 +1377,7 @@ impl Daemon {
     async fn on_server_request(&mut self, id: Value, method: &str, raw: &Value) {
         let description = format!("codex sent {method} despite approvalPolicy never/danger-full-access; failing turn");
         self.log(&format!("[error] {description}: {raw}"));
-        if let Err(error) = self.app.reject(id, method).await {
+        if let Err(error) = self.app.reject(id, method) {
             self.log(&format!("[error] {error:#}"));
         }
         self.hold = None;
@@ -1312,7 +1386,7 @@ impl Daemon {
         if let (Some(turn_id), Some(thread_id)) = (turn_id, self.thread_id.clone()) {
             let params = json!({ "threadId": thread_id, "turnId": turn_id });
             let pending = Pending::Interrupt { client: None, turn_id, paused: false };
-            if let Err(error) = self.request("turn/interrupt", params, pending).await {
+            if let Err(error) = self.request("turn/interrupt", params, pending) {
                 self.log(&format!("[error] interrupt after server request: {error:#}"));
             }
         }
@@ -1327,21 +1401,30 @@ impl Daemon {
 
     /// Best effort and capped: a rejected or wedged interrupt must not keep
     /// the daemon alive. App events keep flowing meanwhile, so the
-    /// interrupted turn can still report to its clients; new commands wait in
-    /// the queue and are refused once shutdown begins.
-    async fn interrupt_for_shutdown(&mut self, app_events: &mut UnboundedReceiver<AppEvent>) {
+    /// interrupted turn can still report to its clients; new commands are
+    /// refused, which sends a client back to wait for the label lock.
+    async fn interrupt_for_shutdown(
+        &mut self,
+        app_events: &mut UnboundedReceiver<AppEvent>,
+        events: &mut UnboundedReceiver<Event>,
+    ) {
         let turn_id = self.active.as_ref().and_then(|turn| turn.turn_id.clone());
         let (Some(turn_id), Some(thread_id)) = (turn_id, self.thread_id.clone()) else {
             return;
         };
         let params = json!({ "threadId": thread_id, "turnId": turn_id });
-        let Ok(id) = self.app.request("turn/interrupt", params).await else {
+        let Ok(id) = self.app.request("turn/interrupt", params) else {
             return;
         };
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
             let event = tokio::select! {
                 event = app_events.recv() => event,
+                Some(event) = events.recv() => {
+                    // Refused now that shutdown has begun.
+                    self.on_event(event).await;
+                    continue;
+                }
                 _ = tokio::time::sleep_until(deadline) => return,
             };
             let Some(event) = event else {
@@ -1429,30 +1512,40 @@ fn format_rate_limits(limits: &Value) -> String {
     format!("primary {}, secondary {}", window(&limits["primary"]), window(&limits["secondary"]))
 }
 
-/// One client connection: read one request, forward it, write the one reply.
-/// A client that hangs up while waiting is dropped; its reply goes nowhere.
+/// One client connection: read one request, forward it, write its replies
+/// until the final one. A client that hangs up while waiting is dropped; its
+/// replies go nowhere.
 async fn serve_connection(stream: UnixStream, events: UnboundedSender<Event>) {
     let (read, mut write) = stream.into_split();
     let mut lines = BufReader::new(read).lines();
-    let reply = match lines.next_line().await {
+    let (reply_tx, mut replies) = unbounded_channel();
+    match lines.next_line().await {
         Ok(Some(line)) => match serde_json::from_str::<Request>(&line) {
-            Err(error) => Some(Reply::error(format!("invalid command JSON: {error}"))),
+            Err(error) => {
+                let _ = reply_tx.send(Reply::error(format!("invalid command JSON: {error}")));
+            }
             Ok(request) => {
-                let (reply_tx, reply_rx) = oneshot::channel();
                 let _ = events.send(Event::Command { request, reply: reply_tx });
-                tokio::select! {
-                    reply = reply_rx => Some(reply.unwrap_or_else(|_| Reply::error("daemon dropped the request"))),
-                    _ = lines.next_line() => None,
-                }
             }
         },
-        _ => None,
-    };
-    if let Some(reply) = reply {
-        if let Ok(mut line) = serde_json::to_vec(&reply) {
-            line.push(b'\n');
-            let _ = write.write_all(&line).await;
+        _ => {
+            let _ = events.send(Event::Disconnected);
+            return;
+        }
+    }
+    loop {
+        let reply = tokio::select! {
+            reply = replies.recv() => reply.unwrap_or_else(|| Reply::error("daemon dropped the request")),
+            _ = lines.next_line() => break,
+        };
+        let last = !matches!(reply, Reply::Accepted { .. });
+        let Ok(mut line) = serde_json::to_vec(&reply) else {
+            break;
+        };
+        line.push(b'\n');
+        if write.write_all(&line).await.is_err() || last {
             let _ = write.shutdown().await;
+            break;
         }
     }
     let _ = events.send(Event::Disconnected);

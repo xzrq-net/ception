@@ -17,8 +17,9 @@ pub enum Request {
     Send { prompt: String, report: ReportLevel },
     Goal { action: GoalAction, objective: Option<String>, report: ReportLevel },
     Interrupt,
-    /// Block until the live turn settles; answers at once when idle.
-    Watch { report: ReportLevel },
+    /// Block until the live turn settles; answers at once when idle. With a
+    /// run id: that run, live or retained.
+    Watch { report: ReportLevel, run: Option<u64> },
     Shutdown,
 }
 
@@ -32,9 +33,13 @@ pub enum GoalAction {
     Clear,
 }
 
+/// Zero or more `Accepted`, then exactly one `Result` or `Error`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Reply {
+    /// The request's turn is running as run `run`; the final reply follows
+    /// when it settles.
+    Accepted { run: u64 },
     Result(Outcome),
     Error { message: String },
 }
@@ -60,9 +65,6 @@ pub struct DaemonStatus {
     pub state: String,
     pub goal: Option<Value>,
     pub log: PathBuf,
-    /// The process whose death ends this daemon, if any.
-    pub watch_pid: Option<u32>,
-    pub watch_starttime: Option<u64>,
 }
 
 impl Reply {

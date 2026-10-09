@@ -42,7 +42,7 @@ pub async fn run(command: Command) -> Result<u8> {
             quota::run(&at.dir()?, json).await?;
             Ok(0)
         }
-        Command::Watch { label, follow, wait } => watch(&label, follow, &wait).await,
+        Command::Watch { label, follow, run, wait } => watch(&label, follow, run, &wait).await,
         Command::Skill => {
             print!("{}", include_str!("../SKILL.md"));
             Ok(0)
@@ -219,22 +219,12 @@ async fn spawn_daemon(scope: &Scope, label: &str, paths: &LabelPaths, revival: &
     }
 }
 
-/// A live daemon left over from an earlier process of this session (a
-/// resumed Claude session gets a new pid under the same id) whose watched
-/// process has died: it is on its way out and must not take new work.
-fn stale_generation(scope: &Scope, daemon: &DaemonStatus) -> bool {
-    let (Some(pid), Some(starttime)) = (daemon.watch_pid, daemon.watch_starttime) else {
-        return false;
-    };
-    if scope.session.watch_pid == Some(pid) {
-        return false;
-    }
-    procfs::starttime(pid).ok() != Some(starttime)
-}
-
 const POLL: Duration = Duration::from_millis(50);
 
-/// Reach the label's daemon, starting one if needed, under one deadline.
+/// Reach the label's daemon, starting one if needed, under one deadline. A
+/// daemon on its way out (say, its resumed Claude session's previous process
+/// died) refuses status; we then wait for it to release the label and start
+/// a successor.
 async fn ensure_daemon(scope: &Scope, label: &str, paths: &LabelPaths, revival: &Revival) -> Result<DaemonStatus> {
     let deadline = Instant::now() + spawn_timeout() + Duration::from_secs(10);
     loop {
@@ -242,12 +232,7 @@ async fn ensure_daemon(scope: &Scope, label: &str, paths: &LabelPaths, revival: 
             bail!("daemon for {label} did not become ready; see {}", paths.log.display());
         }
         if let Some(daemon) = status(paths).await {
-            if !stale_generation(scope, &daemon) {
-                return Ok(daemon);
-            }
-            let _ = call(&paths.socket, &Request::Shutdown).await;
-            wait_until(deadline, || !store::lock_held(&paths.lock)).await;
-            continue;
+            return Ok(daemon);
         }
         match spawn_daemon(scope, label, paths, revival).await? {
             Spawned::Ready => continue,
@@ -271,9 +256,7 @@ async fn wait_until(deadline: Instant, done: impl Fn() -> bool) {
 /// needed.
 async fn revive(scope: &Scope, label: &str, paths: &LabelPaths) -> Result<DaemonStatus> {
     if let Some(daemon) = status(paths).await {
-        if !stale_generation(scope, &daemon) {
-            return Ok(daemon);
-        }
+        return Ok(daemon);
     }
     if !paths.record.exists() {
         return Err(scope.missing(label));
@@ -281,9 +264,49 @@ async fn revive(scope: &Scope, label: &str, paths: &LabelPaths) -> Result<Daemon
     ensure_daemon(scope, label, paths, &Revival::Resume).await
 }
 
+/// Send a turn-bearing request and relay its outcome. With a timeout, give
+/// up waiting once it has passed and the turn is known to be running.
+async fn converse(socket: &Path, request: &Request, label: &str, timeout: Option<u64>) -> Result<u8> {
+    let stream = UnixStream::connect(socket).await?;
+    let (read, mut write) = stream.into_split();
+    let mut line = serde_json::to_vec(request)?;
+    line.push(b'\n');
+    write.write_all(&line).await?;
+    let mut lines = BufReader::new(read).lines();
+    let deadline = timeout.map(|secs| Instant::now() + Duration::from_secs(secs));
+    let mut run = None;
+    loop {
+        let next = match (deadline, run) {
+            (Some(deadline), Some(run)) => match tokio::time::timeout_at(deadline, lines.next_line()).await {
+                Ok(next) => next?,
+                Err(_) => return Ok(still_running(label, run)),
+            },
+            _ => lines.next_line().await?,
+        };
+        let Some(next) = next else {
+            bail!("daemon connection closed before replying");
+        };
+        match serde_json::from_str(&next).context("daemon reply")? {
+            Reply::Accepted { run: accepted } => {
+                if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    return Ok(still_running(label, accepted));
+                }
+                run = Some(accepted);
+            }
+            reply => return finish(reply, label),
+        }
+    }
+}
+
+fn still_running(label: &str, run: u64) -> u8 {
+    println!("still running: run {run}; reattach with `ception watch {label} --run {run}`");
+    5
+}
+
 fn finish(reply: Reply, label: &str) -> Result<u8> {
     let outcome = match reply {
         Reply::Error { message } => bail!(message),
+        Reply::Accepted { .. } => bail!("daemon sent no final reply"),
         Reply::Result(outcome) => outcome,
     };
     if !outcome.report.is_empty() {
@@ -338,7 +361,8 @@ async fn spawn(
         Spawned::Ready => {}
     }
     println!("log: {}", paths.log.display());
-    finish(call(&paths.socket, &Request::Send { prompt, report: wait.report }).await?, label)
+    let request = Request::Send { prompt, report: wait.report };
+    converse(&paths.socket, &request, label, wait.timeout).await
 }
 
 async fn send(label: &str, wait: &WaitArgs, prompt: Vec<String>) -> Result<u8> {
@@ -349,7 +373,8 @@ async fn send(label: &str, wait: &WaitArgs, prompt: Vec<String>) -> Result<u8> {
     let daemon = revive(&scope, label, &paths).await?;
     println!("log: {}", daemon.log.display());
     // The daemon decides atomically: steer if a turn is live, else start one.
-    finish(call(&paths.socket, &Request::Send { prompt, report: wait.report }).await?, label)
+    let request = Request::Send { prompt, report: wait.report };
+    converse(&paths.socket, &request, label, wait.timeout).await
 }
 
 /// Setting or resuming a goal blocks on the run codex starts for it; pause,
@@ -375,7 +400,7 @@ async fn goal(label: &str, action: GoalAction, wait: &WaitArgs, objective: Vec<S
         println!("log: {}", daemon.log.display());
     }
     let request = Request::Goal { action, objective, report: wait.report };
-    finish(call(&paths.socket, &request).await?, label)
+    converse(&paths.socket, &request, label, wait.timeout).await
 }
 
 async fn interrupt(label: &str, at: &AtArgs) -> Result<u8> {
@@ -461,7 +486,7 @@ fn timestamp(time: SystemTime) -> String {
         .unwrap_or_else(|_| "-".into())
 }
 
-async fn watch(label: &str, follow: bool, wait: &WaitArgs) -> Result<u8> {
+async fn watch(label: &str, follow: bool, run: Option<u64>, wait: &WaitArgs) -> Result<u8> {
     let scope = Scope::resolve(&wait.at)?;
     let paths = scope.label(label)?;
     if follow {
@@ -485,5 +510,6 @@ async fn watch(label: &str, follow: bool, wait: &WaitArgs) -> Result<u8> {
         bail!("no live daemon for {label}; `ception send` respawns and resumes a stored thread");
     };
     println!("log: {}", daemon.log.display());
-    finish(call(&paths.socket, &Request::Watch { report: wait.report }).await?, label)
+    let request = Request::Watch { report: wait.report, run };
+    converse(&paths.socket, &request, label, wait.timeout).await
 }

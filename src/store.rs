@@ -131,9 +131,17 @@ pub fn gc(hash: &str, my_session: &str, max_age: Duration) -> Result<()> {
     for (session, dir) in subdirs(&projects_root()?.join(hash)) {
         let mut newest: BTreeMap<String, SystemTime> = BTreeMap::new();
         for file in files(&dir) {
-            if file.name.ends_with(".tmp") {
+            if let Some(label) = file.name.strip_suffix(".json.tmp") {
+                // A daemon may be rewriting this very file; only its lock
+                // holder could be, so take the lock and look again.
                 if age(file.modified) > TEMP_MAX_AGE {
-                    let _ = fs::remove_file(&file.path);
+                    let paths = LabelPaths::new(hash, &session, label)?;
+                    if let Ok(Some(_lock)) = try_lock(&paths.lock) {
+                        let modified = fs::metadata(&file.path).and_then(|meta| meta.modified());
+                        if modified.is_ok_and(|modified| age(modified) > TEMP_MAX_AGE) {
+                            let _ = fs::remove_file(&file.path);
+                        }
+                    }
                 }
                 continue;
             }
