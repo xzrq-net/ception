@@ -21,12 +21,51 @@ pub fn starttime(pid: u32) -> Result<u64> {
     Ok(field.parse()?)
 }
 
-/// Which pid namespace pids we write down belong to: boot id plus the pid
-/// namespace inode. Containers sharing the state dir have their own.
-pub fn namespace_id() -> String {
-    let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap_or_default();
-    let ns = std::fs::read_link("/proc/self/ns/pid").unwrap_or_default();
-    format!("{}/{}", boot.trim(), ns.display())
+/// The variable that marks an app-server and everything it starts, so the
+/// lot can be found again by value, whatever process group or parent they
+/// end up with.
+pub const OWNER_VAR: &str = "CEPTION_OWNER";
+
+/// Live processes (other than us) whose environment carries
+/// `CEPTION_OWNER=<token>`, with their start times.
+pub fn owned_processes(token: &str) -> Vec<(u32, u64)> {
+    let marker = format!("{OWNER_VAR}={token}");
+    let me = std::process::id();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|&pid| pid != me)
+        .filter(|&pid| {
+            std::fs::read(format!("/proc/{pid}/environ"))
+                .is_ok_and(|environ| environ.split(|&b| b == 0).any(|var| var == marker.as_bytes()))
+        })
+        .filter_map(|pid| Some((pid, starttime(pid).ok()?)))
+        .collect()
+}
+
+/// SIGTERM the processes carrying `token`, then SIGKILL what is left. Each
+/// signal goes only to a pid whose start time still matches, so a reused
+/// pid is never hit. Returns how many there were.
+pub async fn kill_owned(token: &str) -> usize {
+    let found = owned_processes(token);
+    let alive = |&(pid, start): &(u32, u64)| starttime(pid).ok() == Some(start);
+    for (signal, wait_ms) in [(libc::SIGTERM, 2000), (libc::SIGKILL, 1000)] {
+        let live: Vec<_> = found.iter().copied().filter(alive).collect();
+        if live.is_empty() {
+            break;
+        }
+        for (pid, _) in &live {
+            unsafe { libc::kill(*pid as libc::pid_t, signal) };
+        }
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
+        while live.iter().any(alive) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+    found.len()
 }
 
 /// Becomes ready when the watched process exits.

@@ -125,7 +125,7 @@ pub fn format_quota(response: &Value, now: Timestamp) -> String {
 }
 
 pub async fn run(cwd: &Path, json_output: bool) -> Result<()> {
-    let (mut app, mut events) = AppServer::spawn(cwd)?;
+    let (mut app, mut events) = AppServer::spawn(cwd, None)?;
     let result = async {
         app.initialize(&mut events, |_| {}).await?;
         app.call(&mut events, "account/rateLimits/read", json!({}), |_| {}).await

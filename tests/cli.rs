@@ -1174,7 +1174,7 @@ fn a_revived_daemon_first_kills_what_a_sigkilled_predecessor_left_running() {
     let started = lines.iter().rposition(|line| line.starts_with("[daemon] starting ")).unwrap();
     let killed = lines
         .iter()
-        .position(|line| line.contains("killing leftover app-server process group"))
+        .position(|line| line.contains("a previous daemon left running"))
         .unwrap_or_else(|| panic!("no leftover kill logged:\n{log}"));
     let listening = started + lines[started..].iter().position(|line| line.starts_with("[daemon] listening")).unwrap();
     assert!(started < killed && killed < listening, "{log}");
@@ -1323,7 +1323,7 @@ fn still_running_run(out: &Output, label: &str) -> String {
     let run = lines[0]["still running: run ".len()..].split(';').next().unwrap().to_string();
     // `<daemon generation>.<n>`
     let (generation, n) = run.split_once('.').unwrap_or_else(|| panic!("malformed run id in:\n{out}"));
-    assert!(generation.len() == 4 && n.parse::<u64>().is_ok(), "{out}");
+    assert!(generation.len() == 8 && n.parse::<u64>().is_ok(), "{out}");
     assert_eq!(lines[0], format!("still running: run {run}; reattach with `ception watch {label} --run {run}`"));
     run
 }

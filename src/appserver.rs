@@ -95,9 +95,14 @@ pub struct AppServer {
 }
 
 impl AppServer {
-    pub fn spawn(cwd: &Path) -> Result<(Self, UnboundedReceiver<AppEvent>)> {
+    /// `owner`, if given, marks the server and everything it starts (see
+    /// [`crate::procfs::OWNER_VAR`]).
+    pub fn spawn(cwd: &Path, owner: Option<&str>) -> Result<(Self, UnboundedReceiver<AppEvent>)> {
         let argv = codex_command()?;
         let mut command = Command::new(&argv[0]);
+        if let Some(owner) = owner {
+            command.env(crate::procfs::OWNER_VAR, owner);
+        }
         command
             .args(&argv[1..])
             .current_dir(cwd)
@@ -144,11 +149,6 @@ impl AppServer {
             closed: false,
         };
         Ok((server, rx))
-    }
-
-    /// The server's process group, led by the server itself.
-    pub fn pgid(&self) -> libc::pid_t {
-        self.pgid
     }
 
     pub fn request(&mut self, method: &str, params: Value) -> Result<u64> {
