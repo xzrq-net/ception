@@ -18,9 +18,7 @@ const SUN_PATH_MAX: usize = 108;
 
 /// Labels and session keys become path components.
 pub fn validate_name(kind: &str, name: &str) -> Result<()> {
-    let charset = name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    let charset = name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
     if name.is_empty() || !charset || name.chars().all(|c| c == '.') {
         bail!("{kind} must contain only letters, numbers, dot, underscore, and dash");
     }
@@ -47,9 +45,7 @@ pub fn projects_root() -> Result<PathBuf> {
 }
 
 fn home() -> Result<PathBuf> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .context("HOME is not set")
+    std::env::var_os("HOME").map(PathBuf::from).context("HOME is not set")
 }
 
 /// The project a directory belongs to: the nearest ancestor holding a VCS

@@ -515,9 +515,8 @@ fn an_unattended_continuation_turn_is_adopted_so_watch_and_list_can_see_it() {
     let log = fs::read_to_string(row["logPath"].as_str().unwrap()).unwrap();
     assert_has(&log, "adopted an unattended continuation turn");
     assert_has(&log, "Continued past the compaction and finished the work.");
-    let unknown_turn_started = log
-        .lines()
-        .any(|line| line.find("unknown notification").is_some_and(|at| line[at..].contains("turn/started")));
+    let unknown_turn_started =
+        log.lines().any(|line| line.find("unknown notification").is_some_and(|at| line[at..].contains("turn/started")));
     assert!(!unknown_turn_started, "{log}");
 }
 
@@ -1106,7 +1105,8 @@ fn watch_run_of_an_unknown_run_fails_with_exit_4() {
     let run = still_running_run(&out, "quiet");
     let (generation, _) = run.split_once('.').unwrap();
 
-    let out = ctx.ception(&["watch", "quiet", "--run", &format!("{generation}.999")]).timeout(secs(3)).run().expect_code(4);
+    let out =
+        ctx.ception(&["watch", "quiet", "--run", &format!("{generation}.999")]).timeout(secs(3)).run().expect_code(4);
     assert_has(&out.stderr, "not retained");
     let out = ctx.ception(&["watch", "quiet", "--run", "999"]).timeout(secs(3)).run().expect_code(4);
     assert_has(&out.stderr, "not from this daemon");
@@ -1402,7 +1402,8 @@ fn interrupt_reaches_a_known_turn_without_waiting_for_its_start_reply() {
     spawned.wait().expect_code(3);
 
     let state = ctx.fake_state();
-    let interrupt_at = state["requests"].as_array().unwrap().iter().position(|r| r["method"] == "turn/interrupt").unwrap();
+    let interrupt_at =
+        state["requests"].as_array().unwrap().iter().position(|r| r["method"] == "turn/interrupt").unwrap();
     let mark = state["marks"].as_array().unwrap().iter().find(|m| m["mark"] == "turn/start replied").unwrap();
     let requests_before_reply = mark["requests"].as_u64().unwrap() as usize;
     assert!(
@@ -1430,7 +1431,9 @@ fn requests<'a>(state: &'a Value, method: &'a str) -> impl Iterator<Item = &'a V
 }
 
 fn goal_set_statuses(state: &Value) -> Vec<String> {
-    requests(state, "thread/goal/set").map(|request| request["params"]["status"].as_str().unwrap().to_string()).collect()
+    requests(state, "thread/goal/set")
+        .map(|request| request["params"]["status"].as_str().unwrap().to_string())
+        .collect()
 }
 
 fn last_turn_start(state: &Value) -> &Value {

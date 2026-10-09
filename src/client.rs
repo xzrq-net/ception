@@ -173,11 +173,12 @@ enum Spawned {
 
 async fn spawn_daemon(scope: &Scope, label: &str, paths: &LabelPaths, revival: &Revival) -> Result<Spawned> {
     let mut command = tokio::process::Command::new(std::env::current_exe().context("locate ception")?);
-    command
-        .arg("daemon")
-        .arg("--project")
-        .arg(&scope.project)
-        .args(["--session", &scope.session.key, "--label", label]);
+    command.arg("daemon").arg("--project").arg(&scope.project).args([
+        "--session",
+        &scope.session.key,
+        "--label",
+        label,
+    ]);
     match revival {
         Revival::Resume => {
             command.arg("--resume");
@@ -196,11 +197,7 @@ async fn spawn_daemon(scope: &Scope, label: &str, paths: &LabelPaths, revival: &
     }
     // The daemon's stdout is our readiness pipe; it points its own stderr at
     // the log once it holds the label.
-    command
-        .current_dir(&scope.project)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+    command.current_dir(&scope.project).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
     procfs::detach(command.as_std_mut());
     let mut child = command.spawn().context("start daemon")?;
     let stdout = child.stdout.take().expect("piped");
@@ -362,9 +359,10 @@ fn finish(reply: Reply, label: &str) -> Result<u8> {
     // A turn report says what happened in the turn; the goal says whether
     // codex is going to keep going. Both are needed to know if the run is over.
     if outcome.turn_id.is_some()
-        && let Some(goal) = &outcome.goal {
-            println!("\n{}", format_goal(Some(goal), Some(label)));
-        }
+        && let Some(goal) = &outcome.goal
+    {
+        println!("\n{}", format_goal(Some(goal), Some(label)));
+    }
     Ok(status_exit_code(&outcome.status) as u8)
 }
 

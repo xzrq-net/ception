@@ -109,10 +109,7 @@ pub async fn run(options: Options) -> Result<()> {
     ));
     kill_leftovers(&owner_path(&paths), &mut log).await;
 
-    let mut signals = Signals {
-        term: signal(SignalKind::terminate())?,
-        int: signal(SignalKind::interrupt())?,
-    };
+    let mut signals = Signals { term: signal(SignalKind::terminate())?, int: signal(SignalKind::interrupt())? };
     let paths_for_cleanup = paths.clone();
     match boot(options, paths, &mut log, &mut signals).await {
         Ok(booted) => {
@@ -225,8 +222,7 @@ async fn boot(options: Options, paths: LabelPaths, log: &mut Log, signals: &mut 
         _ => None,
     };
     let (thread_id, model, effort) = if options.resume {
-        let record = store::read(&paths.record)?
-            .ok_or_else(|| anyhow!("no stored thread for {}", options.label))?;
+        let record = store::read(&paths.record)?.ok_or_else(|| anyhow!("no stored thread for {}", options.label))?;
         (Some(record.thread_id), record.model, record.effort)
     } else {
         (None, options.model.clone(), options.effort.clone())
@@ -243,16 +239,14 @@ async fn boot(options: Options, paths: LabelPaths, log: &mut Log, signals: &mut 
         if let Some(resume) = &thread_id {
             let mut params = thread_params(&options.project, model.as_deref());
             params["threadId"] = json!(resume);
-            let response = app
-                .call(&mut app_events, "thread/resume", params, |event| backlog.push(event))
-                .await?;
+            let response = app.call(&mut app_events, "thread/resume", params, |event| backlog.push(event)).await?;
             if let Some(id) = response["thread"]["id"].as_str() {
                 thread_id = Some(id.to_string());
             }
         }
         let _ = std::fs::remove_file(&paths.socket);
-        let listener = UnixListener::bind(&paths.socket)
-            .with_context(|| format!("listen on {}", paths.socket.display()))?;
+        let listener =
+            UnixListener::bind(&paths.socket).with_context(|| format!("listen on {}", paths.socket.display()))?;
         std::fs::set_permissions(&paths.socket, std::fs::Permissions::from_mode(0o600))?;
         anyhow::Ok((app, app_events, backlog, listener, thread_id))
     };
@@ -351,30 +345,63 @@ enum RetainedOutcome {
 
 /// A request's continuation, run when its response arrives.
 enum Pending {
-    ThreadStart { then: AfterThread },
+    ThreadStart {
+        then: AfterThread,
+    },
     /// For the starting turn `op`.
-    TurnStart { op: u64 },
-    Steer { client: Client },
-    GoalSet { client: Client, action: GoalAction, goal_updates: u64, turns_settled: u64 },
-    GoalGet { client: Client, goal_updates: u64 },
-    GoalClear { client: Client, goal_updates: u64 },
+    TurnStart {
+        op: u64,
+    },
+    Steer {
+        client: Client,
+    },
+    GoalSet {
+        client: Client,
+        action: GoalAction,
+        goal_updates: u64,
+        turns_settled: u64,
+    },
+    GoalGet {
+        client: Client,
+        goal_updates: u64,
+    },
+    GoalClear {
+        client: Client,
+        goal_updates: u64,
+    },
     /// An interrupt pausing the active goal first, so freeing the thread
     /// doesn't just start the goal's next turn.
-    InterruptPause { client: Client, goal_updates: u64 },
-    Interrupt { client: Option<Client>, turn_id: String, paused: bool },
+    InterruptPause {
+        client: Client,
+        goal_updates: u64,
+    },
+    Interrupt {
+        client: Option<Client>,
+        turn_id: String,
+        paused: bool,
+    },
 }
 
 enum AfterThread {
     /// The starting turn `op`.
-    Turn { op: u64 },
-    Goal { client: Client, action: GoalAction, objective: Option<String> },
+    Turn {
+        op: u64,
+    },
+    Goal {
+        client: Client,
+        action: GoalAction,
+        objective: Option<String>,
+    },
 }
 
 /// Work that waits for the thread, a turn start, or a held report to resolve.
 enum Deferred {
     Command(Request, Client),
     /// The second half of an interrupt, after its goal pause.
-    Interrupt { client: Client, paused: bool },
+    Interrupt {
+        client: Client,
+        paused: bool,
+    },
 }
 
 enum Event {
@@ -481,11 +508,12 @@ impl Daemon {
 
     async fn serve(mut self, mut signals: Signals) {
         if self.thread_id.is_some()
-            && let Err(error) = self.persist() {
-                self.log(&format!("[state] {error:#}; shutting down"));
-                self.shutdown("label not persisted").await;
-                return;
-            }
+            && let Err(error) = self.persist()
+        {
+            self.log(&format!("[state] {error:#}; shutting down"));
+            self.shutdown("label not persisted").await;
+            return;
+        }
         let mut app_events = self.app_events.take().expect("serve runs once");
         let mut events = self.event_rx.take().expect("serve runs once");
         let mut listener = self.listener.take();
@@ -494,10 +522,7 @@ impl Daemon {
             self.on_app(event).await;
         }
         let idle = Duration::from_secs(
-            std::env::var("CEPTION_IDLE_TIMEOUT_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(4 * 60 * 60),
+            std::env::var("CEPTION_IDLE_TIMEOUT_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(4 * 60 * 60),
         );
 
         while !self.shutting_down {
@@ -800,9 +825,7 @@ impl Daemon {
             }
             return;
         };
-        let op = run
-            .strip_prefix(&format!("{}.", self.generation))
-            .and_then(|op| op.parse::<u64>().ok());
+        let op = run.strip_prefix(&format!("{}.", self.generation)).and_then(|op| op.parse::<u64>().ok());
         let Some(op) = op else {
             client.answer(Reply::error(format!(
                 "run {run} is not from this daemon (it restarted since); its report is gone"
@@ -835,11 +858,7 @@ impl Daemon {
         }
         let op = self.next_run();
         self.starting = Some(Starting { op, prompt, clients: vec![client], expected: None });
-        if self.thread_id.is_some() {
-            self.start_turn(op)
-        } else {
-            self.start_thread(AfterThread::Turn { op })
-        }
+        if self.thread_id.is_some() { self.start_turn(op) } else { self.start_thread(AfterThread::Turn { op }) }
     }
 
     fn start_thread(&mut self, then: AfterThread) -> Result<()> {
@@ -953,11 +972,12 @@ impl Daemon {
         // Paused even with no turn running: a held run or a goal about to
         // start its next turn must stop too.
         if self.goal_active()
-            && let Some(thread_id) = self.thread_id.clone() {
-                let params = json!({ "threadId": thread_id, "status": "paused" });
-                let pending = Pending::InterruptPause { client, goal_updates: self.goal_updates };
-                return self.request("thread/goal/set", params, pending);
-            }
+            && let Some(thread_id) = self.thread_id.clone()
+        {
+            let params = json!({ "threadId": thread_id, "status": "paused" });
+            let pending = Pending::InterruptPause { client, goal_updates: self.goal_updates };
+            return self.request("thread/goal/set", params, pending);
+        }
         self.interrupt_current(client, false)
     }
 
@@ -969,9 +989,7 @@ impl Daemon {
             self.deferred.push_back(held_back);
             return Ok(());
         }
-        let Deferred::Interrupt { client, paused } = held_back else {
-            unreachable!()
-        };
+        let Deferred::Interrupt { client, paused } = held_back else { unreachable!() };
         let turn_id = self.active.as_ref().map(|turn| turn.turn_id.clone());
         let (Some(turn_id), Some(thread_id)) = (turn_id, self.thread_id.clone()) else {
             let report = if paused { format!("no active turn\n{}", self.goal_line()) } else { "no active turn".into() };
@@ -1002,9 +1020,10 @@ impl Daemon {
                 Some(Incoming::Notification { method, params }) => self.on_notification(&method, &params, &message),
                 Some(Incoming::Response { id, outcome }) => {
                     if let Some(pending) = self.pending.remove(&id)
-                        && let Err(error) = self.on_response(pending, outcome) {
-                            self.log(&format!("[error] {error:#}"));
-                        }
+                        && let Err(error) = self.on_response(pending, outcome)
+                    {
+                        self.log(&format!("[error] {error:#}"));
+                    }
                 }
                 Some(Incoming::Request { id, method }) => self.on_server_request(id, &method, &message),
                 None => self.log(&format!("[debug] unrecognised message {message}")),
@@ -1224,13 +1243,15 @@ impl Daemon {
     /// mid-turn into it), or the turn codex is about to start.
     fn attach_goal_client(&mut self, client: Client, turns_settled_before: u64) {
         let goal_active = self.goal_active();
-        if self.turns_settled > turns_settled_before && !goal_active
-            && let Some(Retained { outcome: RetainedOutcome::Report { acc, .. }, .. }) = self.settled.back() {
-                let reply = turn_reply(acc, self.goal.clone(), client.report);
-                self.log("[goal] the goal's turn ran and stopped while it was being set");
-                client.answer(reply);
-                return;
-            }
+        if self.turns_settled > turns_settled_before
+            && !goal_active
+            && let Some(Retained { outcome: RetainedOutcome::Report { acc, .. }, .. }) = self.settled.back()
+        {
+            let reply = turn_reply(acc, self.goal.clone(), client.report);
+            self.log("[goal] the goal's turn ran and stopped while it was being set");
+            client.answer(reply);
+            return;
+        }
         if let Some(turn) = &mut self.active {
             turn.clients.push(client);
             return;
@@ -1250,9 +1271,11 @@ impl Daemon {
         match method {
             "thread/tokenUsage/updated" => {
                 if let Some(turn) = &mut self.active
-                    && ours && params["turnId"].as_str() == Some(turn.turn_id.as_str()) {
-                        turn.acc.handle_notification(method, params);
-                    }
+                    && ours
+                    && params["turnId"].as_str() == Some(turn.turn_id.as_str())
+                {
+                    turn.acc.handle_notification(method, params);
+                }
                 return;
             }
             "account/rateLimits/updated" => {
@@ -1397,10 +1420,7 @@ impl Daemon {
         } else {
             (env_duration("CEPTION_CONTINUATION_GRACE_MS", 2_000), "turn compacted")
         };
-        self.log(&format!(
-            "[turn] {reason}; holding the report up to {}ms for a continuation turn",
-            grace.as_millis()
-        ));
+        self.log(&format!("[turn] {reason}; holding the report up to {}ms for a continuation turn", grace.as_millis()));
         let generation = self.next_id();
         self.hold = Some(generation);
         self.after(grace, Event::GraceExpired(generation));
@@ -1432,10 +1452,7 @@ impl Daemon {
         } else if !clients.is_empty() || goal_pending {
             ("(goal turn)", "[turn] codex started the goal's turn")
         } else {
-            (
-                "(unattended continuation)",
-                "[turn] adopted an unattended continuation turn; attach with `ception watch`",
-            )
+            ("(unattended continuation)", "[turn] adopted an unattended continuation turn; attach with `ception watch`")
         };
         let op = self.next_run();
         self.active = Some(ActiveTurn {
@@ -1547,12 +1564,14 @@ impl Daemon {
                 return;
             };
             if let AppEvent::Message(message) = &event
-                && message.get("method").is_none() && message.get("id").and_then(Value::as_u64) == Some(id) {
-                    if let Some(error) = message.get("error") {
-                        self.log(&format!("[interrupt] {}", error["message"].as_str().unwrap_or("failed")));
-                    }
-                    return;
+                && message.get("method").is_none()
+                && message.get("id").and_then(Value::as_u64) == Some(id)
+            {
+                if let Some(error) = message.get("error") {
+                    self.log(&format!("[interrupt] {}", error["message"].as_str().unwrap_or("failed")));
                 }
+                return;
+            }
             let closed = matches!(event, AppEvent::Closed(_));
             self.on_app(event).await;
             if closed {

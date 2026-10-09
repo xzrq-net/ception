@@ -32,9 +32,7 @@ use serde_json::{Value, json};
 
 static STATE_PATH: LazyLock<PathBuf> = LazyLock::new(|| match env::var_os("CEPTION_FAKE_STATE") {
     Some(path) => PathBuf::from(path),
-    None => env::current_dir()
-        .unwrap()
-        .join("fake-appserver-state.json"),
+    None => env::current_dir().unwrap().join("fake-appserver-state.json"),
 });
 static BEHAVIOR: LazyLock<String> =
     LazyLock::new(|| env::var("CEPTION_FAKE_BEHAVIOR").unwrap_or_else(|_| "happy".into()));
@@ -117,12 +115,8 @@ fn update_state<T>(f: impl FnOnce(&mut State) -> T) -> T {
     }
     let mut lock_path = STATE_PATH.clone().into_os_string();
     lock_path.push(".lock");
-    let lock = fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&lock_path)
-        .expect("open fake state lock");
+    let lock =
+        fs::OpenOptions::new().create(true).truncate(false).write(true).open(&lock_path).expect("open fake state lock");
     lock.lock().expect("lock fake state");
     let mut state = load_state();
     let result = f(&mut state);
@@ -133,11 +127,7 @@ fn update_state<T>(f: impl FnOnce(&mut State) -> T) -> T {
 
 fn create_thread(cwd: Value) -> Thread {
     update_state(|state| {
-        let thread = Thread {
-            id: format!("thr_{}", state.next_thread),
-            cwd,
-            created_at: now_seconds(),
-        };
+        let thread = Thread { id: format!("thr_{}", state.next_thread), cwd, created_at: now_seconds() };
         state.next_thread += 1;
         state.threads.push(thread.clone());
         thread
@@ -146,10 +136,7 @@ fn create_thread(cwd: Value) -> Thread {
 
 fn find_thread(thread_id: &Value) -> Result<Thread, String> {
     let state = load_state();
-    let found = state
-        .threads
-        .into_iter()
-        .find(|candidate| *thread_id == candidate.id.as_str());
+    let found = state.threads.into_iter().find(|candidate| *thread_id == candidate.id.as_str());
     found.ok_or_else(|| match thread_id.as_str() {
         Some(id) => format!("unknown thread {id}"),
         None => format!("unknown thread {thread_id}"),
@@ -168,10 +155,7 @@ fn next_turn() -> String {
 // Message builders
 
 fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
 }
 
 fn now_seconds() -> u64 {
@@ -213,11 +197,7 @@ fn reply(request: &Value, result: Value) -> Value {
 }
 
 fn reply_error(request: &Value, code: i64, message: &str) -> Value {
-    respond(
-        request,
-        "error",
-        json!({ "code": code, "message": message }),
-    )
+    respond(request, "error", json!({ "code": code, "message": message }))
 }
 
 fn build_thread(thread: &Thread) -> Value {
@@ -369,36 +349,23 @@ fn fixture_goal(thread_id: &str, status: &str) -> Value {
 fn rate_limits() -> Value {
     let now = now_seconds();
     let window = |used: u64, mins: u64, resets_in_mins: u64| json!({ "usedPercent": used, "windowDurationMins": mins, "resetsAt": now + resets_in_mins * 60 });
-    let snapshot =
-        |limit_id: &str, limit_name: Value, primary: Value, secondary: Value, credits: Value| {
-            json!({
-                "limitId": limit_id,
-                "limitName": limit_name,
-                "normalModelSlug": null,
-                "primary": primary,
-                "secondary": secondary,
-                "credits": credits,
-                "individualLimit": null,
-                "spendControlReached": false,
-                "planType": "pro",
-                "rateLimitReachedType": null
-            })
-        };
+    let snapshot = |limit_id: &str, limit_name: Value, primary: Value, secondary: Value, credits: Value| {
+        json!({
+            "limitId": limit_id,
+            "limitName": limit_name,
+            "normalModelSlug": null,
+            "primary": primary,
+            "secondary": secondary,
+            "credits": credits,
+            "individualLimit": null,
+            "spendControlReached": false,
+            "planType": "pro",
+            "rateLimitReachedType": null
+        })
+    };
     let credits = json!({ "hasCredits": true, "unlimited": false, "balance": "12.50" });
-    let account = snapshot(
-        "codex",
-        Value::Null,
-        window(12, 300, 180),
-        window(47, 10080, 3000),
-        credits,
-    );
-    let spark = snapshot(
-        "codex_spark",
-        json!("Spark"),
-        window(3, 300, 240),
-        Value::Null,
-        Value::Null,
-    );
+    let account = snapshot("codex", Value::Null, window(12, 300, 180), window(47, 10080, 3000), credits);
+    let spark = snapshot("codex_spark", json!("Spark"), window(3, 300, 240), Value::Null, Value::Null);
     json!({
         "rateLimits": account,
         "rateLimitsByLimitId": { "codex": account, "codex_spark": spark }
@@ -420,11 +387,7 @@ impl Turn {
     /// A turn the server starts by itself, with no prompt behind it. Takes the
     /// next turn id from the state file.
     fn unprompted(thread_id: &str) -> Turn {
-        Turn {
-            thread_id: thread_id.into(),
-            turn_id: next_turn(),
-            prompt: String::new(),
-        }
+        Turn { thread_id: thread_id.into(), turn_id: next_turn(), prompt: String::new() }
     }
 }
 
@@ -444,13 +407,8 @@ struct Server {
     batch: Option<Vec<Value>>,
 }
 
-static SERVER: Mutex<Server> = Mutex::new(Server {
-    active_turn: None,
-    request_id: 9000,
-    goal: None,
-    goal_turns: 0,
-    batch: None,
-});
+static SERVER: Mutex<Server> =
+    Mutex::new(Server { active_turn: None, request_id: 9000, goal: None, goal_turns: 0, batch: None });
 
 fn server() -> MutexGuard<'static, Server> {
     SERVER.lock().unwrap()
@@ -459,9 +417,7 @@ fn server() -> MutexGuard<'static, Server> {
 /// Only called with the server lock held, which is what keeps lines whole.
 fn write_out(text: &str) {
     let mut out = io::stdout().lock();
-    out.write_all(text.as_bytes())
-        .and_then(|()| out.flush())
-        .expect("write stdout");
+    out.write_all(text.as_bytes()).and_then(|()| out.flush()).expect("write stdout");
 }
 
 static TIMERS: Mutex<Vec<JoinHandle<()>>> = Mutex::new(Vec::new());
@@ -527,25 +483,15 @@ impl Server {
     }
 
     fn complete_turn(&mut self, turn: &Turn, status: &str, message: Option<&str>) {
-        let Turn {
-            thread_id,
-            turn_id,
-            prompt,
-        } = turn;
+        let Turn { thread_id, turn_id, prompt } = turn;
         let final_text = match message {
             Some(text) => text.to_string(),
-            None if prompt.contains("follow") => {
-                "Resumed the prior run.\nFollow-up prompt accepted.".into()
-            }
+            None if prompt.contains("follow") => "Resumed the prior run.\nFollow-up prompt accepted.".into(),
             None => format!("Handled the requested task.\nPrompt: {prompt}"),
         };
         self.send(turn_started(thread_id, turn_id));
         self.send(reasoning_started(thread_id, turn_id));
-        self.send(reasoning_delta(
-            thread_id,
-            turn_id,
-            "Thinking through fixture.",
-        ));
+        self.send(reasoning_delta(thread_id, turn_id, "Thinking through fixture."));
         self.send(item_completed(
             thread_id,
             turn_id,
@@ -584,69 +530,48 @@ impl Server {
     fn start_long_turn(&mut self, turn: Turn) {
         self.send(turn_started(&turn.thread_id, &turn.turn_id));
         self.send(reasoning_started(&turn.thread_id, &turn.turn_id));
-        self.send(reasoning_delta(
-            &turn.thread_id,
-            &turn.turn_id,
-            "Waiting for steering.",
-        ));
+        self.send(reasoning_delta(&turn.thread_id, &turn.turn_id, "Waiting for steering."));
         self.active_turn = Some(turn);
     }
 
     // Reproduces the observed compaction shape: codex closes the turn with a bare
     // instruction acknowledgement, then continues the real work in a fresh turn.
     fn start_compacted_turn(&mut self, turn: &Turn) {
-        let Turn {
-            thread_id, turn_id, ..
-        } = turn;
+        let Turn { thread_id, turn_id, .. } = turn;
         self.send(turn_started(thread_id, turn_id));
         self.send(item_completed(
             thread_id,
             turn_id,
             json!({ "type": "contextCompaction", "id": format!("compact_{turn_id}") }),
         ));
-        self.send(agent_message(
-            thread_id,
-            turn_id,
-            "Instructions loaded for `/repo`.",
-        ));
+        self.send(agent_message(thread_id, turn_id, "Instructions loaded for `/repo`."));
         self.send(turn_completed(thread_id, turn_id, "completed", Value::Null));
 
         fn finish(s: &mut Server, turn: &Turn) {
-            let Turn {
-                thread_id, turn_id, ..
-            } = turn;
-            s.send(agent_message(
-                thread_id,
-                turn_id,
-                "Continued past the compaction and finished the work.",
-            ));
+            let Turn { thread_id, turn_id, .. } = turn;
+            s.send(agent_message(thread_id, turn_id, "Continued past the compaction and finished the work."));
             s.send(token_usage_updated(thread_id, turn_id));
             s.send(turn_completed(thread_id, turn_id, "completed", Value::Null));
             s.active_turn = None;
         }
         let continuation = Turn::unprompted(thread_id);
-        set_timeout(
-            env_ms("CEPTION_FAKE_CONTINUATION_DELAY_MS", 150),
-            move |s| {
-                s.active_turn = Some(continuation.clone());
-                s.send(turn_started(&continuation.thread_id, &continuation.turn_id));
-                // Optionally keep the continuation running so tests can observe it live.
-                let run_ms = env_ms("CEPTION_FAKE_CONTINUATION_RUN_MS", 0);
-                if run_ms > 0 {
-                    set_timeout(run_ms, move |s| finish(s, &continuation));
-                } else {
-                    finish(s, &continuation);
-                }
-            },
-        );
+        set_timeout(env_ms("CEPTION_FAKE_CONTINUATION_DELAY_MS", 150), move |s| {
+            s.active_turn = Some(continuation.clone());
+            s.send(turn_started(&continuation.thread_id, &continuation.turn_id));
+            // Optionally keep the continuation running so tests can observe it live.
+            let run_ms = env_ms("CEPTION_FAKE_CONTINUATION_RUN_MS", 0);
+            if run_ms > 0 {
+                set_timeout(run_ms, move |s| finish(s, &continuation));
+            } else {
+                finish(s, &continuation);
+            }
+        });
     }
 
     // The real cross-turn mechanism: an active thread goal makes codex start a
     // follow-on turn by itself once the thread goes idle.
     fn start_goal_turn(&mut self, turn: &Turn) {
-        let Turn {
-            thread_id, turn_id, ..
-        } = turn;
+        let Turn { thread_id, turn_id, .. } = turn;
         self.send(turn_started(thread_id, turn_id));
         self.send(json!({
             "method": "thread/goal/updated",
@@ -662,28 +587,19 @@ impl Server {
         }));
 
         let continuation = Turn::unprompted(thread_id);
-        set_timeout(
-            env_ms("CEPTION_FAKE_CONTINUATION_DELAY_MS", 150),
-            move |s| {
-                let Turn {
-                    thread_id, turn_id, ..
-                } = &continuation;
-                s.active_turn = Some(continuation.clone());
-                s.send(turn_started(thread_id, turn_id));
-                s.send(agent_message(
-                    thread_id,
-                    turn_id,
-                    "Goal continuation finished the work.",
-                ));
-                s.send(token_usage_updated(thread_id, turn_id));
-                s.send(json!({
-                    "method": "thread/goal/updated",
-                    "params": { "threadId": thread_id, "turnId": turn_id, "goal": fixture_goal(thread_id, "complete") }
-                }));
-                s.send(turn_completed(thread_id, turn_id, "completed", Value::Null));
-                s.active_turn = None;
-            },
-        );
+        set_timeout(env_ms("CEPTION_FAKE_CONTINUATION_DELAY_MS", 150), move |s| {
+            let Turn { thread_id, turn_id, .. } = &continuation;
+            s.active_turn = Some(continuation.clone());
+            s.send(turn_started(thread_id, turn_id));
+            s.send(agent_message(thread_id, turn_id, "Goal continuation finished the work."));
+            s.send(token_usage_updated(thread_id, turn_id));
+            s.send(json!({
+                "method": "thread/goal/updated",
+                "params": { "threadId": thread_id, "turnId": turn_id, "goal": fixture_goal(thread_id, "complete") }
+            }));
+            s.send(turn_completed(thread_id, turn_id, "completed", Value::Null));
+            s.active_turn = None;
+        });
     }
 
     /// The goal set through `thread/goal/set`; callers make sure there is one.
@@ -717,9 +633,7 @@ impl Server {
     }
 
     fn goal_is_active(&self) -> bool {
-        self.goal
-            .as_ref()
-            .is_some_and(|goal| goal.status == "active")
+        self.goal.as_ref().is_some_and(|goal| goal.status == "active")
     }
 
     // What an active goal actually does: codex starts its own turn on the idle
@@ -729,8 +643,7 @@ impl Server {
     fn start_goal_turn_from_goal(&mut self, thread_id: &str) {
         let turn = Turn::unprompted(thread_id);
         self.active_turn = Some(turn.clone());
-        let stopping =
-            matches!(BEHAVIOR.as_str(), "goal-stopped" | "goal-instant") && self.goal_turns == 0;
+        let stopping = matches!(BEHAVIOR.as_str(), "goal-stopped" | "goal-instant") && self.goal_turns == 0;
         self.goal_turns += 1;
         if *BEHAVIOR == "steer" {
             // Park the goal's turn open so a test can steer it mid-flight.
@@ -739,11 +652,7 @@ impl Server {
         }
         let turn_id = &turn.turn_id;
         self.send(turn_started(thread_id, turn_id));
-        let text = if stopping {
-            "Working on the objective."
-        } else {
-            "Objective met; work finished."
-        };
+        let text = if stopping { "Working on the objective." } else { "Objective met; work finished." };
         self.send(agent_message(thread_id, turn_id, text));
         self.send(token_usage_updated(thread_id, turn_id));
         if stopping {
@@ -792,9 +701,7 @@ impl Server {
     // Requests
 
     fn dispatch(&mut self, message: &Value) {
-        let has_method = message["method"]
-            .as_str()
-            .is_some_and(|method| !method.is_empty());
+        let has_method = message["method"].as_str().is_some_and(|method| !method.is_empty());
         if message.get("id").is_some() && !has_method {
             if message["error"]["code"] == -32601 {
                 update_state(|state| state.rejected_requests += 1);
@@ -803,9 +710,7 @@ impl Server {
         }
 
         update_state(|state| {
-            state
-                .requests
-                .push(json!({ "method": message["method"], "params": message["params"] }));
+            state.requests.push(json!({ "method": message["method"], "params": message["params"] }));
         });
 
         if let Err(err) = self.handle(message) {
@@ -897,11 +802,7 @@ impl Server {
     fn turn_start(&mut self, message: &Value) -> Result<(), String> {
         let params = &message["params"];
         let thread = find_thread(&params["threadId"])?;
-        let turn = Turn {
-            thread_id: thread.id,
-            turn_id: next_turn(),
-            prompt: prompt_text(&params["input"]),
-        };
+        let turn = Turn { thread_id: thread.id, turn_id: next_turn(), prompt: prompt_text(&params["input"]) };
         update_state(|state| {
             state.last_turn_starts.push(json!({
                 "threadId": turn.thread_id,
@@ -915,10 +816,7 @@ impl Server {
         let Some(turn) = self.turn_start_special(message, turn) else {
             return Ok(());
         };
-        self.send(reply(
-            message,
-            json!({ "turn": build_turn(&turn.turn_id, "inProgress", Value::Null) }),
-        ));
+        self.send(reply(message, json!({ "turn": build_turn(&turn.turn_id, "inProgress", Value::Null) })));
 
         let behavior = BEHAVIOR.as_str();
         if behavior == "stubborn-child" {
@@ -1051,16 +949,11 @@ impl Server {
         let thread_id = find_thread(&params["threadId"])?.id;
         let previous_objective = self.goal.take().map(|goal| goal.objective);
         self.goal = Some(Goal {
-            objective: given(&params["objective"])
-                .or(previous_objective)
-                .unwrap_or_else(|| json!("")),
+            objective: given(&params["objective"]).or(previous_objective).unwrap_or_else(|| json!("")),
             status: given(&params["status"]).unwrap_or_else(|| json!("active")),
         });
         // The running turn, if any, addressed on this request's thread.
-        let parked = self.active_turn.clone().map(|turn| Turn {
-            thread_id: thread_id.clone(),
-            ..turn
-        });
+        let parked = self.active_turn.clone().map(|turn| Turn { thread_id: thread_id.clone(), ..turn });
 
         match (BEHAVIOR.as_str(), parked) {
             // The goal is accepted and never starts a turn by itself.
@@ -1092,9 +985,7 @@ impl Server {
                     s.complete_turn(&parked, "completed", Some("Parked turn finished."));
                     s.send_goal_updated(&thread_id);
                 });
-                set_timeout(60, move |s| {
-                    s.run_goal_continuation(&thread_id, "Continuation after the late goal.")
-                });
+                set_timeout(60, move |s| s.run_goal_continuation(&thread_id, "Continuation after the late goal."));
             }
 
             // The running turn absorbs the goal and meets the objective itself,
@@ -1103,11 +994,7 @@ impl Server {
                 self.answer_goal(message, &thread_id);
                 set_timeout(50, move |s| {
                     s.set_goal_status(&parked.thread_id, "complete");
-                    s.complete_turn(
-                        &parked,
-                        "completed",
-                        Some("Objective met inside the running turn."),
-                    );
+                    s.complete_turn(&parked, "completed", Some("Objective met inside the running turn."));
                 });
             }
 
@@ -1127,9 +1014,7 @@ impl Server {
             // goal can start a turn and that turn can fail, so the reply arrives
             // last, carrying the stale (active) snapshot. Plain: one write.
             // "-split": each message its own write, 20ms apart.
-            (behavior @ ("goal-response-last" | "goal-response-last-split"), None)
-                if self.goal_is_active() =>
-            {
+            (behavior @ ("goal-response-last" | "goal-response-last-split"), None) if self.goal_is_active() => {
                 let messages = self.goal_turn_before_reply(message, &thread_id);
                 if behavior == "goal-response-last" {
                     self.with_batch(|s| messages.into_iter().for_each(|m| s.send(m)));
@@ -1207,10 +1092,7 @@ impl Server {
                 "prompt": steer_prompt
             }));
         });
-        self.send(reply(
-            message,
-            json!({ "turnId": params["expectedTurnId"] }),
-        ));
+        self.send(reply(message, json!({ "turnId": params["expectedTurnId"] })));
         if let Some(steered) = self.active_turn.clone() {
             set_timeout(100, move |s| {
                 let text = format!("Steered response.\nSteer: {steer_prompt}");

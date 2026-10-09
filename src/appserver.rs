@@ -25,10 +25,19 @@ pub enum AppEvent {
 }
 
 pub enum Incoming {
-    Notification { method: String, params: Value },
-    Response { id: u64, outcome: Result<Value, String> },
+    Notification {
+        method: String,
+        params: Value,
+    },
+    Response {
+        id: u64,
+        outcome: Result<Value, String>,
+    },
     /// The server asking us something (approvals); we never answer yes.
-    Request { id: Value, method: String },
+    Request {
+        id: Value,
+        method: String,
+    },
 }
 
 impl Incoming {
@@ -41,11 +50,9 @@ impl Incoming {
             (Some(id), Some(method)) => Some(Self::Request { id, method }),
             (Some(id), None) => {
                 let outcome = match map.remove("error") {
-                    Some(error) => Err(error
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .unwrap_or("request failed")
-                        .to_string()),
+                    Some(error) => {
+                        Err(error.get("message").and_then(Value::as_str).unwrap_or("request failed").to_string())
+                    }
                     None => Ok(map.remove("result").unwrap_or(Value::Null)),
                 };
                 Some(Self::Response { id: id.as_u64()?, outcome })
@@ -126,9 +133,7 @@ impl AppServer {
                 Ok(())
             });
         }
-        let mut child = command
-            .spawn()
-            .with_context(|| format!("start {}", argv.join(" ")))?;
+        let mut child = command.spawn().with_context(|| format!("start {}", argv.join(" ")))?;
         let pid = child.id().context("app-server pid")?;
         let exit = PidWatch::child(pid)?;
         let (tx, rx) = unbounded_channel();
@@ -170,10 +175,7 @@ impl AppServer {
     fn send(&mut self, message: Value) -> Result<()> {
         let mut line = serde_json::to_vec(&message)?;
         line.push(b'\n');
-        self.writer
-            .as_ref()
-            .and_then(|writer| writer.send(line).ok())
-            .context("codex app-server stdin is closed")
+        self.writer.as_ref().and_then(|writer| writer.send(line).ok()).context("codex app-server stdin is closed")
     }
 
     /// Send a request and wait for its response, handing everything else to

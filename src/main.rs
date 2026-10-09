@@ -155,10 +155,7 @@ fn main() -> ExitCode {
             return if error.use_stderr() { ExitCode::from(4) } else { ExitCode::SUCCESS };
         }
     };
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime");
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tokio runtime");
     match runtime.block_on(client::run(cli.command)) {
         Ok(code) => ExitCode::from(code),
         // Usage and infrastructure errors; turn outcomes are exit codes.

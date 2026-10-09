@@ -12,8 +12,8 @@ use tokio::io::unix::AsyncFd;
 /// Clock ticks since boot at which the process started. Together with the pid
 /// it names one process even across pid reuse.
 pub fn starttime(pid: u32) -> Result<u64> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
-        .with_context(|| format!("process {pid} not found"))?;
+    let stat =
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).with_context(|| format!("process {pid} not found"))?;
     // comm (field 2) is parenthesised and may contain spaces; fields after it
     // start at 3, so starttime (22) is the 20th.
     let rest = &stat[stat.rfind(')').context("malformed /proc stat")? + 2..];

@@ -23,9 +23,7 @@ pub fn from_env() -> Result<Session> {
 
 pub fn resolve(env: impl Fn(&str) -> Option<String>) -> Result<Session> {
     let var = |name: &str| env(name).filter(|value| !value.is_empty());
-    let key = var("CEPTION_SESSION")
-        .or_else(|| var("CLAUDE_CODE_SESSION_ID"))
-        .unwrap_or_else(|| "default".to_string());
+    let key = var("CEPTION_SESSION").or_else(|| var("CLAUDE_CODE_SESSION_ID")).unwrap_or_else(|| "default".to_string());
     validate_name("session", &key)?;
     let watch_pid = match var("CEPTION_WATCH_PID").or_else(|| var("CLAUDE_PID")) {
         Some(pid) => Some(pid.parse().with_context(|| format!("invalid watch pid {pid:?}"))?),
@@ -39,11 +37,7 @@ mod tests {
     use super::*;
 
     fn session(vars: &[(&str, &str)]) -> Result<Session> {
-        resolve(|name| {
-            vars.iter()
-                .find(|(key, _)| *key == name)
-                .map(|(_, value)| value.to_string())
-        })
+        resolve(|name| vars.iter().find(|(key, _)| *key == name).map(|(_, value)| value.to_string()))
     }
 
     #[test]
@@ -59,11 +53,7 @@ mod tests {
 
     #[test]
     fn explicit_overrides_win_independently() {
-        let vars = [
-            ("CLAUDE_CODE_SESSION_ID", "abc"),
-            ("CLAUDE_PID", "42"),
-            ("CEPTION_SESSION", "mine"),
-        ];
+        let vars = [("CLAUDE_CODE_SESSION_ID", "abc"), ("CLAUDE_PID", "42"), ("CEPTION_SESSION", "mine")];
         assert_eq!(session(&vars).unwrap(), Session { key: "mine".into(), watch_pid: Some(42) });
         let vars = [("CLAUDE_PID", "42"), ("CEPTION_WATCH_PID", "7")];
         assert_eq!(session(&vars).unwrap(), Session { key: "default".into(), watch_pid: Some(7) });

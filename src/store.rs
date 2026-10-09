@@ -28,8 +28,7 @@ pub struct Record {
 pub fn read(path: &Path) -> Result<Option<Record>> {
     match fs::read(path) {
         Ok(bytes) => {
-            let record = serde_json::from_slice(&bytes)
-                .with_context(|| format!("parse {}", path.display()))?;
+            let record = serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?;
             Ok(Some(record))
         }
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
@@ -166,9 +165,7 @@ pub fn gc(hash: &str, my_session: &str, max_age: Duration) -> Result<()> {
                 continue;
             };
             let still_stale = [&paths.record, &paths.log].iter().all(|file| {
-                fs::metadata(file)
-                    .and_then(|meta| meta.modified())
-                    .map_or(true, |modified| age(modified) > max_age)
+                fs::metadata(file).and_then(|meta| meta.modified()).map_or(true, |modified| age(modified) > max_age)
             });
             if still_stale {
                 let _ = fs::remove_file(&paths.record);

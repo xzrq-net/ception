@@ -14,12 +14,22 @@ use crate::render::ReportLevel;
 pub enum Request {
     Status,
     /// Steer the live turn if there is one, else start a turn.
-    Send { prompt: String, report: ReportLevel },
-    Goal { action: GoalAction, objective: Option<String>, report: ReportLevel },
+    Send {
+        prompt: String,
+        report: ReportLevel,
+    },
+    Goal {
+        action: GoalAction,
+        objective: Option<String>,
+        report: ReportLevel,
+    },
     Interrupt,
     /// Block until the live turn settles; answers at once when idle. With a
     /// run id: that run, live or retained.
-    Watch { report: ReportLevel, run: Option<String> },
+    Watch {
+        report: ReportLevel,
+        run: Option<String>,
+    },
     Shutdown,
 }
 
@@ -41,11 +51,17 @@ pub enum GoalAction {
 pub enum Reply {
     /// The request's turn is running as run `run`; the final reply follows
     /// when it settles.
-    Accepted { run: String },
+    Accepted {
+        run: String,
+    },
     Result(Outcome),
-    Error { message: String },
+    Error {
+        message: String,
+    },
     /// Not acted on (the daemon is shutting down); safe to retry elsewhere.
-    Refused { message: String },
+    Refused {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

@@ -125,9 +125,7 @@ fn is_compaction_amnesia_message(text: &str) -> bool {
         return false;
     };
     rest.is_empty()
-        || rest
-            .strip_prefix(" for ")
-            .is_some_and(|target| !target.is_empty() && !target.contains(['\r', '\n']))
+        || rest.strip_prefix(" for ").is_some_and(|target| !target.is_empty() && !target.contains(['\r', '\n']))
 }
 
 /// codexErrorInfo is either a bare name or a single-key object carrying
@@ -148,20 +146,14 @@ fn error_info_name(info: Option<&Value>) -> Option<String> {
                     .collect(),
                 _ => Vec::new(),
             };
-            if fields.is_empty() {
-                Some(name.clone())
-            } else {
-                Some(format!("{name} ({})", fields.join(", ")))
-            }
+            if fields.is_empty() { Some(name.clone()) } else { Some(format!("{name} ({})", fields.join(", "))) }
         }
         _ => None,
     }
 }
 
 pub fn format_token_usage(usage: &Value) -> String {
-    let usage = present(usage.get("last"))
-        .or_else(|| present(usage.get("total")))
-        .unwrap_or(usage);
+    let usage = present(usage.get("last")).or_else(|| present(usage.get("total"))).unwrap_or(usage);
     let Some(total) = usage.get("totalTokens").filter(|v| v.is_number()) else {
         return "n/a".to_string();
     };
@@ -207,9 +199,7 @@ pub fn format_goal(goal: Option<&Value>, label: Option<&str>) -> String {
             Some(label) => format!("ception goal {label} --resume"),
             None => "ception goal <label> --resume".to_string(),
         };
-        lines.push(format!(
-            "the goal stopped before completing; restart the run with `{resume}`"
-        ));
+        lines.push(format!("the goal stopped before completing; restart the run with `{resume}`"));
     }
     lines.join("\n")
 }
@@ -313,11 +303,8 @@ impl TurnAccumulator {
             Some(info) => format!(" errorCode={info}"),
             None => String::new(),
         };
-        let compactions = if self.compactions > 0 {
-            format!(" compactions={}", self.compactions)
-        } else {
-            String::new()
-        };
+        let compactions =
+            if self.compactions > 0 { format!(" compactions={}", self.compactions) } else { String::new() };
         format!(
             "=== status={}{error_info}{compactions} tokens={} durationMs={} ===",
             self.status,
@@ -395,10 +382,7 @@ impl TurnAccumulator {
         // only its instruction-loading acknowledgement as the final answer.
         // Match the observed message rather than treating a text-only answer
         // as failure: reasoning and an agent message can be a complete turn.
-        let amnesia = self
-            .message_after_compaction
-            .as_deref()
-            .is_some_and(is_compaction_amnesia_message);
+        let amnesia = self.message_after_compaction.as_deref().is_some_and(is_compaction_amnesia_message);
         if self.status == "completed" && amnesia {
             self.status = "failed".to_string();
             self.derailed_by_compaction = true;
@@ -419,11 +403,9 @@ impl TurnAccumulator {
                 let files = self.record_file_changes(item);
                 format!("[edit] {} ({status})", files_or_id(&files, &id))
             }
-            Some("mcpToolCall") => format!(
-                "[mcp] {}/{} ({status})",
-                js_string(item.get("server")),
-                js_string(item.get("tool")),
-            ),
+            Some("mcpToolCall") => {
+                format!("[mcp] {}/{} ({status})", js_string(item.get("server")), js_string(item.get("tool")),)
+            }
             _ => return Vec::new(),
         };
         self.full_lines.push(line.clone());
@@ -500,20 +482,15 @@ impl TurnAccumulator {
             }
             "mcpToolCall" => format!("[mcp] {}/{} status={status}", field("server"), field("tool")),
             "dynamicToolCall" => {
-                let namespace = if truthy(item.get("namespace")) {
-                    format!("{}/", field("namespace"))
-                } else {
-                    String::new()
-                };
+                let namespace =
+                    if truthy(item.get("namespace")) { format!("{}/", field("namespace")) } else { String::new() };
                 format!("[tool] {namespace}{} status={status}", field("tool"))
             }
             "webSearch" => format!("[web] {}", field("query")),
             "plan" => format!("[plan] {}", truncate(&field("text"), 1200)),
-            "collabAgentToolCall" => format!(
-                "[agent] {} {} status={status}",
-                field("tool"),
-                field("receiverThreadIds"),
-            ),
+            "collabAgentToolCall" => {
+                format!("[agent] {} {} status={status}", field("tool"), field("receiverThreadIds"),)
+            }
             "enteredReviewMode" | "exitedReviewMode" => {
                 format!("[review] {}", truncate(&field("review"), 1200))
             }
@@ -541,11 +518,8 @@ impl TurnAccumulator {
     }
 
     pub fn build_report(&self, level: ReportLevel) -> String {
-        let mut body = if self.final_message.is_empty() {
-            self.error_message.clone()
-        } else {
-            self.final_message.clone()
-        };
+        let mut body =
+            if self.final_message.is_empty() { self.error_message.clone() } else { self.final_message.clone() };
         if self.derailed_by_compaction {
             body = [
                 "WARNING: turn derailed by mid-turn context compaction. The model lost",
@@ -656,8 +630,7 @@ mod tests {
         assert_eq!(turn.status, "failed");
         assert!(turn.derailed_by_compaction);
         assert!(
-            turn.build_report(ReportLevel::Brief)
-                .contains("WARNING: turn derailed by mid-turn context compaction")
+            turn.build_report(ReportLevel::Brief).contains("WARNING: turn derailed by mid-turn context compaction")
         );
     }
 
@@ -747,12 +720,18 @@ mod tests {
     fn adopting_a_continuation_clears_the_derailed_verdict_from_the_compacted_half() {
         let mut turn = accumulator();
         complete_item(&mut turn, json!({ "id": "compaction", "type": "contextCompaction" }));
-        complete_item(&mut turn, json!({ "id": "ack", "type": "agentMessage", "text": "Instructions loaded for `/repo`." }));
+        complete_item(
+            &mut turn,
+            json!({ "id": "ack", "type": "agentMessage", "text": "Instructions loaded for `/repo`." }),
+        );
         complete_turn(&mut turn);
         assert_eq!(turn.status, "failed");
 
         turn.adopt_continuation("turn-2");
-        complete_item(&mut turn, json!({ "id": "real", "type": "agentMessage", "text": "Actually finished the work." }));
+        complete_item(
+            &mut turn,
+            json!({ "id": "real", "type": "agentMessage", "text": "Actually finished the work." }),
+        );
         complete_turn(&mut turn);
 
         assert_eq!(turn.status, "completed");
@@ -783,7 +762,10 @@ mod tests {
             "item/reasoning/summaryTextDelta",
             &json!({ "itemId": "r1", "summaryIndex": 0, "delta": "Planning the fix" }),
         );
-        complete_item(&mut turn, json!({ "id": "r1", "type": "reasoning", "summary": ["Planning the fix"], "content": [] }));
+        complete_item(
+            &mut turn,
+            json!({ "id": "r1", "type": "reasoning", "summary": ["Planning the fix"], "content": [] }),
+        );
         complete_item(&mut turn, json!({ "id": "message", "type": "agentMessage", "text": "Done." }));
         complete_turn(&mut turn);
 
@@ -841,7 +823,10 @@ mod tests {
         assert_eq!(edit, ["[edit] e1: +x"]);
         assert!(turn.build_report(ReportLevel::Full).contains("[edit] e1: +x"));
 
-        turn.handle_notification("item/commandExecution/outputDelta", &json!({ "itemId": "c1", "delta": "streamed\n" }));
+        turn.handle_notification(
+            "item/commandExecution/outputDelta",
+            &json!({ "itemId": "c1", "delta": "streamed\n" }),
+        );
         let cmd = complete_item(
             &mut turn,
             json!({ "id": "c1", "type": "commandExecution", "command": "cargo\n  test", "exitCode": null }),
@@ -903,7 +888,10 @@ mod tests {
     fn header_line_carries_a_millisecond_utc_timestamp() {
         let mut turn = TurnAccumulator::new("alpha", "th", "tu", "first   line\r\nsecond line");
         turn.started_at = "2026-10-08T12:34:56.789999Z".parse().unwrap();
-        assert_eq!(turn.header_line(), "\n=== 2026-10-08T12:34:56.789Z label=alpha thread=th turn=tu prompt=first line ===");
+        assert_eq!(
+            turn.header_line(),
+            "\n=== 2026-10-08T12:34:56.789Z label=alpha thread=th turn=tu prompt=first line ==="
+        );
         turn.started_at = "2026-10-08T12:34:56Z".parse().unwrap();
         assert!(turn.header_line().starts_with("\n=== 2026-10-08T12:34:56.000Z label=alpha"));
     }
@@ -939,7 +927,10 @@ mod tests {
     #[test]
     fn token_usage_and_exit_codes() {
         assert_eq!(format_token_usage(&Value::Null), "n/a");
-        assert_eq!(format_token_usage(&json!({ "last": null, "total": { "totalTokens": 7.0 } })), "7 total (0 in, 0 out, 0 reasoning)");
+        assert_eq!(
+            format_token_usage(&json!({ "last": null, "total": { "totalTokens": 7.0 } })),
+            "7 total (0 in, 0 out, 0 reasoning)"
+        );
         assert_eq!(format_token_usage(&json!({ "totalTokens": "7" })), "n/a");
         assert_eq!(status_exit_code("idle"), 0);
         assert_eq!(status_exit_code("failed"), 2);

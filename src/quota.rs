@@ -82,10 +82,7 @@ fn snapshot_rows(label: &str, snapshot: &Value, now: Timestamp) -> Vec<(String, 
     match reported.as_slice() {
         [] => vec![(label.to_string(), "not reported".to_string())],
         [(_, window)] => vec![(label.to_string(), window_value(*window, now))],
-        _ => reported
-            .iter()
-            .map(|(slot, window)| (format!("{label} {slot}"), window_value(*window, now)))
-            .collect(),
+        _ => reported.iter().map(|(slot, window)| (format!("{label} {slot}"), window_value(*window, now))).collect(),
     }
 }
 
