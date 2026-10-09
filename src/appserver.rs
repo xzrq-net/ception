@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::sync::oneshot;
 use tokio::time::Instant;
 
 use crate::procfs::PidWatch;
@@ -87,6 +88,9 @@ pub struct AppServer {
     writer: Option<UnboundedSender<Vec<u8>>>,
     next_id: u64,
     stderr_tail: Arc<Mutex<String>>,
+    /// Fires when stderr hits EOF, so an exit description includes the
+    /// server's last words.
+    stderr_done: Option<oneshot::Receiver<()>>,
     closed: bool,
 }
 
@@ -125,10 +129,19 @@ impl AppServer {
         let (tx, rx) = unbounded_channel();
         let stderr_tail = Arc::new(Mutex::new(String::new()));
         tokio::spawn(read_stdout(child.stdout.take().expect("piped"), tx.clone(), exit));
-        tokio::spawn(read_stderr(child.stderr.take().expect("piped"), tx, stderr_tail.clone()));
+        let (stderr_eof, stderr_done) = oneshot::channel();
+        tokio::spawn(read_stderr(child.stderr.take().expect("piped"), tx, stderr_tail.clone(), stderr_eof));
         let (writer, lines) = unbounded_channel();
         tokio::spawn(write_stdin(child.stdin.take().expect("piped"), lines));
-        let server = Self { child, pgid: pid as libc::pid_t, writer: Some(writer), next_id: 1, stderr_tail, closed: false };
+        let server = Self {
+            child,
+            pgid: pid as libc::pid_t,
+            writer: Some(writer),
+            next_id: 1,
+            stderr_tail,
+            stderr_done: Some(stderr_done),
+            closed: false,
+        };
         Ok((server, rx))
     }
 
@@ -215,6 +228,9 @@ impl AppServer {
             },
             _ => "stdout closed".to_string(),
         };
+        if let Some(done) = self.stderr_done.take() {
+            let _ = tokio::time::timeout(Duration::from_millis(500), done).await;
+        }
         let stderr = self.stderr_tail.lock().unwrap().trim().to_string();
         if stderr.is_empty() {
             format!("codex app-server exited unexpectedly ({status})")
@@ -310,6 +326,7 @@ async fn read_stderr(
     stderr: tokio::process::ChildStderr,
     tx: UnboundedSender<AppEvent>,
     tail: Arc<Mutex<String>>,
+    eof: oneshot::Sender<()>,
 ) {
     let mut lines = BufReader::new(stderr).lines();
     while let Ok(Some(line)) = lines.next_line().await {
@@ -325,4 +342,5 @@ async fn read_stderr(
         }
         let _ = tx.send(AppEvent::Stderr(line));
     }
+    let _ = eof.send(());
 }

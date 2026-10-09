@@ -853,6 +853,150 @@ fn no_session_env_uses_the_default_session_and_ends_on_idle_timeout() {
     assert_has(&ctx.log("default", "bare"), "shutting down: idle timeout");
 }
 
+// ----- regressions found in review ----------------------------------------------------------
+
+/// Shutdown used to release the label lock while app-server descendants that
+/// ignore SIGTERM lived on, so a successor could overlap the old tools.
+#[test]
+fn kill_releases_the_label_only_after_app_server_descendants_are_gone() {
+    let ctx = Ctx::new("stubborn-child");
+
+    ctx.ception(&["spawn", "shell", "start a tool"]).run().expect_code(0);
+    let tool = children(&ctx)[0];
+    let _reap = Reap::new(&[tool]);
+    assert!(alive(tool), "the fake's tool never ran");
+
+    let killed = ctx.ception(&["kill", "shell"]).run().expect_code(0);
+    assert_has(&killed.stdout, "shutdown accepted");
+
+    let lock = ctx.lock_path(SESSION, "shell");
+    assert!(wait_until(WAIT, || lock_free(&lock)), "daemon never released the label");
+    assert!(!alive(tool), "label released while app-server descendant {tool} still runs");
+}
+
+/// A server that stops reading its stdin used to block the daemon on a full
+/// pipe: status went unanswered and kill could not reach it.
+#[test]
+fn a_server_that_stops_reading_cannot_wedge_the_daemon() {
+    let ctx = Ctx::new("deaf");
+
+    let mut first = ctx.ception(&["spawn", "deaf", "first"]).spawn();
+    ctx.wait_turn_starts(1);
+    // 1 MiB of steer, far past a pipe buffer, into a server that reads no more.
+    let mut steer = ctx.ception(&["send", "deaf", "-"]).stdin(&"x".repeat(1 << 20)).spawn();
+    steer.wait_stdout("log: ");
+    std::thread::sleep(ms(300));
+
+    let started = Instant::now();
+    let rows = ctx.list(&ctx.env);
+    assert!(started.elapsed() < secs(2), "list took {:?}", started.elapsed());
+    assert_eq!(row(&rows, "deaf").unwrap()["status"], "active", "{rows:#?}");
+
+    let killed = ctx.ception(&["kill", "deaf"]).run().expect_code(0);
+    assert_has(&killed.stdout, "shutdown accepted");
+    let lock = ctx.lock_path(SESSION, "deaf");
+    assert!(wait_until(secs(8), || lock_free(&lock)), "daemon did not end after kill");
+    // Both waiting clients hear about it instead of hanging.
+    let steered = steer.wait_timeout(secs(5)).expect("steer client hung");
+    assert_ne!(steered.code, Some(0), "{steered}");
+    let spawned = first.wait_timeout(secs(5)).expect("spawn client hung");
+    assert_ne!(spawned.code, Some(0), "{spawned}");
+}
+
+/// The turn/start reply arriving after the run had already continued into a
+/// new turn used to point the run back at its first turn, so the
+/// continuation's completion was ignored and the client hung.
+#[test]
+fn a_late_turn_start_reply_does_not_rewind_a_continued_run() {
+    let ctx = Ctx::new("late-start-reply");
+
+    let out = ctx.ception(&["spawn", "late", "do the work"]).timeout(secs(10)).run().expect_code(0);
+    assert_has(&out.stdout, "Continuation turn finished the work.");
+}
+
+/// A server exit went unnoticed while a descendant still held its stdout.
+#[test]
+fn an_app_server_exit_is_noticed_while_a_descendant_holds_its_stdout() {
+    let ctx = Ctx::new("exit-with-child");
+
+    let started = Instant::now();
+    let out = ctx.ception(&["spawn", "exiter", "work"]).timeout(secs(10)).run();
+    let _reap = Reap::new(&children(&ctx));
+    let out = out.expect_code(4);
+    assert!(started.elapsed() < secs(5), "took {:?} to notice", started.elapsed());
+    assert_has(&out.stderr, "exit 17");
+
+    assert!(ctx.wait_status("exiter", "dead", WAIT), "daemon outlived its app-server");
+    let lock = ctx.lock_path(SESSION, "exiter");
+    assert!(wait_until(WAIT, || lock_free(&lock)), "daemon never released the label");
+    let holder = children(&ctx)[0];
+    assert!(!alive(holder), "stdout holder {holder} survived the daemon");
+}
+
+/// An interrupt with an active goal used to wait for a pending turn/start
+/// reply before pausing the goal, which could start more turns meanwhile.
+#[test]
+fn interrupt_pauses_an_active_goal_without_waiting_for_a_pending_turn_start() {
+    let ctx = Ctx::new("slow-turn-start");
+
+    // The fixture's goal never starts a turn; the waiter gives up quickly.
+    let env = ctx.env.set("CEPTION_GOAL_START_MS", 200);
+    let goal = ctx.ception(&["goal", "arc", "the objective"]).env(&env).run().expect_code(0);
+    assert_has(&goal.stdout, "started no turn");
+
+    let mut sent = ctx.ception(&["send", "arc", "manual turn"]).spawn();
+    ctx.wait_turn_starts(1);
+    let interrupted = ctx.ception(&["interrupt", "arc"]).run().expect_code(0);
+    assert_has(&interrupted.stdout, "goal: paused");
+    sent.wait().expect_code(3);
+
+    let state = ctx.fake_state();
+    assert_eq!(goal_set_statuses(&state), ["active", "paused"]);
+    let paused_at = state["requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .position(|r| r["method"] == "thread/goal/set" && r["params"]["status"] == "paused")
+        .unwrap();
+    let mark = state["marks"].as_array().unwrap().iter().find(|m| m["mark"] == "turn/start replied").unwrap();
+    let requests_before_reply = mark["requests"].as_u64().unwrap() as usize;
+    assert!(
+        paused_at < requests_before_reply,
+        "goal paused only after the turn/start reply (request #{paused_at}, reply after #{requests_before_reply})"
+    );
+}
+
+/// GC used to delete any old record temp file, even one a live daemon (the
+/// lock holder) may be rewriting.
+#[test]
+fn gc_keeps_a_stale_record_temp_while_its_label_daemon_lives() {
+    let ctx = Ctx::new("happy");
+
+    ctx.ception(&["spawn", "busy", "first"]).run().expect_code(0);
+    let live_temp = ctx.session_dir(SESSION).join("busy.json.tmp");
+    let dead_temp = ctx.session_dir(SESSION).join("gone.json.tmp");
+    for temp in [&live_temp, &dead_temp] {
+        fs::write(temp, "{}\n").unwrap();
+        set_age(temp, days(1));
+    }
+
+    ctx.list(&ctx.env);
+    assert!(exists(&live_temp), "gc deleted the temp record of a live daemon");
+    assert!(!exists(&dead_temp), "gc kept a stale temp record with no daemon");
+}
+
+/// Shutdown used to exit before queued replies reached their sockets: a client
+/// waiting on a turn whose server crashed got an empty reply instead of why.
+#[test]
+fn a_crashed_app_server_reaches_the_waiting_client_with_its_stderr() {
+    let ctx = Ctx::new("crash");
+
+    let out = ctx.ception(&["spawn", "crash", "work"]).run().expect_code(4);
+    assert_has(&out.stderr, "exit 3");
+    assert_has(&out.stderr, "distinctive-crash-7731");
+    assert!(ctx.wait_status("crash", "dead", WAIT), "daemon outlived its app-server");
+}
+
 // ----- helpers ---------------------------------------------------------------------------
 
 fn requests<'a>(state: &'a Value, method: &'a str) -> impl Iterator<Item = &'a Value> + 'a {
@@ -865,6 +1009,12 @@ fn goal_set_statuses(state: &Value) -> Vec<String> {
 
 fn last_turn_start(state: &Value) -> &Value {
     state["lastTurnStarts"].as_array().and_then(|turns| turns.last()).expect("a turn start")
+}
+
+/// Pids of the long-lived processes the fake left behind.
+fn children(ctx: &Ctx) -> Vec<u32> {
+    let state = ctx.fake_state();
+    state["children"].as_array().into_iter().flatten().map(|pid| pid.as_u64().unwrap() as u32).collect()
 }
 
 fn array_len(value: &Value) -> usize {

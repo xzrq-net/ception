@@ -6,7 +6,7 @@
 //!   starts, steers and interrupts; tests read it. Default
 //!   `./fake-appserver-state.json`.
 //! - `CEPTION_FAKE_BEHAVIOR`: which scripted shape to play, default "happy".
-//!   See `turn_start` and `goal_set` for the branches.
+//!   See `turn_start`, `turn_start_special` and `goal_set` for the branches.
 //! - `CEPTION_FAKE_CONTINUATION_DELAY_MS` (150), `CEPTION_FAKE_CONTINUATION_RUN_MS`
 //!   (0), `CEPTION_FAKE_GOAL_TURN_DELAY_MS` (100): timing of the turns the
 //!   server starts by itself.
@@ -20,7 +20,8 @@ use std::fs;
 use std::io::{self, BufRead, ErrorKind, Write};
 use std::panic;
 use std::path::PathBuf;
-use std::process;
+use std::process::{self, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -58,6 +59,13 @@ struct State {
     steers: Vec<Value>,
     interrupts: Vec<Value>,
     rejected_requests: u64,
+    /// Pids of long-lived processes the fake left in its process group.
+    #[serde(default)]
+    children: Vec<u32>,
+    /// Points in time tests order against, e.g. `{ "mark": "turn/start
+    /// replied", "requests": <requests recorded by then> }`.
+    #[serde(default)]
+    marks: Vec<Value>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -81,6 +89,8 @@ fn load_state() -> State {
             steers: vec![],
             interrupts: vec![],
             rejected_requests: 0,
+            children: vec![],
+            marks: vec![],
         },
         Err(err) => panic!("read fake state: {err}"),
     }
@@ -454,6 +464,23 @@ fn write_out(text: &str) {
 }
 
 static TIMERS: Mutex<Vec<JoinHandle<()>>> = Mutex::new(Vec::new());
+
+/// Set by "deaf": the stdin reader stops for good, so the client's writes back
+/// up once the pipe buffer is full.
+static DEAF: AtomicBool = AtomicBool::new(false);
+
+/// A long-lived process in the fake's process group, the way codex's shells
+/// and tools are. Never reaped by the fake; recorded for tests to check on.
+fn spawn_descendant(script: &str, stdout: Stdio) {
+    let child = process::Command::new("sh")
+        .args(["-c", script])
+        .stdin(Stdio::null())
+        .stdout(stdout)
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn descendant");
+    update_state(|state| state.children.push(child.id()));
+}
 
 /// JS `setTimeout`: run `f` after `ms` on its own thread, under the server lock
 /// like every other callback.
@@ -859,13 +886,20 @@ impl Server {
                 "sandboxPolicy": params["sandboxPolicy"]
             }));
         });
+        let Some(turn) = self.turn_start_special(message, turn) else {
+            return Ok(());
+        };
         self.send(reply(
             message,
             json!({ "turn": build_turn(&turn.turn_id, "inProgress", Value::Null) }),
         ));
 
         let behavior = BEHAVIOR.as_str();
-        if behavior == "steer" || turn.prompt.contains("slow") {
+        if behavior == "stubborn-child" {
+            // A shell that shrugs off SIGTERM, like a tool codex started.
+            spawn_descendant("trap '' TERM; sleep 1000", Stdio::null());
+            self.complete_turn(&turn, "completed", None);
+        } else if behavior == "steer" || turn.prompt.contains("slow") {
             self.start_long_turn(turn);
         } else if behavior == "continuation" {
             self.start_compacted_turn(&turn);
@@ -881,6 +915,66 @@ impl Server {
             self.complete_turn(&turn, "completed", None);
         }
         Ok(())
+    }
+
+    /// Turn shapes that break the usual reply-first order or end the server.
+    /// Hands the turn back when the behavior is not one of them.
+    fn turn_start_special(&mut self, message: &Value, turn: Turn) -> Option<Turn> {
+        let started = |turn: &Turn| json!({ "turn": build_turn(&turn.turn_id, "inProgress", Value::Null) });
+        match BEHAVIOR.as_str() {
+            // Answers and starts the turn, then never reads stdin again.
+            "deaf" => {
+                self.send(reply(message, started(&turn)));
+                self.start_long_turn(turn);
+                DEAF.store(true, Ordering::SeqCst);
+            }
+            // The turn compacts, ends, and continues in turn B before the
+            // turn/start reply (naming the first turn) goes out; B's answer and
+            // completion come after it.
+            "late-start-reply" => {
+                let Turn { thread_id, turn_id, .. } = &turn;
+                let continuation = Turn::unprompted(thread_id);
+                let next = &continuation.turn_id;
+                self.with_batch(|s| {
+                    s.send(turn_started(thread_id, turn_id));
+                    let compaction = json!({ "type": "contextCompaction", "id": format!("compact_{turn_id}") });
+                    s.send(item_completed(thread_id, turn_id, compaction));
+                    s.send(turn_completed(thread_id, turn_id, "completed", Value::Null));
+                    s.send(turn_started(thread_id, next));
+                    s.send(reply(message, started(&turn)));
+                    s.send(agent_message(thread_id, next, "Continuation turn finished the work."));
+                    s.send(turn_completed(thread_id, next, "completed", Value::Null));
+                });
+            }
+            // Starts the turn, leaves a process holding stdout, and exits 17.
+            "exit-with-child" => {
+                self.send(reply(message, started(&turn)));
+                self.send(turn_started(&turn.thread_id, &turn.turn_id));
+                spawn_descendant("exec sleep 1000", Stdio::inherit());
+                process::exit(17);
+            }
+            // Dies mid-turn with a last word on stderr.
+            "crash" => {
+                self.send(reply(message, started(&turn)));
+                self.send(turn_started(&turn.thread_id, &turn.turn_id));
+                eprintln!("fake: rollout file corrupt (distinctive-crash-7731)");
+                process::exit(3);
+            }
+            // The reply comes a second late; the turn then stays open.
+            "slow-turn-start" => {
+                let request = message.clone();
+                set_timeout(1000, move |s| {
+                    update_state(|state| {
+                        let requests = state.requests.len();
+                        state.marks.push(json!({ "mark": "turn/start replied", "requests": requests }));
+                    });
+                    s.send(reply(&request, started(&turn)));
+                    s.start_long_turn(turn);
+                });
+            }
+            _ => return Some(turn),
+        }
+        None
     }
 
     fn goal_set(&mut self, message: &Value) -> Result<(), String> {
@@ -900,6 +994,9 @@ impl Server {
         });
 
         match (BEHAVIOR.as_str(), parked) {
+            // The goal is accepted and never starts a turn by itself.
+            ("slow-turn-start", _) => self.answer_goal(message, &thread_id),
+
             // Ends the running turn and rejects the goal request in one write.
             ("goal-set-error", parked) => {
                 self.goal = None;
@@ -1077,6 +1174,9 @@ fn main() {
         }
         let message: Value = serde_json::from_str(&line).expect("parse message");
         server().dispatch(&message);
+        while DEAF.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_secs(3600));
+        }
     }
     wait_for_timers();
 }

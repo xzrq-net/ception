@@ -274,11 +274,40 @@ pub fn set_age(path: &Path, age: Duration) {
     file.set_modified(SystemTime::now() - age).unwrap();
 }
 
-/// Field 4 of /proc/<pid>/stat.
+/// The fields of /proc/<pid>/stat after the command name: state, ppid, ...
+fn stat_fields(pid: u32) -> Option<Vec<String>> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = &stat[stat.rfind(')')? + 2..];
+    Some(rest.split_whitespace().map(str::to_string).collect())
+}
+
 pub fn ppid(pid: u32) -> u32 {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
-    let rest = &stat[stat.rfind(')').unwrap() + 2..];
-    rest.split_whitespace().nth(1).unwrap().parse().unwrap()
+    stat_fields(pid).expect("process exists")[1].parse().unwrap()
+}
+
+/// Running, as opposed to gone or a zombie.
+pub fn alive(pid: u32) -> bool {
+    stat_fields(pid).is_some_and(|fields| fields[0] != "Z")
+}
+
+/// SIGKILLs processes a failing test would otherwise leak, if they are still
+/// the same processes (same start time) when the guard drops.
+pub struct Reap(Vec<(u32, String)>);
+
+impl Reap {
+    pub fn new(pids: &[u32]) -> Reap {
+        Reap(pids.iter().filter_map(|&pid| Some((pid, stat_fields(pid)?.get(19)?.clone()))).collect())
+    }
+}
+
+impl Drop for Reap {
+    fn drop(&mut self) {
+        for (pid, starttime) in &self.0 {
+            if stat_fields(*pid).and_then(|fields| fields.get(19).cloned()).as_ref() == Some(starttime) {
+                unsafe { libc::kill(*pid as libc::pid_t, libc::SIGKILL) };
+            }
+        }
+    }
 }
 
 // ----- waiting -------------------------------------------------------------------
