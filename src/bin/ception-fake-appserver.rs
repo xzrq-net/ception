@@ -431,13 +431,24 @@ static DEAF: AtomicBool = AtomicBool::new(false);
 /// and tools are. Never reaped by the fake; recorded for tests to check on.
 #[allow(clippy::zombie_processes)]
 fn spawn_descendant(script: &str, stdout: Stdio) {
-    let child = process::Command::new("sh")
-        .args(["-c", script])
-        .stdin(Stdio::null())
-        .stdout(stdout)
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn descendant");
+    spawn_descendant_in(script, stdout, false);
+}
+
+/// `own_session`: the descendant calls setsid, leaving the fake's process
+/// group and session the way PTY-backed tools do.
+#[allow(clippy::zombie_processes)]
+fn spawn_descendant_in(script: &str, stdout: Stdio, own_session: bool) {
+    let mut command = process::Command::new("sh");
+    command.args(["-c", script]).stdin(Stdio::null()).stdout(stdout).stderr(Stdio::null());
+    if own_session {
+        unsafe {
+            std::os::unix::process::CommandExt::pre_exec(&mut command, || {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+    let child = command.spawn().expect("spawn descendant");
     update_state(|state| state.children.push(child.id()));
 }
 
@@ -802,6 +813,13 @@ impl Server {
     fn turn_start(&mut self, message: &Value) -> Result<(), String> {
         let params = &message["params"];
         let thread = find_thread(&params["threadId"])?;
+        // Like codex: input for a thread that is running a turn steers that
+        // turn, and the reply names it.
+        if let Some(active) = self.active_turn.clone() {
+            self.send(reply(message, json!({ "turn": build_turn(&active.turn_id, "inProgress", Value::Null) })));
+            self.steer_active(&params["threadId"], &active.turn_id, prompt_text(&params["input"]));
+            return Ok(());
+        }
         let turn = Turn { thread_id: thread.id, turn_id: next_turn(), prompt: prompt_text(&params["input"]) };
         update_state(|state| {
             state.last_turn_starts.push(json!({
@@ -819,9 +837,11 @@ impl Server {
         self.send(reply(message, json!({ "turn": build_turn(&turn.turn_id, "inProgress", Value::Null) })));
 
         let behavior = BEHAVIOR.as_str();
-        if behavior == "stubborn-child" {
-            // A shell that shrugs off SIGTERM, like a tool codex started.
-            spawn_descendant("trap '' TERM; sleep 1000", Stdio::null());
+        if behavior == "stubborn-child" || behavior == "stubborn-session-child" {
+            // A shell that shrugs off SIGTERM, like a tool codex started; in
+            // its own session for the second behavior.
+            let own_session = behavior == "stubborn-session-child";
+            spawn_descendant_in("trap '' TERM; sleep 1000", Stdio::null(), own_session);
             self.complete_turn(&turn, "completed", None);
         } else if behavior == "steer" || turn.prompt.contains("slow") {
             self.start_long_turn(turn);
@@ -1114,15 +1134,20 @@ impl Server {
 
     fn turn_steer(&mut self, message: &Value) {
         let params = &message["params"];
-        let steer_prompt = prompt_text(&params["input"]);
+        self.send(reply(message, json!({ "turnId": params["expectedTurnId"] })));
+        let expected = params["expectedTurnId"].as_str().unwrap_or_default().to_string();
+        self.steer_active(&params["threadId"], &expected, prompt_text(&params["input"]));
+    }
+
+    /// Record a steer and finish the running turn with it shortly after.
+    fn steer_active(&mut self, thread_id: &Value, expected: &str, steer_prompt: String) {
         update_state(|state| {
             state.steers.push(json!({
-                "threadId": params["threadId"],
-                "expectedTurnId": params["expectedTurnId"],
+                "threadId": thread_id,
+                "expectedTurnId": expected,
                 "prompt": steer_prompt
             }));
         });
-        self.send(reply(message, json!({ "turnId": params["expectedTurnId"] })));
         if let Some(steered) = self.active_turn.clone() {
             set_timeout(100, move |s| {
                 let text = format!("Steered response.\nSteer: {steer_prompt}");

@@ -201,16 +201,21 @@ startup error.
 
 A daemon holds its label's lock (`flock`) for its whole life; that is the
 one-daemon-per-label guarantee, and the kernel releases it however the daemon
-dies. It owns the app-server's process group and takes it down on exit,
-codex's shells and subagents included, before releasing the lock. The
-app-server and everything it starts also carry `CEPTION_OWNER=<random
-token>` in their environment, with the token kept beside the lock: exit
-sweeps up descendants that left the process group, and if a daemon is killed
-outright (SIGKILL), the label's next daemon kills whatever still carries its
-token before starting. Matching by token, and signalling through pidfds,
-means nothing unrelated is hit. The limit: a descendant that scrubs its
-environment (`env -i`), leaves the process group and ignores SIGTERM can
-outlive a SIGKILLed daemon; only a cgroup or a supervisor would close that.
+dies.
+
+A daemon owns its process tree. It is a child subreaper, so whatever codex
+starts stays its descendant even when orphaned, in another session or with a
+scrubbed environment; and it alone reaps its children, so a pid it signals
+can't belong to anyone else. On exit it signals its children (SIGTERM, then
+SIGKILL after 2s), reaps them, and repeats as orphans are handed to it, until
+none are left; only then is the label released. Codex's shells and subagents
+go with it.
+
+The limit is a daemon killed outright (SIGKILL, OOM): it can't tear down. The
+app-server gets SIGTERM from the kernel (`PR_SET_PDEATHSIG`) but may take a
+while to exit, and anything it started can outlive it, so a revived label
+can briefly overlap leftovers of its predecessor. Closing that would take a
+cgroup or an outside supervisor.
 
 A daemon on its way out refuses new work; `send` and `goal` then wait for it
 to release the label and start a successor.
@@ -235,8 +240,7 @@ Under `${XDG_STATE_HOME:-~/.local/state}/ception-rs/`:
   the label's daemon while it holds the lock.
 - `projects/<projhash>/<session>/<label>.log`: the turn log (tail with
   `ception watch --follow LABEL`).
-- `run/<key>.lock`, `run/<key>.sock`, `run/<key>.owner`: label locks,
-  sockets and the token marking the app-server's processes, `key` a hash of
+- `run/<key>.lock`, `run/<key>.sock`: label locks and sockets, `key` a hash of
   project, session and label. Kept under the state root, not
   `$XDG_RUNTIME_DIR`, so containers on one kernel sharing the state root share
   the locks and can reach each other's daemons.

@@ -1,13 +1,21 @@
 //! The per-label daemon: owns one codex app-server and one thread, serves
 //! CLI clients over a unix socket.
 //!
-//! One actor owns all state and handles events in order. App-server output
-//! arrives on one channel in stream order, and RPC responses are handled at
-//! their position in that stream as stored continuations ([`Pending`]).
-//! Stream order is not the whole story: codex snapshots a goal, persists it,
-//! and only then answers, so goal notifications and even whole turns can land
-//! before the reply that started them. Goal continuations therefore check for
-//! fresher notifications and for turns that settled while they were in flight.
+//! One actor owns all state and handles events in order: app-server output
+//! (in stream order, with RPC responses handled at their position as stored
+//! continuations, [`Pending`]), client commands, timers, child exits.
+//!
+//! Processes: the daemon is a child subreaper and the only thing that reaps
+//! its children, so everything codex starts stays in its process tree and a
+//! pid it lists can't be recycled under it. Teardown signals its children
+//! (TERM, then KILL) and reaps them until none are left; orphans the kernel
+//! hands it are reached the same way.
+//!
+//! Turns: a run is a turn plus the continuations codex folds into it. Runs
+//! are made only from codex's notifications: the first lifecycle event of an
+//! unseen turn starts a run, or continues the current one. Requests never
+//! make runs; a client waits on the turn codex names in its turn/start reply
+//! (or on the next run, for a goal), and is attached once that turn shows up.
 
 use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -73,6 +81,9 @@ const LOCK_PATIENCE: Duration = Duration::from_millis(500);
 /// Settled runs kept for `watch --run`.
 pub const RETAINED_RUNS: usize = 16;
 
+/// Teardown sends SIGTERM for this long before switching to SIGKILL.
+const TERM_GRACE: Duration = Duration::from_secs(2);
+
 /// Entry point for `ception daemon`. Stdout is the spawning client's
 /// readiness pipe: exactly one line, `ready`, `busy` or `error: ...`.
 pub async fn run(options: Options) -> Result<()> {
@@ -92,6 +103,10 @@ pub async fn run(options: Options) -> Result<()> {
         tokio::time::sleep(Duration::from_millis(25)).await;
     };
 
+    // Everything codex starts stays ours: orphans are reparented to us, not
+    // to init, and teardown reaches them.
+    unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) };
+
     // Opened only once the lock is ours: gc deletes logs under the lock.
     let log_file = OpenOptions::new()
         .create(true)
@@ -107,10 +122,12 @@ pub async fn run(options: Options) -> Result<()> {
         options.project.display(),
         std::process::id()
     ));
-    kill_leftovers(&owner_path(&paths), &mut log).await;
 
-    let mut signals = Signals { term: signal(SignalKind::terminate())?, int: signal(SignalKind::interrupt())? };
-    let paths_for_cleanup = paths.clone();
+    let mut signals = Signals {
+        term: signal(SignalKind::terminate())?,
+        int: signal(SignalKind::interrupt())?,
+        child: signal(SignalKind::child())?,
+    };
     match boot(options, paths, &mut log, &mut signals).await {
         Ok(booted) => {
             signal_ready("ready");
@@ -118,11 +135,11 @@ pub async fn run(options: Options) -> Result<()> {
         }
         Err(error) => {
             log.line(&format!("[daemon] startup failed: {error:#}"));
-            kill_leftovers(&owner_path(&paths_for_cleanup), &mut log).await;
             signal_ready(&format!("error: {error:#}"));
+            teardown(None, &mut log).await;
         }
     }
-    // The app-server is closed by now; only then may a successor take over.
+    // Everything we started is gone by now; only then may a successor start.
     drop(lock);
     Ok(())
 }
@@ -138,32 +155,50 @@ fn signal_ready(line: &str) {
     }
 }
 
-/// Where a daemon keeps the token its app-server and every descendant carry
-/// in their environment ([`procfs::OWNER_VAR`]). Written before the server
-/// starts; if the daemon is SIGKILLed (no cleanup runs), the label's next
-/// daemon finds the token here and kills what is left. Removed once they
-/// are gone.
-fn owner_path(paths: &LabelPaths) -> PathBuf {
-    paths.lock.with_extension("owner")
-}
-
-/// Kill whatever a previous daemon (or a failed startup) left running.
-/// Processes are found by the token's value, so nothing unrelated can match.
-async fn kill_leftovers(path: &Path, log: &mut Log) {
-    let Ok(token) = std::fs::read_to_string(path) else {
-        return;
-    };
-    let token = token.trim();
-    if !token.is_empty() {
-        let sweep = procfs::kill_owned(token).await;
-        if sweep.found > 0 {
-            log.line(&format!("[daemon] killed {} process(es) a previous daemon left running", sweep.found));
+/// Reap every child that has exited, telling the app-server if it was one.
+fn reap_children(mut app: Option<&mut AppServer>) {
+    loop {
+        let mut status = 0;
+        let pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
+        if pid <= 0 {
+            return;
         }
-        if sweep.survivors > 0 {
-            log.line(&format!("[daemon] {} of them survived SIGKILL", sweep.survivors));
+        if let Some(app) = app.as_deref_mut().filter(|app| app.pid() as libc::pid_t == pid) {
+            app.reaped(status);
         }
     }
-    let _ = std::fs::remove_file(path);
+}
+
+/// Kill and reap the daemon's whole process tree: signal every child, reap
+/// what exits, and repeat as the kernel hands over orphans, until no child
+/// is left. SIGTERM first, SIGKILL after [`TERM_GRACE`]. Only our own
+/// unreaped children are signalled, so nothing unrelated can be hit. Not
+/// bounded: the label stays locked until the tree is really gone.
+async fn teardown(mut app: Option<&mut AppServer>, log: &mut Log) {
+    let me = std::process::id();
+    let started = Instant::now();
+    let mut termed = HashSet::new();
+    let mut reported = 0;
+    loop {
+        reap_children(app.as_deref_mut());
+        let children = procfs::children_of(me);
+        if children.is_empty() {
+            return;
+        }
+        let elapsed = started.elapsed();
+        for pid in children.iter().copied() {
+            if elapsed >= TERM_GRACE {
+                unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+            } else if termed.insert(pid) {
+                unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+            }
+        }
+        if elapsed.as_secs() >= 10 * (reported + 1) {
+            reported += 1;
+            log.line(&format!("[daemon] still waiting for {} process(es) to exit", children.len()));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 fn random_hex(bytes: usize) -> String {
@@ -186,10 +221,11 @@ impl Log {
 struct Signals {
     term: Signal,
     int: Signal,
+    child: Signal,
 }
 
 impl Signals {
-    async fn recv(&mut self) -> &'static str {
+    async fn shutdown(&mut self) -> &'static str {
         tokio::select! {
             _ = self.term.recv() => "SIGTERM",
             _ = self.int.recv() => "SIGINT",
@@ -211,12 +247,11 @@ struct Booted {
     thread_id: Option<String>,
     model: Option<String>,
     effort: Option<String>,
-    owner: String,
 }
 
 /// Start the app-server, resume the thread, listen. Bounded, and abandoned if
-/// the watched process dies or a signal arrives; dropping the half-started
-/// app-server kills its process group.
+/// the watched process dies or a signal arrives (the caller then tears down
+/// whatever started).
 async fn boot(options: Options, paths: LabelPaths, log: &mut Log, signals: &mut Signals) -> Result<Booted> {
     let watch = match (options.watch_pid, options.watch_starttime) {
         (Some(pid), Some(starttime)) => {
@@ -231,11 +266,8 @@ async fn boot(options: Options, paths: LabelPaths, log: &mut Log, signals: &mut 
         (None, options.model.clone(), options.effort.clone())
     };
 
-    // Recorded before the server exists, so no window leaves it untracked.
-    let owner = random_hex(16);
-    std::fs::write(owner_path(&paths), &owner).context("record the app-server owner token")?;
     let start = async {
-        let (mut app, mut app_events) = AppServer::spawn(&options.project, Some(&owner))?;
+        let (mut app, mut app_events) = AppServer::spawn(&options.project)?;
         let mut backlog = Vec::new();
         app.initialize(&mut app_events, |event| backlog.push(event)).await?;
         let mut thread_id = thread_id;
@@ -263,13 +295,13 @@ async fn boot(options: Options, paths: LabelPaths, log: &mut Log, signals: &mut 
         started = start => started?,
         _ = tokio::time::sleep(spawn_timeout()) => bail!("startup timed out"),
         _ = watch_exit => bail!("watched process exited during startup"),
-        signal = signals.recv() => bail!("{signal} during startup"),
+        signal = signals.shutdown() => bail!("{signal} during startup"),
     };
     if let Some(thread_id) = &thread_id {
         log.line(&format!("[thread] resumed {thread_id}"));
     }
     log.line(&format!("[daemon] listening {}", paths.socket.display()));
-    Ok(Booted { options, paths, app, app_events, backlog, listener, watch, thread_id, model, effort, owner })
+    Ok(Booted { options, paths, app, app_events, backlog, listener, watch, thread_id, model, effort })
 }
 
 fn thread_params(project: &Path, model: Option<&str>) -> Value {
@@ -306,23 +338,10 @@ impl Client {
     }
 }
 
-/// A turn we asked for and codex hasn't confirmed yet. Its clients wait
-/// here, not on whatever turn happens to be running: a turn codex starts on
-/// its own meanwhile must not answer them.
-struct Starting {
+/// A turn plus the continuation turns codex folds into it.
+struct Run {
     op: u64,
-    prompt: String,
-    clients: Vec<Client>,
-    /// The turn codex named in its reply, while we wait to see it.
-    expected: Option<String>,
-}
-
-/// One logical run: a turn plus any continuation turns folded into it.
-struct ActiveTurn {
-    op: u64,
-    /// The physical turn running now.
-    turn_id: String,
-    /// Every physical turn folded into the run, first to current.
+    /// Every physical turn of the run, the current one last.
     turns: Vec<String>,
     acc: TurnAccumulator,
     clients: Vec<Client>,
@@ -331,19 +350,41 @@ struct ActiveTurn {
     compactions_held: u32,
 }
 
-/// A settled run, kept for `watch --run` and for a turn/start reply that
-/// arrives after its turn already ran.
-struct Retained {
-    op: u64,
-    turns: Vec<String>,
-    outcome: RetainedOutcome,
+impl Run {
+    fn current(&self) -> &str {
+        self.turns.last().expect("a run has a turn")
+    }
 }
 
-enum RetainedOutcome {
+/// A settled run, kept for `watch --run` and for a turn/start reply that
+/// arrives after its turn already ran.
+struct Settled {
+    op: u64,
+    turns: Vec<String>,
+    outcome: SettledOutcome,
+}
+
+enum SettledOutcome {
     /// With the goal as it stood when the run settled.
     Report { acc: Box<TurnAccumulator>, goal: Option<Value> },
     /// The run ended in an infrastructure failure, as its clients were told.
     Failed(String),
+}
+
+/// A client waiting for work that hasn't shown up yet.
+struct Waiter {
+    client: Client,
+    expect: Expect,
+}
+
+enum Expect {
+    /// The turn codex named in its turn/start reply: the one it started, or
+    /// the running one it steered the input into. `steer_run` is the run
+    /// that was current when the request went out; landing in it means the
+    /// input joined work already under way.
+    Turn { id: String, prompt: String, steer_run: Option<u64> },
+    /// The next run codex starts, for a goal; `timer` names its timeout.
+    NextRun { timer: u64 },
 }
 
 /// A request's continuation, run when its response arrives.
@@ -351,18 +392,16 @@ enum Pending {
     ThreadStart {
         then: AfterThread,
     },
-    /// For the starting turn `op`.
     TurnStart {
-        op: u64,
-    },
-    Steer {
         client: Client,
+        prompt: String,
+        steer_run: Option<u64>,
     },
     GoalSet {
         client: Client,
         action: GoalAction,
         goal_updates: u64,
-        turns_settled: u64,
+        settled_count: u64,
     },
     GoalGet {
         client: Client,
@@ -386,39 +425,28 @@ enum Pending {
 }
 
 enum AfterThread {
-    /// The starting turn `op`.
-    Turn {
-        op: u64,
-    },
-    Goal {
-        client: Client,
-        action: GoalAction,
-        objective: Option<String>,
-    },
+    Send { client: Client, prompt: String },
+    Goal { client: Client, action: GoalAction, objective: Option<String> },
 }
 
-/// Work that waits for the thread, a turn start, or a held report to resolve.
+/// Work that has to wait: anything needing the thread while it is being
+/// created, and the turn half of an interrupt while there is nothing yet to
+/// interrupt.
 enum Deferred {
     Command(Request, Client),
-    /// The second half of an interrupt, after its goal pause.
-    Interrupt {
-        client: Client,
-        paused: bool,
-    },
+    Interrupt { client: Client, paused: bool },
 }
 
 enum Event {
-    Command { request: Request, reply: UnboundedSender<Reply> },
+    Command {
+        request: Request,
+        reply: UnboundedSender<Reply>,
+    },
     /// A connection taken by the refuser, counted so exit waits for its reply.
     Connected,
     Disconnected,
     GraceExpired(u64),
     GoalStartExpired(u64),
-}
-
-struct GoalWaiter {
-    id: u64,
-    client: Client,
 }
 
 struct Daemon {
@@ -434,16 +462,13 @@ struct Daemon {
     event_rx: Option<UnboundedReceiver<Event>>,
     model: Option<String>,
     effort: Option<String>,
-    /// Marks the app-server's processes; see [`owner_path`].
-    owner: String,
     /// Prefixes run ids, so a restarted daemon never mistakes an old id for
     /// one of its own.
     generation: String,
 
     thread_id: Option<String>,
     thread_starting: bool,
-    starting: Option<Starting>,
-    active: Option<ActiveTurn>,
+    run: Option<Run>,
     /// Generation of the grace timer while a finished turn's report is held
     /// for a continuation.
     hold: Option<u64>,
@@ -451,13 +476,13 @@ struct Daemon {
     goal: Option<Value>,
     /// Goal notifications seen, so a reply can tell it is older than them.
     goal_updates: u64,
-    goal_waiters: Vec<GoalWaiter>,
+    waiters: Vec<Waiter>,
     pending: HashMap<u64, Pending>,
     deferred: VecDeque<Deferred>,
-    turns_settled: u64,
+    settled_count: u64,
     /// Recently settled runs, newest last.
-    settled: VecDeque<Retained>,
-    /// Every physical turn seen to end, retained or not.
+    settled: VecDeque<Settled>,
+    /// Every turn seen to end, retained or not: never tracked again.
     finished_turns: HashSet<String>,
 
     next_id: u64,
@@ -474,7 +499,6 @@ struct Daemon {
 impl Daemon {
     fn new(booted: Booted, log: Log) -> Self {
         let (events, event_rx) = unbounded_channel();
-        let generation = random_hex(4);
         Self {
             options: booted.options,
             paths: booted.paths,
@@ -488,19 +512,17 @@ impl Daemon {
             event_rx: Some(event_rx),
             model: booted.model,
             effort: booted.effort,
-            owner: booted.owner,
-            generation,
+            generation: random_hex(4),
             thread_id: booted.thread_id,
             thread_starting: false,
-            starting: None,
-            active: None,
+            run: None,
             hold: None,
             goal: None,
             goal_updates: 0,
-            goal_waiters: Vec::new(),
+            waiters: Vec::new(),
             pending: HashMap::new(),
             deferred: VecDeque::new(),
-            turns_settled: 0,
+            settled_count: 0,
             settled: VecDeque::new(),
             finished_turns: HashSet::new(),
             next_id: 0,
@@ -515,17 +537,16 @@ impl Daemon {
     }
 
     async fn serve(mut self, mut signals: Signals) {
-        if self.thread_id.is_some()
-            && let Err(error) = self.persist()
-        {
-            self.log(&format!("[state] {error:#}; shutting down"));
-            self.shutdown("label not persisted").await;
-            return;
-        }
         let mut app_events = self.app_events.take().expect("serve runs once");
         let mut events = self.event_rx.take().expect("serve runs once");
         let mut listener = self.listener.take();
         let watch = self.watch.take();
+        if self.thread_id.is_some()
+            && let Err(error) = self.persist()
+        {
+            self.log(&format!("[state] {error:#}; shutting down"));
+            self.shutdown_request = Some("label not persisted".into());
+        }
         for event in std::mem::take(&mut self.backlog) {
             self.on_app(event).await;
         }
@@ -533,7 +554,7 @@ impl Daemon {
             std::env::var("CEPTION_IDLE_TIMEOUT_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(4 * 60 * 60),
         );
 
-        while !self.shutting_down {
+        while self.shutdown_request.is_none() {
             let idle_at = self.idle_eligible().then(|| self.last_activity + idle);
             let watch_exit = async {
                 match &watch {
@@ -550,6 +571,7 @@ impl Daemon {
                         tokio::spawn(serve_connection(stream, self.events.clone()));
                     }
                 }
+                _ = signals.child.recv() => reap_children(Some(&mut self.app)),
                 _ = watch_exit => {
                     let pid = self.options.watch_pid.unwrap_or_default();
                     self.shutdown_request = Some(format!("watched process {pid} exited"));
@@ -557,24 +579,22 @@ impl Daemon {
                 _ = tokio::time::sleep_until(idle_at.unwrap_or_else(Instant::now)), if idle_at.is_some() => {
                     self.shutdown_request = Some("idle timeout".into());
                 }
-                signal = signals.recv() => self.shutdown_request = Some(signal.into()),
+                _ = signals.term.recv() => self.shutdown_request = Some("SIGTERM".into()),
+                _ = signals.int.recv() => self.shutdown_request = Some("SIGINT".into()),
             }
-            if let Some(reason) = self.shutdown_request.take() {
-                self.stopping = true;
-                // Connections keep being answered, with Refused, until we exit.
-                if let Some(listener) = listener.take() {
-                    tokio::spawn(refuse_connections(listener, self.events.clone()));
-                }
-                self.interrupt_for_shutdown(&mut app_events, &mut events).await;
-                self.shutdown(&reason).await;
-                break;
-            }
-            self.claim_starting();
+            self.resolve_waiters();
             self.drain_deferred().await;
-            self.ack_active();
+            self.ack_run();
         }
-        drop(listener);
-        let _ = std::fs::remove_file(&self.paths.socket);
+
+        let reason = self.shutdown_request.take().expect("loop exits on a request");
+        self.stopping = true;
+        // Connections keep being answered, with Refused, until we exit.
+        if let Some(listener) = listener.take() {
+            tokio::spawn(refuse_connections(listener, self.events.clone()));
+        }
+        self.interrupt_for_shutdown(&mut app_events, &mut events).await;
+        self.shutdown(&reason).await;
         self.drain_connections(&mut events).await;
     }
 
@@ -597,23 +617,22 @@ impl Daemon {
         }
     }
 
-    /// Tell the clients of the running turn which run they are waiting on.
-    fn ack_active(&mut self) {
-        let Some(op) = self.active.as_ref().map(|turn| turn.op) else {
+    /// Tell the clients of the current run which run they are waiting on.
+    fn ack_run(&mut self) {
+        let Some(op) = self.run.as_ref().map(|run| run.op) else {
             return;
         };
-        let run = self.run_name(op);
-        for client in &mut self.active.as_mut().expect("checked").clients {
-            client.accept(&run);
+        let name = self.run_name(op);
+        for client in &mut self.run.as_mut().expect("checked").clients {
+            client.accept(&name);
         }
     }
 
     fn idle_eligible(&self) -> bool {
-        self.active.is_none()
-            && self.starting.is_none()
+        self.run.is_none()
             && self.hold.is_none()
             && self.connections == 0
-            && self.goal_waiters.is_empty()
+            && self.waiters.is_empty()
             && self.pending.is_empty()
             && self.deferred.is_empty()
     }
@@ -652,6 +671,13 @@ impl Daemon {
         format_goal(self.goal.as_ref(), Some(self.label()))
     }
 
+    /// A requested turn is on its way: a turn/start awaiting its reply, or
+    /// a reply naming a turn not seen yet.
+    fn start_in_flight(&self) -> bool {
+        self.pending.values().any(|pending| matches!(pending, Pending::TurnStart { .. }))
+            || self.waiters.iter().any(|waiter| matches!(waiter.expect, Expect::Turn { .. }))
+    }
+
     fn persist(&self) -> Result<()> {
         let Some(thread_id) = &self.thread_id else {
             return Ok(());
@@ -685,12 +711,13 @@ impl Daemon {
         Ok(())
     }
 
-    fn retain(&mut self, op: u64, turns: Vec<String>, outcome: RetainedOutcome) {
+    fn settle(&mut self, op: u64, turns: Vec<String>, outcome: SettledOutcome) {
         self.finished_turns.extend(turns.iter().cloned());
-        self.settled.push_back(Retained { op, turns, outcome });
+        self.settled.push_back(Settled { op, turns, outcome });
         if self.settled.len() > RETAINED_RUNS {
             self.settled.pop_front();
         }
+        self.settled_count += 1;
     }
 
     // ----- client commands -------------------------------------------------
@@ -722,19 +749,21 @@ impl Daemon {
                 }
             }
             Event::Connected => self.connections += 1,
-            Event::Disconnected => {
-                self.connections = self.connections.saturating_sub(1);
-            }
+            Event::Disconnected => self.connections = self.connections.saturating_sub(1),
             Event::GraceExpired(generation) => {
                 if self.hold == Some(generation) {
                     self.hold = None;
                     self.log("[turn] no continuation arrived; settling");
-                    self.finish_active_turn();
+                    self.finish_run();
                 }
             }
-            Event::GoalStartExpired(id) => {
-                if let Some(index) = self.goal_waiters.iter().position(|w| w.id == id) {
-                    let waiter = self.goal_waiters.remove(index);
+            Event::GoalStartExpired(timer) => {
+                let index = self
+                    .waiters
+                    .iter()
+                    .position(|waiter| matches!(waiter.expect, Expect::NextRun { timer: t } if t == timer));
+                if let Some(index) = index {
+                    let waiter = self.waiters.remove(index);
                     let ms = env_duration("CEPTION_GOAL_START_MS", 30_000).as_millis();
                     self.log(&format!("[goal] no turn started within {ms}ms"));
                     let report = format!("{}\n\n(codex started no turn within {ms}ms)", self.goal_line());
@@ -744,34 +773,28 @@ impl Daemon {
         }
     }
 
-    /// Whether `item` must wait. A held report may still continue, a turn
-    /// codex hasn't confirmed can't be steered or interrupted, and nothing
-    /// that needs the thread can run while it is being created.
     fn must_defer(&self, item: &Deferred) -> bool {
-        let unconfirmed = self.starting.is_some();
-        let held = self.hold.is_some();
         let creating = self.thread_starting;
         match item {
-            Deferred::Command(Request::Send { .. }, _) => held || creating || unconfirmed,
-            Deferred::Command(Request::Goal { action, .. }, _) => match action {
-                GoalAction::Set | GoalAction::Resume => held || creating,
-                GoalAction::Pause | GoalAction::Clear => creating,
-                GoalAction::Show => false,
-            },
-            // An active goal is paused at once (which also settles a goal
-            // hold); only the turn interrupt after it waits, for a turn
-            // start or for a compaction hold to show what is running.
+            // While a run is held, codex may yet continue it: wait to see, so
+            // the input steers the continuation instead of starting new work
+            // that would fold into the held run.
+            Deferred::Command(Request::Send { .. }, _) => creating || self.hold.is_some(),
             Deferred::Command(Request::Interrupt, _) => creating,
-            Deferred::Interrupt { .. } => {
-                let nothing_known = unconfirmed && self.active.is_none();
-                creating || nothing_known || (held && !self.goal_active())
-            }
+            Deferred::Command(Request::Goal { action, .. }, _) => creating && *action != GoalAction::Show,
             Deferred::Command(..) => false,
+            // Nothing to interrupt yet while a requested turn is on its way,
+            // or while a compaction hold decides whether a continuation comes.
+            Deferred::Interrupt { .. } => {
+                creating
+                    || (self.run.is_none() && self.start_in_flight())
+                    || (self.hold.is_some() && !self.goal_active())
+            }
         }
     }
 
     async fn drain_deferred(&mut self) {
-        while !self.shutting_down {
+        while !self.stopping {
             match self.deferred.front() {
                 Some(item) if !self.must_defer(item) => {
                     let item = self.deferred.pop_front().expect("front exists");
@@ -810,13 +833,13 @@ impl Daemon {
     }
 
     fn status_reply(&self) -> Reply {
-        let running = self.active.is_some() || self.starting.is_some();
+        let running = self.run.is_some() || self.start_in_flight();
         Reply::Result(Outcome {
             status: "ok".into(),
             daemon: Some(DaemonStatus {
                 pid: std::process::id(),
                 thread_id: self.thread_id.clone(),
-                turn_id: self.active.as_ref().map(|turn| turn.turn_id.clone()),
+                turn_id: self.run.as_ref().map(|run| run.current().to_string()),
                 state: if running { "active" } else { "idle" }.into(),
                 goal: self.goal.clone(),
                 log: self.paths.log.clone(),
@@ -829,77 +852,43 @@ impl Daemon {
         Reply::Result(Outcome { status: status.into(), report, goal: self.goal.clone(), ..Default::default() })
     }
 
-    /// Attach to the running turn (or the one starting), or to a named run:
-    /// live, or settled and retained.
+    /// Attach to the current run, or to a named run: live, or settled and
+    /// retained.
     fn watch(&mut self, run: Option<String>, client: Client) {
-        let Some(run) = run else {
-            if let Some(turn) = &mut self.active {
-                turn.clients.push(client);
-            } else if let Some(starting) = &mut self.starting {
-                starting.clients.push(client);
-            } else {
-                client.answer(Reply::ok("idle", "no active turn"));
+        let Some(name) = run else {
+            match &mut self.run {
+                Some(run) => run.clients.push(client),
+                None => client.answer(Reply::ok("idle", "no active turn")),
             }
             return;
         };
-        let op = run.strip_prefix(&format!("{}.", self.generation)).and_then(|op| op.parse::<u64>().ok());
+        let op = name.strip_prefix(&format!("{}.", self.generation)).and_then(|op| op.parse::<u64>().ok());
         let Some(op) = op else {
             client.answer(Reply::error(format!(
-                "run {run} is not from this daemon (it restarted since); its report is gone"
+                "run {name} is not from this daemon (it restarted since); its report is gone"
             )));
             return;
         };
-        if let Some(turn) = self.active.as_mut().filter(|turn| turn.op == op) {
-            turn.clients.push(client);
+        if let Some(run) = self.run.as_mut().filter(|run| run.op == op) {
+            run.clients.push(client);
             return;
         }
-        let reply = match self.settled.iter().find(|retained| retained.op == op) {
-            Some(Retained { outcome: RetainedOutcome::Report { acc, goal }, .. }) => {
-                turn_reply(acc, goal.clone(), client.report)
-            }
-            Some(Retained { outcome: RetainedOutcome::Failed(message), .. }) => Reply::error(message.clone()),
-            None => Reply::error(format!("run {run} is not retained (only the last {RETAINED_RUNS} are)")),
+        let reply = match self.settled.iter().find(|settled| settled.op == op) {
+            Some(settled) => settled_reply(&settled.outcome, client.report),
+            None => Reply::error(format!("run {name} is not retained (only the last {RETAINED_RUNS} are)")),
         };
         client.answer(reply);
     }
 
-    /// Steer the running turn, else start one.
+    /// Codex decides whether the input starts a turn or steers the running
+    /// one; its reply names the turn, and the client waits on that.
     fn send(&mut self, prompt: String, client: Client) -> Result<()> {
-        if let Some(turn_id) = self.active.as_ref().map(|turn| turn.turn_id.clone()) {
-            let params = json!({
-                "threadId": self.thread_id,
-                "expectedTurnId": turn_id,
-                "input": [text_input(&prompt)],
-            });
-            return self.request("turn/steer", params, Pending::Steer { client });
+        if self.thread_id.is_none() {
+            return self.start_thread(AfterThread::Send { client, prompt });
         }
-        let op = self.next_run();
-        self.starting = Some(Starting { op, prompt, clients: vec![client], expected: None });
-        if self.thread_id.is_some() { self.start_turn(op) } else { self.start_thread(AfterThread::Turn { op }) }
-    }
-
-    fn start_thread(&mut self, then: AfterThread) -> Result<()> {
-        self.thread_starting = true;
-        let params = thread_params(&self.options.project, self.model.as_deref());
-        let id = match self.app.request("thread/start", params) {
-            Ok(id) => id,
-            Err(error) => {
-                self.thread_starting = false;
-                self.fail_after_thread(then, &format!("{error:#}"));
-                return Err(error);
-            }
-        };
-        self.pending.insert(id, Pending::ThreadStart { then });
-        Ok(())
-    }
-
-    fn start_turn(&mut self, op: u64) -> Result<()> {
-        let Some(starting) = self.starting.as_ref().filter(|starting| starting.op == op) else {
-            return Ok(());
-        };
         let mut params = json!({
             "threadId": self.thread_id,
-            "input": [text_input(&starting.prompt)],
+            "input": [text_input(&prompt)],
             "cwd": self.options.project,
             "approvalPolicy": "never",
             "sandboxPolicy": { "type": "dangerFullAccess" },
@@ -910,41 +899,23 @@ impl Daemon {
         if let Some(effort) = &self.effort {
             params["effort"] = json!(effort);
         }
-        if let Err(error) = self.request("turn/start", params, Pending::TurnStart { op }) {
-            self.fail_starting(&format!("{error:#}"));
-            return Err(error);
-        }
-        Ok(())
+        let steer_run = self.run.as_ref().map(|run| run.op);
+        self.request("turn/start", params, Pending::TurnStart { client, prompt, steer_run })
     }
 
-    /// The turn we asked for will never run: tell its clients.
-    fn fail_starting(&mut self, message: &str) {
-        if let Some(starting) = self.starting.take() {
-            for client in starting.clients {
-                client.answer(Reply::error(message));
+    fn start_thread(&mut self, then: AfterThread) -> Result<()> {
+        self.thread_starting = true;
+        let params = thread_params(&self.options.project, self.model.as_deref());
+        match self.app.request("thread/start", params) {
+            Ok(id) => {
+                self.pending.insert(id, Pending::ThreadStart { then });
+                Ok(())
             }
-        }
-    }
-
-    /// The running turn is lost: tell its clients, and keep the failure for
-    /// `watch --run`, since they were told its run id.
-    fn fail_active(&mut self, message: &str) {
-        if let Some(turn) = self.active.take() {
-            for client in turn.clients {
-                client.answer(Reply::error(message));
+            Err(error) => {
+                self.thread_starting = false;
+                then.fail(&format!("{error:#}"));
+                Err(error)
             }
-            self.retain(turn.op, turn.turns, RetainedOutcome::Failed(message.to_string()));
-        }
-    }
-
-    fn fail_after_thread(&mut self, then: AfterThread, message: &str) {
-        match then {
-            AfterThread::Turn { op } => {
-                if self.starting.as_ref().is_some_and(|starting| starting.op == op) {
-                    self.fail_starting(message);
-                }
-            }
-            AfterThread::Goal { client, .. } => client.answer(Reply::error(message)),
         }
     }
 
@@ -974,8 +945,8 @@ impl Daemon {
                 if let Some(objective) = &objective {
                     params["objective"] = json!(objective);
                 }
-                let turns_settled = self.turns_settled;
-                let pending = Pending::GoalSet { client, action, goal_updates, turns_settled };
+                let settled_count = self.settled_count;
+                let pending = Pending::GoalSet { client, action, goal_updates, settled_count };
                 self.request("thread/goal/set", params, pending)?;
                 if let Some(objective) = &objective {
                     self.log(&format!("[goal] objective: {objective}"));
@@ -1007,8 +978,8 @@ impl Daemon {
             return Ok(());
         }
         let Deferred::Interrupt { client, paused } = held_back else { unreachable!() };
-        let turn_id = self.active.as_ref().map(|turn| turn.turn_id.clone());
-        let (Some(turn_id), Some(thread_id)) = (turn_id, self.thread_id.clone()) else {
+        let running = self.run.as_ref().filter(|_| self.hold.is_none()).map(|run| run.current().to_string());
+        let (Some(turn_id), Some(thread_id)) = (running, self.thread_id.clone()) else {
             let report = if paused { format!("no active turn\n{}", self.goal_line()) } else { "no active turn".into() };
             client.answer(self.goal_reply("idle", report));
             return Ok(());
@@ -1024,13 +995,20 @@ impl Daemon {
         match event {
             AppEvent::Stderr(line) => self.log(&format!("[app-server stderr] {line}")),
             AppEvent::Closed(reason) => {
-                if self.shutting_down {
+                if self.stopping {
                     return;
                 }
-                let message = self.app.exit_description(reason).await;
+                // Reap it first, so the report says how it ended.
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while !self.app.has_exited() && reason.is_none() && Instant::now() < deadline {
+                    reap_children(Some(&mut self.app));
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                let message = self.app.describe_exit(reason).await;
                 self.log(&format!("[app-server] {message}"));
                 self.hold = None;
                 self.fail_everyone(&message);
+                self.fail_pending(&message);
                 self.shutdown_request = Some("app-server exit".into());
             }
             AppEvent::Message(message) => match Incoming::classify(message.clone()) {
@@ -1063,12 +1041,12 @@ impl Daemon {
                 let thread_id = match outcome {
                     Ok(response) => response["thread"]["id"].as_str().map(str::to_string),
                     Err(error) => {
-                        self.fail_after_thread(then, &error);
+                        then.fail(&error);
                         return Ok(());
                     }
                 };
                 let Some(thread_id) = thread_id else {
-                    self.fail_after_thread(then, "thread/start returned no thread id");
+                    then.fail("thread/start returned no thread id");
                     return Ok(());
                 };
                 self.thread_id = Some(thread_id.clone());
@@ -1078,49 +1056,27 @@ impl Daemon {
                     self.thread_id = None;
                     let message = format!("{error:#}");
                     self.log(&format!("[state] {message}; shutting down"));
-                    self.fail_after_thread(then, &message);
+                    then.fail(&message);
                     self.shutdown_request = Some("label not persisted".into());
                     return Ok(());
                 }
                 self.log(&format!("[thread] started {thread_id}"));
                 match then {
-                    AfterThread::Turn { op } => self.start_turn(op),
+                    AfterThread::Send { client, prompt } => self.send(prompt, client),
                     AfterThread::Goal { client, action, objective } => self.goal_command(action, objective, client),
                 }
             }
-            Pending::TurnStart { op } => {
-                let Some(starting) = self.starting.take_if(|starting| starting.op == op) else {
-                    return Ok(());
-                };
+            Pending::TurnStart { client, prompt, steer_run } => {
                 let turn_id = match outcome {
                     Ok(response) => response["turn"]["id"].as_str().map(str::to_string),
                     Err(error) => {
-                        for client in starting.clients {
-                            client.answer(Reply::error(error.clone()));
-                        }
+                        client.answer(Reply::error(error));
                         return Ok(());
                     }
                 };
-                let Some(turn_id) = turn_id else {
-                    for client in starting.clients {
-                        client.answer(Reply::error("turn/start returned no turn id"));
-                    }
-                    return Ok(());
-                };
-                self.confirm_turn(starting, turn_id);
-                Ok(())
-            }
-            Pending::Steer { client } => {
-                match outcome {
-                    Ok(response) => {
-                        let turn_id = response["turnId"]
-                            .as_str()
-                            .map(str::to_string)
-                            .or_else(|| self.active.as_ref().map(|turn| turn.turn_id.clone()))
-                            .unwrap_or_default();
-                        client.answer(Reply::ok("steered", format!("steered active turn {turn_id}")));
-                    }
-                    Err(error) => client.answer(Reply::error(error)),
+                match turn_id {
+                    Some(id) => self.waiters.push(Waiter { client, expect: Expect::Turn { id, prompt, steer_run } }),
+                    None => client.answer(Reply::error("turn/start returned no turn id")),
                 }
                 Ok(())
             }
@@ -1151,7 +1107,7 @@ impl Daemon {
                 }
                 Ok(())
             }
-            Pending::GoalSet { client, action, goal_updates, turns_settled } => {
+            Pending::GoalSet { client, action, goal_updates, settled_count } => {
                 let response = match outcome {
                     Ok(response) => response,
                     Err(error) => {
@@ -1165,7 +1121,7 @@ impl Daemon {
                 if action == GoalAction::Pause {
                     client.answer(self.goal_reply("ok", self.goal_line()));
                 } else {
-                    self.attach_goal_client(client, turns_settled);
+                    self.attach_goal_client(client, settled_count);
                 }
                 Ok(())
             }
@@ -1198,88 +1154,25 @@ impl Daemon {
         }
     }
 
-    /// Codex accepted the turn we asked for (or steered the input into the
-    /// turn already running, naming that one). turn/started can come before
-    /// the reply, so the turn may already be tracked as a run of its own,
-    /// running or even settled; otherwise it is new, or not seen yet.
-    fn confirm_turn(&mut self, mut starting: Starting, turn_id: String) {
-        starting.expected = Some(turn_id.clone());
-        self.starting = Some(starting);
-        if self.claim_starting() {
-            return;
-        }
-        if self.active.is_some() {
-            // Naming a turn we haven't seen while another is tracked: wait for
-            // it to show up rather than assume the tracked one ended.
-            self.log(&format!("[turn] codex accepted {turn_id}, not seen yet; waiting for it"));
-            return;
-        }
-        let starting = self.starting.take().expect("put back above");
-        let thread_id = self.thread_id.clone().unwrap_or_default();
-        self.active = Some(ActiveTurn {
-            op: starting.op,
-            turn_id: turn_id.clone(),
-            turns: vec![turn_id.clone()],
-            acc: TurnAccumulator::new(self.label(), &thread_id, &turn_id, &starting.prompt),
-            clients: starting.clients,
-            compactions_held: 0,
-        });
-        self.log_turn_header();
-    }
-
-    /// Hand a confirmed start's clients to the run its turn belongs to: the
-    /// running one (whose run id stands, since goal clients may hold it), or
-    /// a settled one, whose outcome answers them.
-    fn claim_starting(&mut self) -> bool {
-        let Some(expected) = self.starting.as_ref().and_then(|starting| starting.expected.clone()) else {
-            return false;
-        };
-        if let Some(turn) = self.active.as_mut().filter(|turn| turn.turns.contains(&expected)) {
-            let starting = self.starting.take().expect("checked");
-            turn.clients.extend(starting.clients);
-            turn.acc.prompt = starting.prompt;
-            self.log(&format!("[turn] {expected} is the turn we asked for"));
-            return true;
-        }
-        let Some(retained) = self.settled.iter().find(|retained| retained.turns.contains(&expected)) else {
-            if !self.finished_turns.contains(&expected) {
-                return false;
-            }
-            // Ended long enough ago that its report has aged out; never
-            // track it again as running.
-            let message = format!("turn {expected} finished before codex confirmed it; its report is in the log");
-            for client in self.starting.take().expect("checked").clients {
-                client.answer(Reply::error(message.clone()));
-            }
-            return true;
-        };
-        let starting = self.starting.take().expect("checked");
-        for client in starting.clients {
-            let reply = match &retained.outcome {
-                RetainedOutcome::Report { acc, goal } => turn_reply(acc, goal.clone(), client.report),
-                RetainedOutcome::Failed(message) => Reply::error(message.clone()),
-            };
-            client.answer(reply);
-        }
-        true
-    }
-
-    /// Where a goal client waits for the goal's work: a turn that settled
-    /// before the reply arrived, the turn running now (codex folds a goal set
-    /// mid-turn into it), or the turn codex is about to start.
-    fn attach_goal_client(&mut self, client: Client, turns_settled_before: u64) {
+    /// Where a goal client waits for the goal's work: a run that settled
+    /// before the reply arrived, the current run (codex folds a goal set
+    /// mid-turn into it), or the next run codex starts.
+    fn attach_goal_client(&mut self, client: Client, settled_before: u64) {
         let goal_active = self.goal_active();
-        if self.turns_settled > turns_settled_before
+        if self.settled_count > settled_before
             && !goal_active
-            && let Some(Retained { outcome: RetainedOutcome::Report { acc, .. }, .. }) = self.settled.back()
+            && let Some(settled) = self.settled.back()
         {
-            let reply = turn_reply(acc, self.goal.clone(), client.report);
+            let reply = match &settled.outcome {
+                SettledOutcome::Report { acc, .. } => turn_reply(acc, self.goal.clone(), client.report),
+                SettledOutcome::Failed(message) => Reply::error(message.clone()),
+            };
             self.log("[goal] the goal's turn ran and stopped while it was being set");
             client.answer(reply);
             return;
         }
-        if let Some(turn) = &mut self.active {
-            turn.clients.push(client);
+        if let Some(run) = &mut self.run {
+            run.clients.push(client);
             return;
         }
         if !goal_active {
@@ -1287,20 +1180,48 @@ impl Daemon {
             client.answer(self.goal_reply("ok", report));
             return;
         }
-        let id = self.next_id();
-        self.goal_waiters.push(GoalWaiter { id, client });
-        self.after(env_duration("CEPTION_GOAL_START_MS", 30_000), Event::GoalStartExpired(id));
+        let timer = self.next_id();
+        self.waiters.push(Waiter { client, expect: Expect::NextRun { timer } });
+        self.after(env_duration("CEPTION_GOAL_START_MS", 30_000), Event::GoalStartExpired(timer));
+    }
+
+    /// Settle waiters whose turn has shown up: join it if it is in the
+    /// current run (or answer at once if the input steered work already
+    /// under way), or answer from its outcome if it already ended.
+    fn resolve_waiters(&mut self) {
+        for waiter in std::mem::take(&mut self.waiters) {
+            let Expect::Turn { id, steer_run, .. } = &waiter.expect else {
+                self.waiters.push(waiter);
+                continue;
+            };
+            if let Some(run) = self.run.as_mut().filter(|run| run.turns.contains(id)) {
+                if *steer_run == Some(run.op) {
+                    let reply = Reply::ok("steered", format!("steered active turn {id}"));
+                    waiter.client.answer(reply);
+                } else {
+                    run.clients.push(waiter.client);
+                }
+            } else if let Some(settled) = self.settled.iter().find(|settled| settled.turns.contains(id)) {
+                let reply = settled_reply(&settled.outcome, waiter.client.report);
+                waiter.client.answer(reply);
+            } else if self.finished_turns.contains(id) {
+                let message = format!("turn {id} finished before codex confirmed it; its report is in the log");
+                waiter.client.answer(Reply::error(message));
+            } else {
+                self.waiters.push(waiter);
+            }
+        }
     }
 
     fn on_notification(&mut self, method: &str, params: &Value, raw: &Value) {
         let ours = self.thread_id.is_some() && params["threadId"].as_str() == self.thread_id.as_deref();
         match method {
             "thread/tokenUsage/updated" => {
-                if let Some(turn) = &mut self.active
+                if let Some(run) = &mut self.run
                     && ours
-                    && params["turnId"].as_str() == Some(turn.turn_id.as_str())
+                    && params["turnId"].as_str() == Some(run.current())
                 {
-                    turn.acc.handle_notification(method, params);
+                    run.acc.handle_notification(method, params);
                 }
                 return;
             }
@@ -1313,27 +1234,9 @@ impl Daemon {
                 return;
             }
             "turn/started" if ours => {
-                let Some(turn_id) = params["turn"]["id"].as_str().map(str::to_string) else {
-                    return;
-                };
-                if self.active.is_none() {
-                    // No run in flight, yet a turn started on our thread: the
-                    // goal's turn, a continuation we already reported, or the
-                    // one we asked for announcing itself before the reply
-                    // (confirm_turn claims it then). Track it either way; an
-                    // unobserved turn still edits the repo.
-                    self.adopt_orphan_turn(turn_id);
-                    return;
+                if let Some(id) = params["turn"]["id"].as_str() {
+                    self.observe_turn(id);
                 }
-                // One thread runs one turn: a new turn means the last one is
-                // over, and the run continues in it (a held report's
-                // continuation, or an end we never saw).
-                if !self.active.as_ref().is_some_and(|turn| turn.turns.contains(&turn_id)) {
-                    self.resume_continuation(turn_id);
-                    return;
-                }
-                // A goal set now is folded into the running turn.
-                self.absorb_goal_waiters();
                 return;
             }
             "thread/goal/updated" | "thread/goal/cleared" => {
@@ -1353,11 +1256,11 @@ impl Daemon {
                 if status.as_deref() != Some("active") {
                     if self.hold.take().is_some() {
                         self.log("[goal] no longer active; settling the turn");
-                        self.finish_active_turn();
+                        self.finish_run();
                     }
-                    // The goal stopped instead of starting the awaited turn.
-                    if self.active.is_none() {
-                        self.release_goal_waiters("(codex started no turn)");
+                    // The goal stopped instead of starting the awaited run.
+                    if self.run.is_none() {
+                        self.release_next_run_waiters("(codex started no turn)");
                     }
                 }
                 return;
@@ -1390,37 +1293,125 @@ impl Daemon {
             }
             return;
         }
-
         if !ours {
             return;
         }
         // Items name their turn in turnId; turn/completed in turn.id.
-        let event_turn = params["turnId"].as_str().or_else(|| params["turn"]["id"].as_str());
-        if self.active.is_none() {
-            // Items of a turn whose turn/started we never saw.
-            match event_turn {
-                Some(turn_id) => self.adopt_orphan_turn(turn_id.to_string()),
-                None => return,
-            }
-        }
-        let Some(turn) = self.active.as_mut() else {
+        let Some(id) = params["turnId"].as_str().or_else(|| params["turn"]["id"].as_str()) else {
             return;
         };
-        if event_turn.is_some_and(|event_turn| event_turn != turn.turn_id) {
+        if method == "turn/completed" && self.run.as_ref().is_some_and(|run| !run.turns.iter().any(|turn| turn == id)) {
+            // The end of a turn we never saw run, while another run is
+            // current (an aborted turn's start event can go undelivered).
+            // Record its outcome on its own; the current run is untouched.
+            if !self.finished_turns.contains(id) {
+                self.settle_unseen_turn(id, params);
+            }
             return;
         }
-        let lines = turn.acc.handle_notification(method, params);
+        if !self.observe_turn(id) {
+            return;
+        }
+        let run = self.run.as_mut().expect("observed");
+        let lines = run.acc.handle_notification(method, params);
         for line in lines {
             self.log(&line);
         }
         if method == "turn/completed" {
-            self.complete_active_turn();
+            self.complete_run();
         }
     }
 
-    fn log_turn_header(&mut self) {
-        if let Some(header) = self.active.as_ref().map(|turn| turn.acc.header_line()) {
-            self.log(&header);
+    /// Account for a lifecycle event of turn `id`: the first one of an unseen
+    /// turn starts a run, or continues the current one (one thread runs one
+    /// turn, so a new turn means the last one is over). False for a turn that
+    /// is already over.
+    fn observe_turn(&mut self, id: &str) -> bool {
+        if self.finished_turns.contains(id) {
+            return false;
+        }
+        match &self.run {
+            Some(run) if run.current() == id => return true,
+            Some(run) if run.turns.iter().any(|turn| turn == id) => return false,
+            Some(_) => self.continue_run(id),
+            None => self.start_run(id),
+        }
+        true
+    }
+
+    fn start_run(&mut self, id: &str) {
+        let thread_id = self.thread_id.clone().unwrap_or_default();
+        let requested = self.waiters.iter().find_map(|waiter| match &waiter.expect {
+            Expect::Turn { id: turn, prompt, .. } if turn == id => Some(prompt.clone()),
+            _ => None,
+        });
+        let clients = self.take_next_run_waiters();
+        let goal_pending = self.pending.values().any(|pending| matches!(pending, Pending::GoalSet { .. }));
+        let (prompt, note) = match requested {
+            Some(prompt) => (prompt, None),
+            None if self.start_in_flight() => ("(turn started)".to_string(), None),
+            None if !clients.is_empty() || goal_pending => {
+                ("(goal turn)".to_string(), Some("[turn] codex started the goal's turn"))
+            }
+            None => (
+                "(unattended continuation)".to_string(),
+                Some("[turn] adopted an unattended continuation turn; attach with `ception watch`"),
+            ),
+        };
+        let op = self.next_run();
+        let acc = TurnAccumulator::new(self.label(), &thread_id, id, &prompt);
+        self.log(&acc.header_line());
+        if let Some(note) = note {
+            self.log(note);
+        }
+        self.run = Some(Run { op, turns: vec![id.to_string()], acc, clients, compactions_held: 0 });
+        self.resolve_waiters();
+    }
+
+    fn continue_run(&mut self, id: &str) {
+        self.hold = None;
+        let clients = self.take_next_run_waiters();
+        let run = self.run.as_mut().expect("continuing a run");
+        run.turns.push(id.to_string());
+        run.acc.adopt_continuation(id);
+        run.clients.extend(clients);
+        self.log(&format!("[turn] continuing in turn {id}"));
+        self.resolve_waiters();
+    }
+
+    /// A completion for a turn never seen running, while another run is
+    /// current: its outcome stands alone, for whoever waits on that turn.
+    fn settle_unseen_turn(&mut self, id: &str, params: &Value) {
+        let thread_id = self.thread_id.clone().unwrap_or_default();
+        let mut acc = TurnAccumulator::new(self.label(), &thread_id, id, "(unseen turn)");
+        acc.handle_notification("turn/completed", params);
+        acc.settle();
+        self.log(&format!("[turn] {id} ended without being seen to start ({})", acc.status));
+        let op = self.next_run();
+        let outcome = SettledOutcome::Report { acc: Box::new(acc), goal: self.goal.clone() };
+        self.settle(op, vec![id.to_string()], outcome);
+        self.resolve_waiters();
+    }
+
+    fn take_next_run_waiters(&mut self) -> Vec<Client> {
+        let (next, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.waiters)
+            .into_iter()
+            .partition(|waiter| matches!(waiter.expect, Expect::NextRun { .. }));
+        self.waiters = rest;
+        if !next.is_empty() {
+            self.log(&format!("[goal] {} client(s) attached to the goal's turn", next.len()));
+        }
+        next.into_iter().map(|waiter| waiter.client).collect()
+    }
+
+    fn release_next_run_waiters(&mut self, note: &str) {
+        let report = format!("{}\n\n{note}", self.goal_line());
+        let (next, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.waiters)
+            .into_iter()
+            .partition(|waiter| matches!(waiter.expect, Expect::NextRun { .. }));
+        self.waiters = rest;
+        for waiter in next {
+            waiter.client.answer(self.goal_reply("ok", report.clone()));
         }
     }
 
@@ -1428,20 +1419,20 @@ impl Daemon {
     /// or after a compaction, codex may start another turn by itself. Hold
     /// the clients and the report until that settles; the timer is a stall
     /// safety net.
-    fn complete_active_turn(&mut self) {
+    fn complete_run(&mut self) {
         if self.hold.is_some() {
             return;
         }
         let goal_active = self.goal_active();
-        let Some(turn) = &mut self.active else {
+        let Some(run) = &mut self.run else {
             return;
         };
-        let compacted = turn.acc.compactions > turn.compactions_held;
+        let compacted = run.acc.compactions > run.compactions_held;
         if !goal_active && !compacted {
-            self.finish_active_turn();
+            self.finish_run();
             return;
         }
-        turn.compactions_held = turn.acc.compactions;
+        run.compactions_held = run.acc.compactions;
         let (grace, reason) = if goal_active {
             (env_duration("CEPTION_GOAL_GRACE_MS", 30_000), "goal still active")
         } else {
@@ -1453,85 +1444,25 @@ impl Daemon {
         self.after(grace, Event::GraceExpired(generation));
     }
 
-    fn resume_continuation(&mut self, turn_id: String) {
-        self.hold = None;
-        let Some(turn) = &mut self.active else {
+    fn finish_run(&mut self) {
+        let Some(mut run) = self.run.take() else {
             return;
         };
-        turn.turn_id = turn_id.clone();
-        turn.turns.push(turn_id.clone());
-        turn.acc.adopt_continuation(&turn_id);
-        self.absorb_goal_waiters();
-        self.log(&format!("[turn] continuing in turn {turn_id}"));
-    }
-
-    fn adopt_orphan_turn(&mut self, turn_id: String) {
-        let Some(thread_id) = self.thread_id.clone() else {
-            return;
-        };
-        if self.shutting_down {
-            return;
-        }
-        let clients: Vec<Client> = self.goal_waiters.drain(..).map(|waiter| waiter.client).collect();
-        let goal_pending = self.pending.values().any(|p| matches!(p, Pending::GoalSet { .. }));
-        let (prompt, note) = if self.starting.is_some() {
-            ("(turn started)", "[turn] a turn started while ours awaits its reply; tracking it")
-        } else if !clients.is_empty() || goal_pending {
-            ("(goal turn)", "[turn] codex started the goal's turn")
-        } else {
-            ("(unattended continuation)", "[turn] adopted an unattended continuation turn; attach with `ception watch`")
-        };
-        let op = self.next_run();
-        self.active = Some(ActiveTurn {
-            op,
-            turn_id: turn_id.clone(),
-            turns: vec![turn_id.clone()],
-            acc: TurnAccumulator::new(self.label(), &thread_id, &turn_id, prompt),
-            clients,
-            compactions_held: 0,
-        });
-        self.log_turn_header();
-        self.log(note);
-    }
-
-    fn absorb_goal_waiters(&mut self) {
-        if self.goal_waiters.is_empty() {
-            return;
-        }
-        let Some(turn) = &mut self.active else {
-            return;
-        };
-        let count = self.goal_waiters.len();
-        turn.clients.extend(self.goal_waiters.drain(..).map(|waiter| waiter.client));
-        self.log(&format!("[goal] {count} client(s) attached to the goal's turn"));
-    }
-
-    fn release_goal_waiters(&mut self, note: &str) {
-        let report = format!("{}\n\n{note}", self.goal_line());
-        for waiter in std::mem::take(&mut self.goal_waiters) {
-            waiter.client.answer(self.goal_reply("ok", report.clone()));
-        }
-    }
-
-    fn finish_active_turn(&mut self) {
-        let Some(mut turn) = self.active.take() else {
-            return;
-        };
-        turn.acc.settle();
-        self.log(&turn.acc.footer_line());
-        for client in turn.clients {
-            let reply = turn_reply(&turn.acc, self.goal.clone(), client.report);
+        run.acc.settle();
+        self.log(&run.acc.footer_line());
+        for client in run.clients {
+            let reply = turn_reply(&run.acc, self.goal.clone(), client.report);
             client.answer(reply);
         }
-        let outcome = RetainedOutcome::Report { acc: Box::new(turn.acc), goal: self.goal.clone() };
-        self.retain(turn.op, turn.turns, outcome);
-        self.turns_settled += 1;
-        // With the goal stopped no further turn is coming.
+        let outcome = SettledOutcome::Report { acc: Box::new(run.acc), goal: self.goal.clone() };
+        self.settle(run.op, run.turns, outcome);
+        // With the goal stopped no further run is coming.
         if !self.goal_active() {
-            self.release_goal_waiters("(codex started no turn)");
+            self.release_next_run_waiters("(codex started no turn)");
         }
         self.last_activity = Instant::now();
         self.persist_or_log();
+        self.resolve_waiters();
     }
 
     fn on_server_request(&mut self, id: Value, method: &str, raw: &Value) {
@@ -1541,7 +1472,7 @@ impl Daemon {
             self.log(&format!("[error] {error:#}"));
         }
         self.hold = None;
-        let turn_id = self.active.as_ref().map(|turn| turn.turn_id.clone());
+        let turn_id = self.run.as_ref().map(|run| run.current().to_string());
         self.fail_everyone(&description);
         if let (Some(turn_id), Some(thread_id)) = (turn_id, self.thread_id.clone()) {
             let params = json!({ "threadId": thread_id, "turnId": turn_id });
@@ -1552,11 +1483,38 @@ impl Daemon {
         }
     }
 
+    /// The current run is lost and nothing awaited will arrive: tell everyone
+    /// waiting, and keep the run's failure for `watch --run`, since its
+    /// clients were told its id.
     fn fail_everyone(&mut self, message: &str) {
-        self.fail_starting(message);
-        self.fail_active(message);
-        for waiter in std::mem::take(&mut self.goal_waiters) {
+        if let Some(run) = self.run.take() {
+            for client in run.clients {
+                client.answer(Reply::error(message));
+            }
+            self.settle(run.op, run.turns, SettledOutcome::Failed(message.to_string()));
+        }
+        for waiter in std::mem::take(&mut self.waiters) {
             waiter.client.answer(Reply::error(message));
+        }
+    }
+
+    /// Requests that will never be answered: tell their clients.
+    fn fail_pending(&mut self, message: &str) {
+        for (_, pending) in self.pending.drain() {
+            let client = match pending {
+                Pending::TurnStart { client, .. }
+                | Pending::GoalSet { client, .. }
+                | Pending::GoalGet { client, .. }
+                | Pending::GoalClear { client, .. }
+                | Pending::InterruptPause { client, .. }
+                | Pending::Interrupt { client: Some(client), .. } => client,
+                Pending::ThreadStart { then } => {
+                    then.fail(message);
+                    continue;
+                }
+                Pending::Interrupt { client: None, .. } => continue,
+            };
+            client.answer(Reply::error(message));
         }
     }
 
@@ -1569,12 +1527,11 @@ impl Daemon {
         app_events: &mut UnboundedReceiver<AppEvent>,
         events: &mut UnboundedReceiver<Event>,
     ) {
-        let turn_id = self.active.as_ref().map(|turn| turn.turn_id.clone());
-        let (Some(turn_id), Some(thread_id)) = (turn_id, self.thread_id.clone()) else {
+        let running = self.run.as_ref().map(|run| run.current().to_string());
+        let (Some(turn_id), Some(thread_id)) = (running, self.thread_id.clone()) else {
             return;
         };
-        let params = json!({ "threadId": thread_id, "turnId": turn_id });
-        let Ok(id) = self.app.request("turn/interrupt", params) else {
+        let Ok(id) = self.app.request("turn/interrupt", json!({ "threadId": thread_id, "turnId": turn_id })) else {
             return;
         };
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -1608,9 +1565,6 @@ impl Daemon {
     }
 
     async fn shutdown(&mut self, reason: &str) {
-        if self.shutting_down {
-            return;
-        }
         self.shutting_down = true;
         self.log(&format!("[daemon] shutting down: {reason}"));
         self.hold = None;
@@ -1620,28 +1574,32 @@ impl Daemon {
             let (Deferred::Command(_, client) | Deferred::Interrupt { client, .. }) = item;
             client.answer(Reply::Refused { message: message.clone() });
         }
-        for (_, pending) in self.pending.drain() {
-            let client = match pending {
-                Pending::Steer { client }
-                | Pending::GoalSet { client, .. }
-                | Pending::GoalGet { client, .. }
-                | Pending::GoalClear { client, .. }
-                | Pending::InterruptPause { client, .. }
-                | Pending::Interrupt { client: Some(client), .. }
-                | Pending::ThreadStart { then: AfterThread::Goal { client, .. } } => client,
-                _ => continue,
-            };
-            client.answer(Reply::error(message.clone()));
-        }
+        self.fail_pending(&message);
         self.persist_or_log();
         let _ = std::fs::remove_file(&self.paths.socket);
-        self.app.close().await;
-        // Descendants that left the process group still carry the token.
-        let sweep = procfs::kill_owned(&self.owner).await;
-        if sweep.survivors > 0 {
-            self.log(&format!("[daemon] {} app-server descendant(s) survived SIGKILL", sweep.survivors));
+        // A well-behaved server exits on stdin EOF; give it a moment before
+        // tearing the tree down.
+        self.app.close_stdin();
+        let deadline = Instant::now() + Duration::from_millis(100);
+        while !self.app.has_exited() && Instant::now() < deadline {
+            reap_children(Some(&mut self.app));
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let _ = std::fs::remove_file(owner_path(&self.paths));
+        teardown(Some(&mut self.app), &mut self.log).await;
+    }
+}
+
+impl AfterThread {
+    fn fail(self, message: &str) {
+        let (AfterThread::Send { client, .. } | AfterThread::Goal { client, .. }) = self;
+        client.answer(Reply::error(message));
+    }
+}
+
+fn settled_reply(outcome: &SettledOutcome, level: ReportLevel) -> Reply {
+    match outcome {
+        SettledOutcome::Report { acc, goal } => turn_reply(acc, goal.clone(), level),
+        SettledOutcome::Failed(message) => Reply::error(message.clone()),
     }
 }
 

@@ -1,6 +1,12 @@
-//! The codex app-server child: spawning it, newline-delimited JSON-RPC over
-//! its stdio (no `"jsonrpc"` field on the wire), and owning its process group.
+//! The codex app-server child: spawning it, and newline-delimited JSON-RPC
+//! over its stdio (no `"jsonrpc"` field on the wire).
+//!
+//! The server is a plain child process reaped only by its owner: the daemon
+//! makes every `waitpid` call itself (and reports the server's exit back
+//! here), and the one-shot quota client reaps it in [`AppServer::close`].
+//! Nothing else reaps it, so a pid the owner holds is never recycled.
 
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -9,12 +15,10 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::process::{ChildStderr, ChildStdin, ChildStdout};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 use tokio::time::Instant;
-
-use crate::procfs::{self, PidWatch};
 
 pub enum AppEvent {
     Message(Value),
@@ -86,10 +90,7 @@ const STDERR_TAIL: usize = 4000;
 const EXIT_DRAIN: Duration = Duration::from_millis(500);
 
 pub struct AppServer {
-    child: Child,
-    /// The server's process group, which outlives the child handle: codex's
-    /// shells and npx's children live in it.
-    pgid: libc::pid_t,
+    pid: u32,
     /// Lines for the writer task. Writes never block the caller, so a server
     /// that stops reading can't wedge the daemon.
     writer: Option<UnboundedSender<Vec<u8>>>,
@@ -98,30 +99,18 @@ pub struct AppServer {
     /// Fires when stderr hits EOF, so an exit description includes the
     /// server's last words.
     stderr_done: Option<oneshot::Receiver<()>>,
-    /// The server's exit, observed without reaping it: an unreaped leader,
-    /// even a zombie, keeps its pid and so the group id from being reused
-    /// while close() signals the group.
-    exit: PidWatch,
-    closed: bool,
+    /// Set when the owner reaps the server, so the stdout reader stops
+    /// waiting on a pipe a descendant may hold open.
+    exited: watch::Sender<bool>,
+    /// How it ended, once reaped.
+    exit_status: Option<String>,
 }
 
 impl AppServer {
-    /// `owner`, if given, marks the server and everything it starts (see
-    /// [`crate::procfs::OWNER_VAR`]).
-    pub fn spawn(cwd: &Path, owner: Option<&str>) -> Result<(Self, UnboundedReceiver<AppEvent>)> {
+    pub fn spawn(cwd: &Path) -> Result<(Self, UnboundedReceiver<AppEvent>)> {
         let argv = codex_command()?;
-        let mut command = Command::new(&argv[0]);
-        if let Some(owner) = owner {
-            command.env(crate::procfs::OWNER_VAR, owner);
-        }
-        command
-            .args(&argv[1..])
-            .current_dir(cwd)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        // Its own process group, so close() reaches everything under it.
+        let mut command = std::process::Command::new(&argv[0]);
+        command.args(&argv[1..]).current_dir(cwd).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
         // PDEATHSIG makes it die with us even on SIGKILL; the "parent" is the
         // spawning thread, and ception runs current_thread runtimes, so that
         // is the main thread. If we died before prctl took effect, the child
@@ -129,7 +118,6 @@ impl AppServer {
         let parent = std::process::id() as libc::pid_t;
         unsafe {
             command.pre_exec(move || {
-                libc::setpgid(0, 0);
                 libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
                 if libc::getppid() != parent {
                     libc::_exit(1);
@@ -138,28 +126,50 @@ impl AppServer {
             });
         }
         let mut child = command.spawn().with_context(|| format!("start {}", argv.join(" ")))?;
-        let pid = child.id().context("app-server pid")?;
-        let exit = PidWatch::child(pid)?.context("app-server exited at once")?;
-        let reader_exit = PidWatch::child(pid)?;
+        let pid = child.id();
+        let stdin = ChildStdin::from_std(child.stdin.take().expect("piped"))?;
+        let stdout = ChildStdout::from_std(child.stdout.take().expect("piped"))?;
+        let stderr = ChildStderr::from_std(child.stderr.take().expect("piped"))?;
+        // Dropping std's handle neither kills nor waits: reaping stays ours.
+        drop(child);
+
         let (tx, rx) = unbounded_channel();
-        let tx_writer = tx.clone();
+        let (exited, exited_rx) = watch::channel(false);
         let stderr_tail = Arc::new(Mutex::new(String::new()));
-        tokio::spawn(read_stdout(child.stdout.take().expect("piped"), tx.clone(), reader_exit));
+        tokio::spawn(read_stdout(stdout, tx.clone(), exited_rx));
         let (stderr_eof, stderr_done) = oneshot::channel();
-        tokio::spawn(read_stderr(child.stderr.take().expect("piped"), tx, stderr_tail.clone(), stderr_eof));
+        tokio::spawn(read_stderr(stderr, tx.clone(), stderr_tail.clone(), stderr_eof));
         let (writer, lines) = unbounded_channel();
-        tokio::spawn(write_stdin(child.stdin.take().expect("piped"), lines, tx_writer));
+        tokio::spawn(write_stdin(stdin, lines, tx));
         let server = Self {
-            child,
-            pgid: pid as libc::pid_t,
+            pid,
             writer: Some(writer),
             next_id: 1,
             stderr_tail,
             stderr_done: Some(stderr_done),
-            exit,
-            closed: false,
+            exited,
+            exit_status: None,
         };
         Ok((server, rx))
+    }
+
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    /// The owner reaped the server with this wait status.
+    pub fn reaped(&mut self, status: libc::c_int) {
+        self.exit_status = Some(describe_wait_status(status));
+        let _ = self.exited.send(true);
+    }
+
+    pub fn has_exited(&self) -> bool {
+        self.exit_status.is_some()
+    }
+
+    /// No more requests; a well-behaved server exits on stdin EOF.
+    pub fn close_stdin(&mut self) {
+        self.writer = None;
     }
 
     pub fn request(&mut self, method: &str, params: Value) -> Result<u64> {
@@ -200,7 +210,10 @@ impl AppServer {
             };
             let message = match event {
                 AppEvent::Message(message) => message,
-                AppEvent::Closed(reason) => bail!(self.exit_description(reason).await),
+                AppEvent::Closed(reason) => {
+                    self.reap_self(Duration::from_secs(2)).await;
+                    bail!(self.describe_exit(reason).await)
+                }
                 other_event => {
                     other(other_event);
                     continue;
@@ -229,18 +242,16 @@ impl AppServer {
         self.notify("initialized", json!({}))
     }
 
-    /// Why the server went away, once [`AppEvent::Closed`] has arrived.
-    pub async fn exit_description(&mut self, reason: Option<String>) -> String {
+    /// Why the server went away, once [`AppEvent::Closed`] has arrived (and
+    /// the owner has had its chance to reap it).
+    pub async fn describe_exit(&mut self, reason: Option<String>) -> String {
         if let Some(reason) = reason {
             return reason;
         }
-        let status = match tokio::time::timeout(Duration::from_secs(2), self.exit.exited()).await {
-            Ok(()) => self.peek_status(),
-            Err(_) => "stdout closed".to_string(),
-        };
         if let Some(done) = self.stderr_done.take() {
             let _ = tokio::time::timeout(Duration::from_millis(500), done).await;
         }
+        let status = self.exit_status.clone().unwrap_or_else(|| "stdout closed".to_string());
         let stderr = self.stderr_tail.lock().unwrap().trim().to_string();
         if stderr.is_empty() {
             format!("codex app-server exited unexpectedly ({status})")
@@ -249,54 +260,47 @@ impl AppServer {
         }
     }
 
-    /// The exited server's status, read without reaping it.
-    fn peek_status(&self) -> String {
-        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        let flags = libc::WEXITED | libc::WNOWAIT | libc::WNOHANG;
-        if unsafe { libc::waitid(libc::P_PID, self.pgid as libc::id_t, &mut info, flags) } != 0 {
-            return "unknown status".to_string();
-        }
-        let status = unsafe { info.si_status() };
-        match info.si_code {
-            libc::CLD_EXITED => format!("exit {status}"),
-            libc::CLD_KILLED | libc::CLD_DUMPED => format!("signal {status}"),
-            _ => "unknown status".to_string(),
+    /// Reap the server if it has exited, waiting up to `limit`. For startup
+    /// and one-shot clients; the daemon's serving loop reaps through its own
+    /// handler instead. Same thread as that handler, so never concurrent.
+    async fn reap_self(&mut self, limit: Duration) {
+        let deadline = Instant::now() + limit;
+        while !self.has_exited() {
+            let mut status = 0;
+            let reaped = unsafe { libc::waitpid(self.pid as libc::pid_t, &mut status, libc::WNOHANG) };
+            if reaped == self.pid as libc::pid_t {
+                self.reaped(status);
+                return;
+            }
+            if reaped < 0 || Instant::now() >= deadline {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
 
-    /// Close stdin and give the server a moment to exit, then SIGTERM its
-    /// process group, then SIGKILL, until the group has no live members (or
-    /// the SIGKILL grace ran out), so a successor never overlaps old tools.
-    /// The leader is reaped only after that.
+    /// For one-shot clients: close stdin, give the server a moment, then
+    /// SIGTERM, then SIGKILL, and reap it.
     pub async fn close(&mut self) {
-        if self.closed {
-            return;
-        }
-        self.closed = true;
-        self.writer = None;
-        let pgid = self.pgid as u32;
-        let _ = tokio::time::timeout(Duration::from_millis(100), self.exit.exited()).await;
-        for (signal, grace) in [(libc::SIGTERM, 2000), (libc::SIGKILL, 1000)] {
-            if !procfs::group_has_live_members(pgid) {
-                break;
+        self.close_stdin();
+        self.reap_self(Duration::from_millis(100)).await;
+        for signal in [libc::SIGTERM, libc::SIGKILL] {
+            if self.has_exited() {
+                return;
             }
-            unsafe { libc::kill(-self.pgid, signal) };
-            let deadline = Instant::now() + Duration::from_millis(grace);
-            while procfs::group_has_live_members(pgid) && Instant::now() < deadline {
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
+            unsafe { libc::kill(self.pid as libc::pid_t, signal) };
+            self.reap_self(Duration::from_secs(2)).await;
         }
-        let _ = tokio::time::timeout(Duration::from_secs(1), self.child.wait()).await;
     }
 }
 
-impl Drop for AppServer {
-    /// Abandoned without close(), e.g. a startup cut short: take the whole
-    /// group down, not just the direct child.
-    fn drop(&mut self) {
-        if !self.closed {
-            unsafe { libc::kill(-self.pgid, libc::SIGKILL) };
-        }
+pub fn describe_wait_status(status: libc::c_int) -> String {
+    if libc::WIFEXITED(status) {
+        format!("exit {}", libc::WEXITSTATUS(status))
+    } else if libc::WIFSIGNALED(status) {
+        format!("signal {}", libc::WTERMSIG(status))
+    } else {
+        "unknown status".to_string()
     }
 }
 
@@ -311,17 +315,18 @@ async fn write_stdin(mut stdin: ChildStdin, mut lines: UnboundedReceiver<Vec<u8>
     }
 }
 
-async fn read_stdout(stdout: ChildStdout, tx: UnboundedSender<AppEvent>, exit: Option<PidWatch>) {
+async fn read_stdout(stdout: ChildStdout, tx: UnboundedSender<AppEvent>, mut exited: watch::Receiver<bool>) {
     let mut lines = BufReader::new(stdout).lines();
     let mut drain_until: Option<Instant> = None;
     loop {
         let next = tokio::select! {
             line = lines.next_line() => line,
-            // The server exited but stdout is still open (a descendant has
-            // it): read what is already there, then report it gone.
-            _ = async { exit.as_ref().expect("guarded").exited().await },
-                if exit.is_some() && drain_until.is_none() =>
-            {
+            // The server was reaped but stdout is still open (a descendant
+            // has it): read what is already there, then report it gone.
+            changed = exited.wait_for(|exited| *exited), if drain_until.is_none() => {
+                if changed.is_err() {
+                    return;
+                }
                 drain_until = Some(Instant::now() + EXIT_DRAIN);
                 continue;
             }
@@ -344,7 +349,7 @@ async fn read_stdout(stdout: ChildStdout, tx: UnboundedSender<AppEvent>, exit: O
 }
 
 async fn read_stderr(
-    stderr: tokio::process::ChildStderr,
+    stderr: ChildStderr,
     tx: UnboundedSender<AppEvent>,
     tail: Arc<Mutex<String>>,
     eof: oneshot::Sender<()>,

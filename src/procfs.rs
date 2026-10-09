@@ -1,10 +1,9 @@
 //! Process primitives: identity via /proc starttime, death notification via
-//! pidfd, and detaching the daemon from the client's process tree.
+//! pidfd, finding our children, and detaching the daemon from the client's
+//! process tree.
 
-use std::collections::{HashMap, HashSet};
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::time::Duration;
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 
 use anyhow::{Context, Result};
@@ -14,118 +13,33 @@ use tokio::io::unix::AsyncFd;
 /// Clock ticks since boot at which the process started. Together with the pid
 /// it names one process even across pid reuse.
 pub fn starttime(pid: u32) -> Result<u64> {
-    let stat =
-        std::fs::read_to_string(format!("/proc/{pid}/stat")).with_context(|| format!("process {pid} not found"))?;
-    // comm (field 2) is parenthesised and may contain spaces; fields after it
-    // start at 3, so starttime (22) is the 20th.
-    let rest = &stat[stat.rfind(')').context("malformed /proc stat")? + 2..];
-    let field = rest.split_whitespace().nth(19).context("malformed /proc stat")?;
-    Ok(field.parse()?)
+    let fields = stat_fields(pid).with_context(|| format!("process {pid} not found"))?;
+    // Fields after comm start at 3 (state), so starttime (22) is the 20th.
+    fields.get(19).context("malformed /proc stat")?.parse().context("malformed /proc stat")
 }
 
-/// The variable that marks an app-server and everything it starts, so the
-/// lot can be found again by value, whatever process group or parent they
-/// end up with.
-pub const OWNER_VAR: &str = "CEPTION_OWNER";
-
-fn carries(pid: u32, marker: &[u8]) -> bool {
-    std::fs::read(format!("/proc/{pid}/environ"))
-        .is_ok_and(|environ| environ.split(|&b| b == 0).any(|var| var == marker))
+/// The fields of /proc/<pid>/stat after "(comm) ", which may contain spaces.
+fn stat_fields(pid: u32) -> Option<Vec<String>> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = stat.get(stat.rfind(')')? + 2..)?;
+    Some(rest.split_whitespace().map(str::to_string).collect())
 }
 
-/// A process pinned by a pidfd: signals sent through it can't reach a
-/// process that later reuses the pid.
-pub struct Pinned {
-    pub pid: u32,
-    fd: OwnedFd,
-}
-
-impl Pinned {
-    fn open(pid: u32) -> Option<Self> {
-        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
-        (raw >= 0).then(|| Self { pid, fd: unsafe { OwnedFd::from_raw_fd(raw as i32) } })
-    }
-
-    /// A pidfd turns readable once its process has exited.
-    fn exited(&self) -> bool {
-        let mut poll = libc::pollfd { fd: self.fd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
-        unsafe { libc::poll(&mut poll, 1, 0) > 0 }
-    }
-
-    fn signal(&self, signal: i32) {
-        let null = std::ptr::null::<libc::siginfo_t>();
-        unsafe { libc::syscall(libc::SYS_pidfd_send_signal, self.fd.as_raw_fd(), signal, null, 0) };
-    }
-}
-
-/// Live processes (other than us) whose environment carries
-/// `CEPTION_OWNER=<token>`. The environment is read again after pinning,
-/// so it is the pinned process's own.
-pub fn owned_processes(token: &str) -> Vec<Pinned> {
-    let marker = format!("{OWNER_VAR}={token}");
-    let me = std::process::id();
+/// Processes whose parent is `parent`. For the daemon (a child subreaper,
+/// and the only one reaping its children) a listed pid stays its child,
+/// alive or a zombie, until it reaps it, so signalling it can't hit anything
+/// else.
+pub fn children_of(parent: u32) -> Vec<u32> {
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return Vec::new();
     };
     entries
         .flatten()
         .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
-        .filter(|&pid| pid != me && carries(pid, marker.as_bytes()))
-        .filter_map(Pinned::open)
-        .filter(|pinned| carries(pinned.pid, marker.as_bytes()) && !pinned.exited())
+        .filter(|&pid| {
+            stat_fields(pid).is_some_and(|fields| fields.get(1).and_then(|ppid| ppid.parse().ok()) == Some(parent))
+        })
         .collect()
-}
-
-pub struct Sweep {
-    pub found: usize,
-    /// Still alive when we gave up.
-    pub survivors: usize,
-}
-
-/// SIGTERM the processes carrying `token`, then SIGKILL what is left,
-/// rescanning throughout so processes forked meanwhile are caught too.
-pub async fn kill_owned(token: &str) -> Sweep {
-    let started = tokio::time::Instant::now();
-    let mut found = HashSet::new();
-    let mut signalled: HashMap<u32, i32> = HashMap::new();
-    loop {
-        let live = owned_processes(token);
-        found.extend(live.iter().map(|pinned| pinned.pid));
-        if live.is_empty() {
-            return Sweep { found: found.len(), survivors: 0 };
-        }
-        let elapsed = started.elapsed();
-        if elapsed > Duration::from_secs(3) {
-            return Sweep { found: found.len(), survivors: live.len() };
-        }
-        let signal = if elapsed < Duration::from_secs(2) { libc::SIGTERM } else { libc::SIGKILL };
-        for pinned in &live {
-            if signalled.insert(pinned.pid, signal) != Some(signal) {
-                pinned.signal(signal);
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
-
-/// Whether any process other than a zombie is in process group `pgid`.
-pub fn group_has_live_members(pgid: u32) -> bool {
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return false;
-    };
-    entries.flatten().filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok()).any(|pid| {
-        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
-            return false;
-        };
-        // After "(comm) ": state, ppid, pgrp.
-        let Some(close) = stat.rfind(')') else {
-            return false;
-        };
-        let mut fields = stat[close + 2..].split_whitespace();
-        let state = fields.next();
-        let pgrp = fields.nth(1).and_then(|pgrp| pgrp.parse::<u32>().ok());
-        pgrp == Some(pgid) && state != Some("Z")
-    })
 }
 
 /// Becomes ready when the watched process exits.
@@ -137,23 +51,6 @@ impl PidWatch {
     /// `None` if the process is already gone, including when its pid now
     /// belongs to someone else.
     pub fn open(pid: u32, expected_starttime: u64) -> Result<Option<Self>> {
-        let Some(watch) = Self::pidfd(pid)? else {
-            return Ok(None);
-        };
-        // Checked after opening: the pidfd pins this pid to whatever process
-        // holds it now, so a matching starttime proves it is the right one.
-        if starttime(pid).ok() != Some(expected_starttime) {
-            return Ok(None);
-        }
-        Ok(Some(watch))
-    }
-
-    /// For our own unreaped child, whose pid cannot have been reused.
-    pub fn child(pid: u32) -> Result<Option<Self>> {
-        Self::pidfd(pid)
-    }
-
-    fn pidfd(pid: u32) -> Result<Option<Self>> {
         let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
         if raw < 0 {
             let error = io::Error::last_os_error();
@@ -163,6 +60,11 @@ impl PidWatch {
             return Err(error).context("pidfd_open");
         }
         let fd = unsafe { OwnedFd::from_raw_fd(raw as i32) };
+        // Checked after opening: the pidfd pins this pid to whatever process
+        // holds it now, so a matching starttime proves it is the right one.
+        if starttime(pid).ok() != Some(expected_starttime) {
+            return Ok(None);
+        }
         Ok(Some(Self { fd: AsyncFd::with_interest(fd, Interest::READABLE)? }))
     }
 
@@ -200,6 +102,14 @@ mod tests {
         let pid = std::process::id();
         assert_eq!(starttime(pid).unwrap(), starttime(pid).unwrap());
         assert!(starttime(u32::MAX - 1).is_err());
+    }
+
+    #[test]
+    fn children_of_finds_a_child() {
+        let mut child = std::process::Command::new("sleep").arg("5").spawn().unwrap();
+        assert!(children_of(std::process::id()).contains(&child.id()));
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
 
     #[tokio::test]

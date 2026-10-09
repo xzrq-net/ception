@@ -5,9 +5,7 @@
 mod support;
 
 use std::fs;
-use std::os::unix::process::CommandExt;
-use std::process::Command;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use support::*;
@@ -1151,35 +1149,68 @@ fn watch_timeout_on_a_parked_turn_hands_back_its_run() {
 
 // ----- regressions found in the second review ------------------------------------------------
 
-/// A SIGKILLed daemon runs no cleanup; its app-server's descendants used to
-/// outlive it for good, overlapping whatever the next daemon started.
+/// The daemon is a child subreaper: a descendant that left the app-server's
+/// session (and shrugs off SIGTERM) is still in its tree, and teardown kills
+/// it before the label is released.
 #[test]
-fn a_revived_daemon_first_kills_what_a_sigkilled_predecessor_left_running() {
-    let ctx = Ctx::new("stubborn-child");
+fn teardown_reaches_descendants_that_left_the_session() {
+    let ctx = Ctx::new("stubborn-session-child");
 
     ctx.ception(&["spawn", "shell", "start a tool"]).run().expect_code(0);
     let tool = children(&ctx)[0];
     let _reap = Reap::new(&[tool]);
-    let daemon = daemon_pid(&ctx.log(SESSION, "shell"));
-    unsafe { libc::kill(daemon as libc::pid_t, libc::SIGKILL) };
+    assert!(alive(tool));
+
+    ctx.ception(&["kill", "shell"]).run().expect_code(0);
     let lock = ctx.lock_path(SESSION, "shell");
+    assert!(wait_until(secs(10), || lock_free(&lock)), "the label was never released");
+    assert!(!alive(tool), "the tool {tool} outlived its daemon's teardown");
+}
+
+/// A SIGKILLed daemon can't tear down (its leftovers are a documented
+/// limit), but the label it held is free again and `send` revives it.
+#[test]
+fn a_sigkilled_daemon_leaves_its_label_revivable() {
+    let ctx = Ctx::new("happy");
+
+    ctx.ception(&["spawn", "killed", "first"]).run().expect_code(0);
+    let daemon = daemon_pid(&ctx.log(SESSION, "killed"));
+    unsafe { libc::kill(daemon as libc::pid_t, libc::SIGKILL) };
+    let lock = ctx.lock_path(SESSION, "killed");
     assert!(wait_until(WAIT, || lock_free(&lock)), "SIGKILLed daemon still holds the label");
-    assert!(alive(tool), "the tool should outlive its SIGKILLed daemon (it ignores SIGTERM)");
 
-    ctx.ception(&["send", "shell", "follow up"]).run().expect_code(0);
-    let _reap_new = Reap::new(&children(&ctx));
-    assert!(!alive(tool), "the predecessor's tool {tool} survived the revival");
+    let sent = ctx.ception(&["send", "killed", "follow up"]).run().expect_code(0);
+    assert_has(&sent.stdout, "Resumed the prior run");
+    assert_eq!(requests(&ctx.fake_state(), "thread/resume").count(), 1);
+}
 
-    // Taken down before the new daemon started serving.
-    let log = ctx.log(SESSION, "shell");
-    let lines: Vec<&str> = log.lines().collect();
-    let started = lines.iter().rposition(|line| line.starts_with("[daemon] starting ")).unwrap();
-    let killed = lines
-        .iter()
-        .position(|line| line.contains("a previous daemon left running"))
-        .unwrap_or_else(|| panic!("no leftover kill logged:\n{log}"));
-    let listening = started + lines[started..].iter().position(|line| line.starts_with("[daemon] listening")).unwrap();
-    assert!(started < killed && killed < listening, "{log}");
+/// A `send` that arrives while a run is held for a continuation waits to see
+/// whether one comes. None does here: the held run settles to its own
+/// client, and the send gets a run (and a report) of its own.
+#[test]
+fn a_send_while_the_last_run_is_held_starts_its_own_run_once_the_hold_settles() {
+    let ctx = Ctx::new("continuation");
+    let env = ctx.env.set("CEPTION_CONTINUATION_GRACE_MS", 1500).set("CEPTION_FAKE_CONTINUATION_DELAY_MS", 20000);
+
+    let mut first = ctx.ception(&["spawn", "hold", "do the work"]).env(&env).spawn();
+    let log = ctx.log_path(SESSION, "hold");
+    assert!(
+        wait_until(WAIT, || fs::read_to_string(&log).is_ok_and(|log| log.contains("holding the report"))),
+        "the report was never held"
+    );
+
+    // "slow" parks the send's turn, so it can be steered to an end.
+    let mut sent = ctx.ception(&["send", "hold", "slow follow up"]).env(&env).spawn();
+    let held = first.wait();
+    assert_eq!(held.code, Some(2), "{held}");
+    assert_has(&held.stdout, "Instructions loaded");
+    assert_lacks(&held.stdout, "Steered response");
+
+    sent.wait_stdout("log: ");
+    let steered = ctx.ception(&["send", "hold", "add steering"]).env(&env).run().expect_code(0);
+    assert_has(&steered.stdout, "steered active turn");
+    let sent = sent.wait().expect_code(0);
+    assert_has(&sent.stdout, "Steered response");
 }
 
 /// A turn codex started by itself used to be taken for the requested one, so
@@ -1210,45 +1241,6 @@ fn a_server_that_closes_its_stdin_fails_the_turn_promptly() {
         assert!(started.elapsed() < secs(5), "took {:?}", started.elapsed());
         assert_has(&out.stderr, "write to codex app-server");
     }
-}
-
-/// A daemon on its way out used to fail the requests queued on it; now it
-/// refuses them and the client revives the label and retries. The send waits
-/// behind a held report, then the daemon's watched process dies.
-#[test]
-fn a_send_refused_by_a_daemon_on_its_way_out_revives_the_label_and_succeeds() {
-    let ctx = Ctx::new("continuation");
-    let mut dummy = Dummy::start();
-
-    // The compacted turn's report is held for a continuation that won't come
-    // while the test runs.
-    let first_env = ctx
-        .env
-        .set("CEPTION_WATCH_PID", dummy.pid())
-        .set("CEPTION_CONTINUATION_GRACE_MS", 20000)
-        .set("CEPTION_FAKE_CONTINUATION_DELAY_MS", 20000);
-    let mut first = ctx.ception(&["spawn", "hold", "do the work"]).env(&first_env).spawn();
-    let log = ctx.log_path(SESSION, "hold");
-    assert!(
-        wait_until(WAIT, || fs::read_to_string(&log).is_ok_and(|log| log.contains("holding the report"))),
-        "the report was never held"
-    );
-
-    // Same session from a new process; the revived daemon plays it straight.
-    let second_env = ctx.env.set("CEPTION_FAKE_BEHAVIOR", "happy");
-    let mut sent = ctx.ception(&["send", "hold", "follow up after the handover"]).env(&second_env).spawn();
-    sent.wait_stdout("log: ");
-    std::thread::sleep(ms(300));
-    dummy.kill();
-
-    let sent = sent.wait().expect_code(0);
-    assert_has(&sent.stdout, "Resumed the prior run");
-    assert_eq!(sent.lines_starting("log: ").len(), 1, "{sent}");
-    let state = ctx.fake_state();
-    assert_eq!(state["appServerStarts"], 2);
-    assert_eq!(requests(&state, "thread/resume").count(), 1);
-    // The held client goes down with its daemon.
-    assert_ne!(first.wait().code, Some(0));
 }
 
 /// A run that ended in an infrastructure failure (here a server request,
@@ -1304,42 +1296,6 @@ fn timeout_counts_from_the_start_of_the_command() {
 }
 
 // ----- regressions found in the third review -------------------------------------------------
-
-/// Leftover cleanup used to trust a recorded process-group id, which an
-/// unrelated group can reuse once the app-server's is gone. Now only
-/// processes carrying the label's owner token are touched. The planted
-/// `.pgid` file is the old design's record, naming an unrelated group of ours.
-#[test]
-fn leftover_cleanup_kills_only_processes_carrying_the_owner_token() {
-    let ctx = Ctx::new("happy");
-    let lock = ctx.lock_path(SESSION, "victim");
-    fs::create_dir_all(lock.parent().unwrap()).unwrap();
-
-    let mut bystander = Command::new("sleep").arg("1000").process_group(0).spawn().unwrap();
-    let bystander_pid = bystander.id();
-    let _reap = Reap::new(&[bystander_pid]);
-    let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
-    let pid_ns = fs::read_link("/proc/self/ns/pid").unwrap();
-    let namespace = format!("{}/{}", boot_id.trim(), pid_ns.display());
-    fs::write(lock.with_extension("pgid"), format!("{bystander_pid} {namespace}\n")).unwrap();
-
-    // Unique, so concurrent runs of the suite can't see each other's.
-    let nanos = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos();
-    let token = format!("{:08x}{:024x}", std::process::id(), nanos);
-    fs::write(lock.with_extension("owner"), &token).unwrap();
-    let leftover = Command::new("sleep").arg("1000").env("CEPTION_OWNER", &token).spawn().unwrap();
-    let leftover_pid = leftover.id();
-    let _reap_leftover = Reap::new(&[leftover_pid]);
-    reap_in_background(leftover);
-
-    ctx.ception(&["spawn", "victim", "work"]).run().expect_code(0);
-    assert!(!alive(leftover_pid), "the leftover carrying the owner token survived");
-    assert!(alive(bystander_pid), "an unrelated process was killed");
-    assert_has(&ctx.log(SESSION, "victim"), "killed 1 process(es) a previous daemon left running");
-
-    let _ = bystander.kill();
-    let _ = bystander.wait();
-}
 
 /// A turn that ran to completion before its turn/start reply used to be
 /// waited on forever, or under --timeout reported as a run that never ends.
@@ -1412,18 +1368,6 @@ fn interrupt_reaches_a_known_turn_without_waiting_for_its_start_reply() {
     );
 }
 
-/// Startup used to go ahead without the owner token on disk; now failing to
-/// record it fails startup before any app-server exists.
-#[test]
-fn a_daemon_that_cannot_record_its_owner_token_fails_before_starting_codex() {
-    let ctx = Ctx::new("happy");
-    fs::create_dir_all(ctx.lock_path(SESSION, "token").with_extension("owner")).unwrap();
-
-    let out = ctx.ception(&["spawn", "token", "work"]).run().expect_code(4);
-    assert_has(&out.stderr, "record the app-server owner token");
-    assert_eq!(ctx.fake_state()["appServerStarts"], Value::Null, "an app-server was started");
-}
-
 // ----- regressions found in the fourth review ------------------------------------------------
 
 /// turn/completed names its turn in `turn.id`, not `turnId`; read as
@@ -1480,11 +1424,6 @@ fn still_running_run(out: &Output, label: &str) -> String {
 fn daemon_pid(log: &str) -> u32 {
     let starting = log.lines().rfind(|line| line.starts_with("[daemon] starting ")).expect("starting line");
     starting.rsplit_once(" pid=").expect("pid=").1.parse().unwrap()
-}
-
-/// Reap a child as soon as it dies, so it doesn't linger as a zombie.
-fn reap_in_background(mut child: std::process::Child) {
-    std::thread::spawn(move || child.wait());
 }
 
 /// Pids of the long-lived processes the fake left behind.
