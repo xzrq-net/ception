@@ -350,11 +350,13 @@ impl TurnAccumulator {
                 Vec::new()
             }
             "item/fileChange/outputDelta" => {
-                if truthy(params.get("delta")) {
-                    vec![format!("[edit] {item_id}: {}", truncate(&delta, 500))]
-                } else {
-                    Vec::new()
+                if !truthy(params.get("delta")) {
+                    return Vec::new();
                 }
+                // `full` promises everything the log gets.
+                let line = format!("[edit] {item_id}: {}", truncate(&delta, 500));
+                self.full_lines.push(line.clone());
+                vec![line]
             }
             "thread/tokenUsage/updated" => {
                 self.token_usage = params.get("tokenUsage").cloned().unwrap_or(Value::Null);
@@ -816,6 +818,7 @@ mod tests {
         assert_eq!(started, ["[edit] b.rs, a.rs (started)"]);
         let edit = turn.handle_notification("item/fileChange/outputDelta", &json!({ "itemId": "e1", "delta": "+x" }));
         assert_eq!(edit, ["[edit] e1: +x"]);
+        assert!(turn.build_report(ReportLevel::Full).contains("[edit] e1: +x"));
 
         turn.handle_notification("item/commandExecution/outputDelta", &json!({ "itemId": "c1", "delta": "streamed\n" }));
         let cmd = complete_item(

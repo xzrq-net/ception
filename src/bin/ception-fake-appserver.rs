@@ -87,9 +87,6 @@ fn load_state() -> State {
 }
 
 fn save_state(state: &State) {
-    if let Some(dir) = STATE_PATH.parent() {
-        fs::create_dir_all(dir).expect("create fake state dir");
-    }
     // Atomic rename: tests (and sibling fake instances) poll this file and must
     // never see a partial write. pid-suffixed so concurrent fakes don't collide.
     let mut temp = STATE_PATH.clone().into_os_string();
@@ -99,23 +96,41 @@ fn save_state(state: &State) {
     fs::rename(&temp, &*STATE_PATH).expect("rename fake state");
 }
 
-fn update_state(f: impl FnOnce(&mut State)) {
+/// Every write goes through here. The rename alone keeps readers from seeing a
+/// partial file; the exclusive flock on `${STATE_PATH}.lock` also keeps sibling
+/// fakes sharing the file (several daemons in one test) from dropping each
+/// other's read-modify-write updates.
+fn update_state<T>(f: impl FnOnce(&mut State) -> T) -> T {
+    if let Some(dir) = STATE_PATH.parent() {
+        fs::create_dir_all(dir).expect("create fake state dir");
+    }
+    let mut lock_path = STATE_PATH.clone().into_os_string();
+    lock_path.push(".lock");
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .expect("open fake state lock");
+    lock.lock().expect("lock fake state");
     let mut state = load_state();
-    f(&mut state);
+    let result = f(&mut state);
     save_state(&state);
+    drop(lock); // closing the file releases the flock
+    result
 }
 
 fn create_thread(cwd: Value) -> Thread {
-    let mut state = load_state();
-    let thread = Thread {
-        id: format!("thr_{}", state.next_thread),
-        cwd,
-        created_at: now_seconds(),
-    };
-    state.next_thread += 1;
-    state.threads.push(thread.clone());
-    save_state(&state);
-    thread
+    update_state(|state| {
+        let thread = Thread {
+            id: format!("thr_{}", state.next_thread),
+            cwd,
+            created_at: now_seconds(),
+        };
+        state.next_thread += 1;
+        state.threads.push(thread.clone());
+        thread
+    })
 }
 
 fn find_thread(thread_id: &Value) -> Result<Thread, String> {
@@ -131,11 +146,11 @@ fn find_thread(thread_id: &Value) -> Result<Thread, String> {
 }
 
 fn next_turn() -> String {
-    let mut state = load_state();
-    let turn_id = format!("turn_{}", state.next_turn);
-    state.next_turn += 1;
-    save_state(&state);
-    turn_id
+    update_state(|state| {
+        let turn_id = format!("turn_{}", state.next_turn);
+        state.next_turn += 1;
+        turn_id
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -306,6 +321,19 @@ fn token_usage_updated(thread_id: &str, turn_id: &str) -> Value {
     json!({
         "method": "thread/tokenUsage/updated",
         "params": { "threadId": thread_id, "turnId": turn_id, "tokenUsage": token_usage() }
+    })
+}
+
+fn goal_updated(thread_id: &str, goal: Value) -> Value {
+    json!({ "method": "thread/goal/updated", "params": { "threadId": thread_id, "goal": goal } })
+}
+
+/// The turn error a server-side safeguard ends a goal's turn with.
+fn policy_stop() -> Value {
+    json!({
+        "message": "Turn stopped by a server-side content policy check.",
+        "codexErrorInfo": "policyStop",
+        "additionalDetails": null
     })
 }
 
@@ -619,17 +647,16 @@ impl Server {
                 ));
                 s.send(token_usage_updated(thread_id, turn_id));
                 s.send(json!({
-                "method": "thread/goal/updated",
-                "params": { "threadId": thread_id, "turnId": turn_id, "goal": fixture_goal(thread_id, "complete") }
-            }));
+                    "method": "thread/goal/updated",
+                    "params": { "threadId": thread_id, "turnId": turn_id, "goal": fixture_goal(thread_id, "complete") }
+                }));
                 s.send(turn_completed(thread_id, turn_id, "completed", Value::Null));
                 s.active_turn = None;
             },
         );
     }
 
-    /// The goal set through `thread/goal/set`; panics without one, as the JS
-    /// threw (a timer firing after `thread/goal/clear` would crash both).
+    /// The goal set through `thread/goal/set`; callers make sure there is one.
     fn build_goal(&self, thread_id: &str) -> Value {
         let goal = self.goal.as_ref().expect("no goal set");
         json!({
@@ -646,11 +673,16 @@ impl Server {
 
     fn send_goal_updated(&mut self, thread_id: &str) {
         let goal = self.build_goal(thread_id);
-        self.send(json!({ "method": "thread/goal/updated", "params": { "threadId": thread_id, "goal": goal } }));
+        self.send(goal_updated(thread_id, goal));
     }
 
     fn set_goal_status(&mut self, thread_id: &str, status: &str) {
-        self.goal.as_mut().expect("no goal set").status = json!(status);
+        // Timers call this; the client may have cleared the goal meanwhile.
+        // (The JS fake crashed here.)
+        let Some(goal) = self.goal.as_mut() else {
+            return;
+        };
+        goal.status = json!(status);
         self.send_goal_updated(thread_id);
     }
 
@@ -685,12 +717,7 @@ impl Server {
         self.send(agent_message(thread_id, turn_id, text));
         self.send(token_usage_updated(thread_id, turn_id));
         if stopping {
-            let error = json!({
-                "message": "Turn stopped by a server-side content policy check.",
-                "codexErrorInfo": "policyStop",
-                "additionalDetails": null
-            });
-            self.send(turn_completed(thread_id, turn_id, "failed", error));
+            self.send(turn_completed(thread_id, turn_id, "failed", policy_stop()));
             self.active_turn = None;
             self.set_goal_status(thread_id, "blocked");
             return;
@@ -930,6 +957,21 @@ impl Server {
                 });
             }
 
+            // Codex snapshots the goal, persists it, then answers. In between, the
+            // goal can start a turn and that turn can fail, so the reply arrives
+            // last, carrying the stale (active) snapshot. Plain: one write.
+            // "-split": each message its own write, 20ms apart.
+            (behavior @ ("goal-response-last" | "goal-response-last-split"), None)
+                if self.goal_is_active() =>
+            {
+                let messages = self.goal_turn_before_reply(message, &thread_id);
+                if behavior == "goal-response-last" {
+                    self.with_batch(|s| messages.into_iter().for_each(|m| s.send(m)));
+                } else {
+                    self.send_spaced(messages, 20);
+                }
+            }
+
             (behavior, parked) => {
                 let starts_turn = self.goal_is_active() && parked.is_none();
                 // "goal-instant" answers and runs the whole turn in one write, the
@@ -949,6 +991,38 @@ impl Server {
             }
         }
         Ok(())
+    }
+
+    /// The `goal-response-last` sequence, reply last. State changes land at once
+    /// (the goal ends `blocked`, no turn left running); only the writes may be
+    /// spread out.
+    fn goal_turn_before_reply(&mut self, message: &Value, thread_id: &str) -> Vec<Value> {
+        let stale = self.build_goal(thread_id);
+        let turn = Turn::unprompted(thread_id);
+        let turn_id = &turn.turn_id;
+        self.goal_turns += 1;
+        self.goal.as_mut().expect("goal just set").status = json!("blocked");
+        let blocked = self.build_goal(thread_id);
+        vec![
+            goal_updated(thread_id, stale.clone()),
+            turn_started(thread_id, turn_id),
+            agent_message(thread_id, turn_id, "Goal turn ran before the reply."),
+            token_usage_updated(thread_id, turn_id),
+            turn_completed(thread_id, turn_id, "failed", policy_stop()),
+            goal_updated(thread_id, blocked),
+            reply(message, json!({ "goal": stale })),
+        ]
+    }
+
+    /// Each message its own write, `gap_ms` apart, in order.
+    fn send_spaced(&mut self, messages: Vec<Value>, gap_ms: u64) {
+        let mut rest = messages.into_iter();
+        if let Some(first) = rest.next() {
+            self.send(first);
+        }
+        if rest.len() > 0 {
+            set_timeout(gap_ms, move |s| s.send_spaced(rest.collect(), gap_ms));
+        }
     }
 
     fn answer_goal(&mut self, message: &Value, thread_id: &str) {

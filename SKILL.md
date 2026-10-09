@@ -74,7 +74,7 @@ Start a run in background Bash (heredoc avoids quoting issues; `-` reads the
 prompt from stdin). You are woken when the turn completes:
 
 ```sh
-ception spawn --label impl - <<'EOF'
+ception spawn impl - <<'EOF'
 <goal, bounds, anchors, stopping point>
 EOF
 ```
@@ -91,10 +91,13 @@ EOF
   look in the wrong project and fail with "no live daemon or stored thread".
 - Labels are scoped to the project root (nearest `.jj`/`.git` walking up from
   the shell's cwd, so any subdirectory of the project reaches the same labels)
-  and to this Claude Code session — another session's labels are invisible to
-  `send` and can't collide with yours. After the user resumes a session, `send`
-  transparently adopts the old session's label and resumes its thread; if it
-  instead fails with "belongs to live session", pick a different label.
+  and to the session. In Claude Code that is the session id, which survives a
+  resume: a resumed session finds its labels and `send` revives their threads.
+  Another session's labels are invisible to yours and can't collide. Outside
+  Claude Code every caller in a project shares one `default` session unless
+  `CEPTION_SESSION` names one. If `send` fails because the label belongs to
+  another session, use a different label; take it over with
+  `CEPTION_SESSION=<that id>` only if that session is done with it.
 - Follow-ups and course corrections go to the same thread:
   `ception send impl "..."`. If the turn is still running this steers it and
   returns immediately; if idle it starts a new turn and blocks. Steer when you

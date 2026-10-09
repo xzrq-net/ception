@@ -514,7 +514,11 @@ impl Daemon {
     async fn on_event(&mut self, event: Event) {
         match event {
             Event::Command { request, reply } => {
-                self.last_activity = Instant::now();
+                // Probes (list, watch on an idle daemon) don't count as use,
+                // or anything polling `ception list` would keep daemons alive.
+                if !matches!(request, Request::Status | Request::Watch { .. }) {
+                    self.last_activity = Instant::now();
+                }
                 let report = match &request {
                     Request::Send { report, .. } | Request::Goal { report, .. } | Request::Watch { report } => *report,
                     _ => ReportLevel::Brief,
@@ -533,7 +537,6 @@ impl Daemon {
             }
             Event::Disconnected => {
                 self.connections = self.connections.saturating_sub(1);
-                self.last_activity = Instant::now();
             }
             Event::GraceExpired(generation) => {
                 if self.hold == Some(generation) {
