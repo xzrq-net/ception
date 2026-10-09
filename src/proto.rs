@@ -34,6 +34,8 @@ pub enum GoalAction {
 }
 
 /// Zero or more `Accepted`, then exactly one `Result`, `Error` or `Refused`.
+// One per message on the wire; boxing the outcome would buy nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Reply {

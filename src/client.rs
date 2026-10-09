@@ -361,11 +361,10 @@ fn finish(reply: Reply, label: &str) -> Result<u8> {
     }
     // A turn report says what happened in the turn; the goal says whether
     // codex is going to keep going. Both are needed to know if the run is over.
-    if outcome.turn_id.is_some() {
-        if let Some(goal) = &outcome.goal {
+    if outcome.turn_id.is_some()
+        && let Some(goal) = &outcome.goal {
             println!("\n{}", format_goal(Some(goal), Some(label)));
         }
-    }
     Ok(status_exit_code(&outcome.status) as u8)
 }
 

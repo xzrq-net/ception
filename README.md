@@ -86,13 +86,16 @@ running after `--timeout`.
 ### Harnesses without background shells
 
 A blocking call that outlives the harness's tool timeout gets killed; the
-daemon and its turn carry on. `--timeout SECS` makes that explicit: the client
-waits at most SECS (or until the turn has started, if that takes longer), then
-prints `still running: run N; reattach with ception watch LABEL --run N` and
-exits 5. `--timeout 0` returns as soon as the turn is running. `watch --run N`
-blocks on that run if it is still going and otherwise delivers its retained
-report (the daemon keeps the last 16). Failures before the turn starts are
-reported directly, as without the flag.
+daemon and its turn carry on. `--timeout SECS` makes that explicit: SECS
+after the command started (daemon startup included), once the turn is
+running, the client prints
+`still running: run 3f9a.1; reattach with ception watch LABEL --run 3f9a.1`
+and exits 5. `--timeout 0` returns as soon as the turn is running.
+`watch --run ID` blocks on that run if it is still going and otherwise
+delivers its retained report, or the failure that ended it (the daemon keeps
+the last 16). Run ids carry the daemon's generation, so a restarted daemon
+refuses an old one rather than mistake it for new work. Failures before the
+turn starts are reported directly, as without the flag.
 
 ## Goals: runs codex drives itself
 
@@ -199,7 +202,13 @@ startup error.
 A daemon holds its label's lock (`flock`) for its whole life; that is the
 one-daemon-per-label guarantee, and the kernel releases it however the daemon
 dies. It owns the app-server's process group and takes it down on exit,
-codex's shells and subagents included, before releasing the lock.
+codex's shells and subagents included, before releasing the lock. A daemon
+killed outright (SIGKILL) can't do that, so the group id is recorded beside
+the lock and the label's next daemon kills any leftover group before it
+starts (when both share a pid namespace).
+
+A daemon on its way out refuses new work; `send` and `goal` then wait for it
+to release the label and start a successor.
 
 A daemon exits when:
 
@@ -221,8 +230,9 @@ Under `${XDG_STATE_HOME:-~/.local/state}/ception-rs/`:
   the label's daemon while it holds the lock.
 - `projects/<projhash>/<session>/<label>.log`: the turn log (tail with
   `ception watch --follow LABEL`).
-- `run/<key>.lock`, `run/<key>.sock`: label locks and sockets, `key` a hash of
-  project, session and label. Kept under the state root, not
+- `run/<key>.lock`, `run/<key>.sock`, `run/<key>.pgid`: label locks, sockets
+  and the live app-server's process group, `key` a hash of project, session
+  and label. Kept under the state root, not
   `$XDG_RUNTIME_DIR`, so containers on one kernel sharing the state root share
   the locks and can reach each other's daemons.
 

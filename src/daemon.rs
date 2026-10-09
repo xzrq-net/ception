@@ -160,8 +160,8 @@ async fn kill_leftover_group(path: &Path, log: &mut Log) {
     let mut fields = text.split_whitespace();
     let pgid: Option<libc::pid_t> = fields.next().and_then(|pgid| pgid.parse().ok());
     let namespace = fields.next().unwrap_or_default();
-    if let Some(pgid) = pgid.filter(|&pgid| pgid > 1 && namespace == procfs::namespace_id()) {
-        if unsafe { libc::kill(-pgid, 0) } == 0 {
+    if let Some(pgid) = pgid.filter(|&pgid| pgid > 1 && namespace == procfs::namespace_id())
+        && unsafe { libc::kill(-pgid, 0) } == 0 {
             log.line(&format!("[daemon] killing leftover app-server process group {pgid}"));
             for (signal, wait) in [(libc::SIGTERM, 2000), (libc::SIGKILL, 1000)] {
                 unsafe { libc::kill(-pgid, signal) };
@@ -171,7 +171,6 @@ async fn kill_leftover_group(path: &Path, log: &mut Log) {
                 }
             }
         }
-    }
     let _ = std::fs::remove_file(path);
 }
 
@@ -337,7 +336,7 @@ struct Retained {
 
 enum RetainedOutcome {
     /// With the goal as it stood when the run settled.
-    Report { acc: TurnAccumulator, goal: Option<Value> },
+    Report { acc: Box<TurnAccumulator>, goal: Option<Value> },
     /// The run ended in an infrastructure failure, as its clients were told.
     Failed(String),
 }
@@ -470,13 +469,12 @@ impl Daemon {
     }
 
     async fn serve(mut self, mut signals: Signals) {
-        if self.thread_id.is_some() {
-            if let Err(error) = self.persist() {
+        if self.thread_id.is_some()
+            && let Err(error) = self.persist() {
                 self.log(&format!("[state] {error:#}; shutting down"));
                 self.shutdown("label not persisted").await;
                 return;
             }
-        }
         let mut app_events = self.app_events.take().expect("serve runs once");
         let mut events = self.event_rx.take().expect("serve runs once");
         let listener = self.listener.take().expect("serve runs once");
@@ -935,13 +933,12 @@ impl Daemon {
     fn interrupt(&mut self, client: Client) -> Result<()> {
         // Paused even with no turn running: a held run or a goal about to
         // start its next turn must stop too.
-        if self.goal_active() {
-            if let Some(thread_id) = self.thread_id.clone() {
+        if self.goal_active()
+            && let Some(thread_id) = self.thread_id.clone() {
                 let params = json!({ "threadId": thread_id, "status": "paused" });
                 let pending = Pending::InterruptPause { client, goal_updates: self.goal_updates };
                 return self.request("thread/goal/set", params, pending);
             }
-        }
         self.interrupt_current(client, false)
     }
 
@@ -985,11 +982,10 @@ impl Daemon {
             AppEvent::Message(message) => match Incoming::classify(message.clone()) {
                 Some(Incoming::Notification { method, params }) => self.on_notification(&method, &params, &message),
                 Some(Incoming::Response { id, outcome }) => {
-                    if let Some(pending) = self.pending.remove(&id) {
-                        if let Err(error) = self.on_response(pending, outcome) {
+                    if let Some(pending) = self.pending.remove(&id)
+                        && let Err(error) = self.on_response(pending, outcome) {
                             self.log(&format!("[error] {error:#}"));
                         }
-                    }
                 }
                 Some(Incoming::Request { id, method }) => self.on_server_request(id, &method, &message),
                 None => self.log(&format!("[debug] unrecognised message {message}")),
@@ -1182,14 +1178,13 @@ impl Daemon {
     /// mid-turn into it), or the turn codex is about to start.
     fn attach_goal_client(&mut self, client: Client, turns_settled_before: u64) {
         let goal_active = self.goal_active();
-        if self.turns_settled > turns_settled_before && !goal_active {
-            if let Some(Retained { outcome: RetainedOutcome::Report { acc, .. }, .. }) = self.settled.back() {
+        if self.turns_settled > turns_settled_before && !goal_active
+            && let Some(Retained { outcome: RetainedOutcome::Report { acc, .. }, .. }) = self.settled.back() {
                 let reply = turn_reply(acc, self.goal.clone(), client.report);
                 self.log("[goal] the goal's turn ran and stopped while it was being set");
                 client.answer(reply);
                 return;
             }
-        }
         if let Some(turn) = &mut self.active {
             turn.clients.push(client);
             return;
@@ -1208,11 +1203,10 @@ impl Daemon {
         let ours = self.thread_id.is_some() && params["threadId"].as_str() == self.thread_id.as_deref();
         match method {
             "thread/tokenUsage/updated" => {
-                if let Some(turn) = &mut self.active {
-                    if ours && params["turnId"].as_str() == Some(turn.turn_id.as_str()) {
+                if let Some(turn) = &mut self.active
+                    && ours && params["turnId"].as_str() == Some(turn.turn_id.as_str()) {
                         turn.acc.handle_notification(method, params);
                     }
-                }
                 return;
             }
             "account/rateLimits/updated" => {
@@ -1435,7 +1429,7 @@ impl Daemon {
             let reply = turn_reply(&turn.acc, self.goal.clone(), client.report);
             client.answer(reply);
         }
-        self.retain(turn.op, RetainedOutcome::Report { acc: turn.acc, goal: self.goal.clone() });
+        self.retain(turn.op, RetainedOutcome::Report { acc: Box::new(turn.acc), goal: self.goal.clone() });
         self.turns_settled += 1;
         // With the goal stopped no further turn is coming.
         if !self.goal_active() {
@@ -1501,14 +1495,13 @@ impl Daemon {
             let Some(event) = event else {
                 return;
             };
-            if let AppEvent::Message(message) = &event {
-                if message.get("method").is_none() && message.get("id").and_then(Value::as_u64) == Some(id) {
+            if let AppEvent::Message(message) = &event
+                && message.get("method").is_none() && message.get("id").and_then(Value::as_u64) == Some(id) {
                     if let Some(error) = message.get("error") {
                         self.log(&format!("[interrupt] {}", error["message"].as_str().unwrap_or("failed")));
                     }
                     return;
                 }
-            }
             let closed = matches!(event, AppEvent::Closed(_));
             self.on_app(event).await;
             if closed {
