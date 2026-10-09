@@ -116,7 +116,7 @@ impl Ctx {
     // ----- on-disk layout --------------------------------------------------
 
     pub fn state_root(&self) -> PathBuf {
-        self.home.join(".local/state/ception-rs")
+        self.home.join(".local/state/ception")
     }
 
     pub fn run_dir(&self) -> PathBuf {

@@ -233,7 +233,7 @@ and the next `send` respawns and resumes.
 
 ## Files
 
-Under `${XDG_STATE_HOME:-~/.local/state}/ception-rs/`:
+Under `${XDG_STATE_HOME:-~/.local/state}/ception/`:
 
 - `projects/<projhash>/<session>/<label>.json`: the label's record (project
   path, thread id, model, effort); its mtime is "last used". Written only by

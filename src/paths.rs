@@ -7,9 +7,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 
-/// Directory name under the state and runtime roots. `ception-rs` while the JS
-/// version is still in use; flips to `ception` at switchover.
-pub const APP_DIR: &str = "ception-rs";
+/// Directory name under the state root.
+pub const APP_DIR: &str = "ception";
 
 const VCS_MARKERS: [&str; 3] = [".jj", ".git", ".hg"];
 
