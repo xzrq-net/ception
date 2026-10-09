@@ -40,12 +40,12 @@
 
             # The check phase runs the integration suite against the fake
             # app-server, which is a test fixture and not shipped. npx on
-            # PATH for the default codex command (npx -y @openai/codex);
-            # suffixed so the user's own node toolchain wins.
+            # PATH for the default codex command (npx -y @openai/codex), tail
+            # for `watch --follow`; suffixed so the user's own tools win.
             postInstall = ''
               rm $out/bin/ception-fake-appserver
               wrapProgram $out/bin/ception \
-                --suffix PATH : ${lib.makeBinPath [ pkgs.nodejs ]}
+                --suffix PATH : ${lib.makeBinPath [ pkgs.nodejs pkgs.coreutils ]}
             '';
 
             meta = {

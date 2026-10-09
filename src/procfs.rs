@@ -21,6 +21,14 @@ pub fn starttime(pid: u32) -> Result<u64> {
     Ok(field.parse()?)
 }
 
+/// Which pid namespace pids we write down belong to: boot id plus the pid
+/// namespace inode. Containers sharing the state dir have their own.
+pub fn namespace_id() -> String {
+    let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap_or_default();
+    let ns = std::fs::read_link("/proc/self/ns/pid").unwrap_or_default();
+    format!("{}/{}", boot.trim(), ns.display())
+}
+
 /// Becomes ready when the watched process exits.
 pub struct PidWatch {
     fd: AsyncFd<OwnedFd>,

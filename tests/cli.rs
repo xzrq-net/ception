@@ -1100,11 +1100,33 @@ fn goal_timeout_hands_back_the_goal_turns_run() {
 
 #[test]
 fn watch_run_of_an_unknown_run_fails_with_exit_4() {
-    let ctx = Ctx::new("happy");
+    let ctx = Ctx::new("steer");
 
-    ctx.ception(&["spawn", "quiet", "first"]).run().expect_code(0);
+    let out = ctx.ception(&["spawn", "quiet", "--timeout", "0", "slow turn"]).run().expect_code(5);
+    let run = still_running_run(&out, "quiet");
+    let (generation, _) = run.split_once('.').unwrap();
+
+    let out = ctx.ception(&["watch", "quiet", "--run", &format!("{generation}.999")]).timeout(secs(3)).run().expect_code(4);
+    assert_has(&out.stderr, "not retained");
     let out = ctx.ception(&["watch", "quiet", "--run", "999"]).timeout(secs(3)).run().expect_code(4);
-    assert_has(&out.stderr, "not known");
+    assert_has(&out.stderr, "not from this daemon");
+}
+
+#[test]
+fn a_run_id_from_before_a_restart_is_refused_not_reused() {
+    let ctx = Ctx::new("steer");
+
+    let out = ctx.ception(&["spawn", "again", "--timeout", "0", "slow turn"]).run().expect_code(5);
+    let old = still_running_run(&out, "again");
+    ctx.ception(&["kill", "again"]).run().expect_code(0);
+
+    // The revived daemon numbers its runs afresh; the old id must not name
+    // its new work.
+    let out = ctx.ception(&["send", "again", "--timeout", "0", "slow turn"]).run().expect_code(5);
+    let new = still_running_run(&out, "again");
+    assert_ne!(old, new);
+    let out = ctx.ception(&["watch", "again", "--run", &old]).timeout(secs(3)).run().expect_code(4);
+    assert_has(&out.stderr, "not from this daemon");
 }
 
 #[test]
@@ -1147,7 +1169,9 @@ fn still_running_run(out: &Output, label: &str) -> String {
     let lines = out.lines_starting("still running: run ");
     assert_eq!(lines.len(), 1, "{out}");
     let run = lines[0]["still running: run ".len()..].split(';').next().unwrap().to_string();
-    assert!(run.parse::<u64>().is_ok(), "{out}");
+    // `<daemon generation>.<n>`
+    let (generation, n) = run.split_once('.').unwrap_or_else(|| panic!("malformed run id in:\n{out}"));
+    assert!(generation.len() == 4 && n.parse::<u64>().is_ok(), "{out}");
     assert_eq!(lines[0], format!("still running: run {run}; reattach with `ception watch {label} --run {run}`"));
     run
 }

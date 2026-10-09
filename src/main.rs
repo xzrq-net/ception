@@ -117,7 +117,7 @@ enum Command {
         /// A run reported by `--timeout`: block on it, or print its retained
         /// report if it already settled.
         #[arg(long)]
-        run: Option<u64>,
+        run: Option<String>,
         #[command(flatten)]
         wait: WaitArgs,
     },
@@ -140,8 +140,9 @@ struct WaitArgs {
     at: AtArgs,
     #[arg(long, value_enum, default_value_t)]
     report: ReportLevel,
-    /// Once the turn has started, stop waiting after SECS and exit 5; the
-    /// turn keeps running (reattach with `watch --run`).
+    /// Stop waiting after SECS (counted from the start of the command, but
+    /// never before the turn is running) and exit 5; the turn keeps running
+    /// (reattach with `watch --run`).
     #[arg(long, value_name = "SECS")]
     timeout: Option<u64>,
 }

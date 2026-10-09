@@ -54,6 +54,13 @@ pub async fn run(command: Command) -> Result<u8> {
     }
 }
 
+impl WaitArgs {
+    /// Fixed when the command starts, so daemon startup counts against it.
+    fn deadline(&self) -> Option<Instant> {
+        self.timeout.map(|secs| Instant::now() + Duration::from_secs(secs))
+    }
+}
+
 impl AtArgs {
     fn dir(&self) -> Result<PathBuf> {
         match &self.cwd {
@@ -264,22 +271,30 @@ async fn revive(scope: &Scope, label: &str, paths: &LabelPaths) -> Result<Daemon
     ensure_daemon(scope, label, paths, &Revival::Resume).await
 }
 
-/// Send a turn-bearing request and relay its outcome. With a timeout, give
-/// up waiting once it has passed and the turn is known to be running.
-async fn converse(socket: &Path, request: &Request, label: &str, timeout: Option<u64>) -> Result<u8> {
-    let stream = UnixStream::connect(socket).await?;
+enum Conversation {
+    Done(u8),
+    /// The daemon didn't take the request (it is going away): wait for the
+    /// label to come free and try again.
+    Refused,
+}
+
+/// Send a turn-bearing request and relay its outcome. With a deadline, stop
+/// waiting once it has passed and the turn is known to be running.
+async fn converse(socket: &Path, request: &Request, label: &str, deadline: Option<Instant>) -> Result<Conversation> {
+    let Ok(stream) = UnixStream::connect(socket).await else {
+        return Ok(Conversation::Refused);
+    };
     let (read, mut write) = stream.into_split();
     let mut line = serde_json::to_vec(request)?;
     line.push(b'\n');
     write.write_all(&line).await?;
     let mut lines = BufReader::new(read).lines();
-    let deadline = timeout.map(|secs| Instant::now() + Duration::from_secs(secs));
-    let mut run = None;
+    let mut run: Option<String> = None;
     loop {
-        let next = match (deadline, run) {
+        let next = match (deadline, &run) {
             (Some(deadline), Some(run)) => match tokio::time::timeout_at(deadline, lines.next_line()).await {
                 Ok(next) => next?,
-                Err(_) => return Ok(still_running(label, run)),
+                Err(_) => return Ok(Conversation::Done(still_running(label, run))),
             },
             _ => lines.next_line().await?,
         };
@@ -289,23 +304,55 @@ async fn converse(socket: &Path, request: &Request, label: &str, timeout: Option
         match serde_json::from_str(&next).context("daemon reply")? {
             Reply::Accepted { run: accepted } => {
                 if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                    return Ok(still_running(label, accepted));
+                    return Ok(Conversation::Done(still_running(label, &accepted)));
                 }
                 run = Some(accepted);
             }
-            reply => return finish(reply, label),
+            Reply::Refused { .. } => return Ok(Conversation::Refused),
+            reply => return finish(reply, label).map(Conversation::Done),
         }
     }
 }
 
-fn still_running(label: &str, run: u64) -> u8 {
+/// Converse, reviving the label's daemon first and again whenever a daemon
+/// on its way out refuses the request.
+async fn converse_reviving(
+    scope: &Scope,
+    label: &str,
+    paths: &LabelPaths,
+    request: &Request,
+    deadline: Option<Instant>,
+    revival: impl Fn() -> Option<Revival>,
+) -> Result<u8> {
+    let mut printed_log = false;
+    for _ in 0..3 {
+        let daemon = match revival() {
+            Some(revival) => ensure_daemon(scope, label, paths, &revival).await?,
+            None => revive(scope, label, paths).await?,
+        };
+        if !printed_log {
+            println!("log: {}", daemon.log.display());
+            printed_log = true;
+        }
+        match converse(&paths.socket, request, label, deadline).await? {
+            Conversation::Done(code) => return Ok(code),
+            Conversation::Refused => {
+                let free_by = Instant::now() + spawn_timeout();
+                wait_until(free_by, || !store::lock_held(&paths.lock)).await;
+            }
+        }
+    }
+    bail!("the daemon for {label} kept refusing work while shutting down")
+}
+
+fn still_running(label: &str, run: &str) -> u8 {
     println!("still running: run {run}; reattach with `ception watch {label} --run {run}`");
     5
 }
 
 fn finish(reply: Reply, label: &str) -> Result<u8> {
     let outcome = match reply {
-        Reply::Error { message } => bail!(message),
+        Reply::Error { message } | Reply::Refused { message } => bail!(message),
         Reply::Accepted { .. } => bail!("daemon sent no final reply"),
         Reply::Result(outcome) => outcome,
     };
@@ -350,6 +397,7 @@ async fn spawn(
     prompt: Vec<String>,
 ) -> Result<u8> {
     let prompt = read_text(prompt, "prompt", "spawn")?;
+    let deadline = wait.deadline();
     let scope = Scope::resolve(&wait.at)?;
     let paths = scope.label(label)?;
     scope.gc();
@@ -362,19 +410,21 @@ async fn spawn(
     }
     println!("log: {}", paths.log.display());
     let request = Request::Send { prompt, report: wait.report };
-    converse(&paths.socket, &request, label, wait.timeout).await
+    match converse(&paths.socket, &request, label, deadline).await? {
+        Conversation::Done(code) => Ok(code),
+        Conversation::Refused => bail!("the new daemon for {label} refused the turn; see {}", paths.log.display()),
+    }
 }
 
 async fn send(label: &str, wait: &WaitArgs, prompt: Vec<String>) -> Result<u8> {
     let prompt = read_text(prompt, "prompt", "send")?;
+    let deadline = wait.deadline();
     let scope = Scope::resolve(&wait.at)?;
     let paths = scope.label(label)?;
     scope.gc();
-    let daemon = revive(&scope, label, &paths).await?;
-    println!("log: {}", daemon.log.display());
     // The daemon decides atomically: steer if a turn is live, else start one.
     let request = Request::Send { prompt, report: wait.report };
-    converse(&paths.socket, &request, label, wait.timeout).await
+    converse_reviving(&scope, label, &paths, &request, deadline, || None).await
 }
 
 /// Setting or resuming a goal blocks on the run codex starts for it; pause,
@@ -386,21 +436,27 @@ async fn goal(label: &str, action: GoalAction, wait: &WaitArgs, objective: Vec<S
         _ if !objective.is_empty() => bail!("goal: an objective only goes with setting a goal"),
         _ => None,
     };
+    let deadline = wait.deadline();
     let scope = Scope::resolve(&wait.at)?;
     let paths = scope.label(label)?;
     scope.gc();
-    let fresh = action == GoalAction::Set && !paths.record.exists() && status(&paths).await.is_none();
-    let daemon = if fresh {
-        let revival = Revival::Fresh { model: None, effort: None };
-        ensure_daemon(&scope, label, &paths, &revival).await?
-    } else {
-        revive(&scope, label, &paths).await?
+    let request = Request::Goal { action, objective, report: wait.report };
+    // A label with no thread yet gets a fresh daemon.
+    let revival = || {
+        (action == GoalAction::Set && !paths.record.exists()).then_some(Revival::Fresh { model: None, effort: None })
     };
     if matches!(action, GoalAction::Set | GoalAction::Resume) {
-        println!("log: {}", daemon.log.display());
+        return converse_reviving(&scope, label, &paths, &request, deadline, revival).await;
     }
-    let request = Request::Goal { action, objective, report: wait.report };
-    converse(&paths.socket, &request, label, wait.timeout).await
+    // Pause, show and clear answer at once and print no log line.
+    match revival() {
+        Some(revival) => ensure_daemon(&scope, label, &paths, &revival).await?,
+        None => revive(&scope, label, &paths).await?,
+    };
+    match converse(&paths.socket, &request, label, None).await? {
+        Conversation::Done(code) => Ok(code),
+        Conversation::Refused => bail!("the daemon for {label} is shutting down; try again"),
+    }
 }
 
 async fn interrupt(label: &str, at: &AtArgs) -> Result<u8> {
@@ -486,7 +542,8 @@ fn timestamp(time: SystemTime) -> String {
         .unwrap_or_else(|_| "-".into())
 }
 
-async fn watch(label: &str, follow: bool, run: Option<u64>, wait: &WaitArgs) -> Result<u8> {
+async fn watch(label: &str, follow: bool, run: Option<String>, wait: &WaitArgs) -> Result<u8> {
+    let deadline = wait.deadline();
     let scope = Scope::resolve(&wait.at)?;
     let paths = scope.label(label)?;
     if follow {
@@ -511,5 +568,8 @@ async fn watch(label: &str, follow: bool, run: Option<u64>, wait: &WaitArgs) -> 
     };
     println!("log: {}", daemon.log.display());
     let request = Request::Watch { report: wait.report, run };
-    converse(&paths.socket, &request, label, wait.timeout).await
+    match converse(&paths.socket, &request, label, deadline).await? {
+        Conversation::Done(code) => Ok(code),
+        Conversation::Refused => bail!("no live daemon for {label} (it is shutting down)"),
+    }
 }

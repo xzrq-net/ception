@@ -127,12 +127,13 @@ impl AppServer {
         let pid = child.id().context("app-server pid")?;
         let exit = PidWatch::child(pid)?;
         let (tx, rx) = unbounded_channel();
+        let tx_writer = tx.clone();
         let stderr_tail = Arc::new(Mutex::new(String::new()));
         tokio::spawn(read_stdout(child.stdout.take().expect("piped"), tx.clone(), exit));
         let (stderr_eof, stderr_done) = oneshot::channel();
         tokio::spawn(read_stderr(child.stderr.take().expect("piped"), tx, stderr_tail.clone(), stderr_eof));
         let (writer, lines) = unbounded_channel();
-        tokio::spawn(write_stdin(child.stdin.take().expect("piped"), lines));
+        tokio::spawn(write_stdin(child.stdin.take().expect("piped"), lines, tx_writer));
         let server = Self {
             child,
             pgid: pid as libc::pid_t,
@@ -143,6 +144,11 @@ impl AppServer {
             closed: false,
         };
         Ok((server, rx))
+    }
+
+    /// The server's process group, led by the server itself.
+    pub fn pgid(&self) -> libc::pid_t {
+        self.pgid
     }
 
     pub fn request(&mut self, method: &str, params: Value) -> Result<u64> {
@@ -282,9 +288,12 @@ impl Drop for AppServer {
     }
 }
 
-async fn write_stdin(mut stdin: ChildStdin, mut lines: UnboundedReceiver<Vec<u8>>) {
+/// A failed write means the server stopped reading for good: report it as
+/// gone, or requests already sent would wait forever.
+async fn write_stdin(mut stdin: ChildStdin, mut lines: UnboundedReceiver<Vec<u8>>, events: UnboundedSender<AppEvent>) {
     while let Some(line) = lines.recv().await {
-        if stdin.write_all(&line).await.is_err() {
+        if let Err(error) = stdin.write_all(&line).await {
+            let _ = events.send(AppEvent::Closed(Some(format!("write to codex app-server: {error}"))));
             return;
         }
     }

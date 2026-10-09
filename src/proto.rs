@@ -19,7 +19,7 @@ pub enum Request {
     Interrupt,
     /// Block until the live turn settles; answers at once when idle. With a
     /// run id: that run, live or retained.
-    Watch { report: ReportLevel, run: Option<u64> },
+    Watch { report: ReportLevel, run: Option<String> },
     Shutdown,
 }
 
@@ -33,15 +33,17 @@ pub enum GoalAction {
     Clear,
 }
 
-/// Zero or more `Accepted`, then exactly one `Result` or `Error`.
+/// Zero or more `Accepted`, then exactly one `Result`, `Error` or `Refused`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Reply {
     /// The request's turn is running as run `run`; the final reply follows
     /// when it settles.
-    Accepted { run: u64 },
+    Accepted { run: String },
     Result(Outcome),
     Error { message: String },
+    /// Not acted on (the daemon is shutting down); safe to retry elsewhere.
+    Refused { message: String },
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
