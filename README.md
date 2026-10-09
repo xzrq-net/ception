@@ -10,19 +10,19 @@ synchronization mechanism.
 
 ## Install
 
-The repository is a Claude Code plugin: `.claude-plugin/plugin.json`, the
-skill in `skills/ception/`, and `bin/`, which Claude Code adds to the Bash
-tool's PATH while the plugin is enabled (so `ception` resolves with no extra
-symlink). Clone it into the user-level skills directory:
+`flake.nix` packages the CLI (Linux only: session tracking reads `/proc`).
+`nix build` runs the test suite as its check phase. With home-manager:
 
-```sh
-git clone git@github.com:xzrq-net/ception.git ~/.claude/skills/ception
+```nix
+inputs.ception.url = "github:xzrq-net/ception";
+# ...
+home.packages = [ inputs.ception.packages.${pkgs.stdenv.hostPlatform.system}.default ];
 ```
 
-It loads on the next session as `ception@skills-dir` (`/reload-plugins`
-picks up changes to non-skill components without restarting); update with
-`git pull`. For shells outside Claude Code, run `bin/ception` directly or
-put the clone's `bin/` on your PATH.
+Then tell the agent about it; see `ception skill` below. Without nix, run
+`bin/ception.mjs` with `node` on PATH. Either way the default codex command
+is `npx -y @openai/codex app-server`; the package puts its own `npx` at the
+end of PATH.
 
 ## Usage
 
@@ -258,18 +258,5 @@ along with their log files.
 codex auth needed. `scripts/smoke.sh` is a manual end-to-end check against
 real codex.
 
-### Deploying local work
-
-The live install is the clone at `~/.claude/skills/ception`, whose `origin`
-points at this working repo. To ship commits:
-
-```sh
-jj bookmark set master -r <rev>   # point master at what should ship
-scripts/deploy.sh                 # reset the clone to master, run its tests
-```
-
-The script refuses if the clone is dirty and prints the rollback command if
-tests fail at the new rev. New invocations pick up `bin/` and skill changes
-immediately; daemons that are already running keep their old code until they
-exit. `/reload-plugins` refreshes other plugin components without restarting
-the session.
+Daemons that are already running keep the code they started with until they
+exit; new invocations get the new build.

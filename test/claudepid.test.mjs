@@ -12,11 +12,25 @@ async function ppidOf(pid) {
   return Number(stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/)[1]);
 }
 
+// The nix build sandbox has no /usr/bin/env, so shebangs name bash directly.
+async function whichBash() {
+  for (const dir of process.env.PATH.split(path.delimiter)) {
+    const candidate = path.join(dir, "bash");
+    try {
+      await fs.access(candidate, fs.constants.X_OK);
+      return candidate;
+    } catch {
+      // Not here.
+    }
+  }
+  throw new Error("bash not on PATH");
+}
+
 // Two nested claude-looking processes with a leaf below them.
 async function nestedClaudeChain() {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "ception-pid-"));
   const script = path.join(dir, "claude");
-  await fs.writeFile(script, '#!/usr/bin/env bash\n"$@"\n');
+  await fs.writeFile(script, `#!${await whichBash()}\n"$@"\n`);
   await fs.chmod(script, 0o755);
 
   // write, not console.log: the latter inspects the number and can colour it.
