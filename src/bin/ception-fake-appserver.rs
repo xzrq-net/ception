@@ -913,6 +913,36 @@ impl Server {
                 }
                 self.send(reply(message, started(&turn)));
             }
+            // Codex moves on to turn B before A's completion arrives; B ends
+            // 300ms later.
+            "late-completion" => {
+                let Turn { thread_id, turn_id, .. } = &turn;
+                let next = Turn::unprompted(thread_id);
+                self.send(reply(message, started(&turn)));
+                self.send(turn_started(thread_id, turn_id));
+                self.send(turn_started(thread_id, &next.turn_id));
+                self.send(turn_completed(thread_id, turn_id, "completed", Value::Null));
+                self.active_turn = Some(next.clone());
+                set_timeout(300, move |s| {
+                    s.send(agent_message(&next.thread_id, &next.turn_id, "B finished."));
+                    s.send(turn_completed(&next.thread_id, &next.turn_id, "completed", Value::Null));
+                    s.active_turn = None;
+                });
+            }
+            // The turn runs and ends, then 17 turns of codex's own do, pushing
+            // it out of the daemon's retained runs; only then the reply.
+            "finished-then-evicted" => {
+                let Turn { thread_id, turn_id, .. } = &turn;
+                self.send(turn_started(thread_id, turn_id));
+                self.send(agent_message(thread_id, turn_id, "Finished long before the reply."));
+                self.send(turn_completed(thread_id, turn_id, "completed", Value::Null));
+                for _ in 0..17 {
+                    let other = Turn::unprompted(thread_id);
+                    self.send(turn_started(thread_id, &other.turn_id));
+                    self.send(turn_completed(thread_id, &other.turn_id, "completed", Value::Null));
+                }
+                self.send(reply(message, started(&turn)));
+            }
             // The turn starts at once; the reply naming it comes two seconds
             // late, marked like slow-turn-start's.
             "started-before-slow-reply" => {

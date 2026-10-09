@@ -1424,6 +1424,29 @@ fn a_daemon_that_cannot_record_its_owner_token_fails_before_starting_codex() {
     assert_eq!(ctx.fake_state()["appServerStarts"], Value::Null, "an app-server was started");
 }
 
+// ----- regressions found in the fourth review ------------------------------------------------
+
+/// turn/completed names its turn in `turn.id`, not `turnId`; read as
+/// unnamed, a late completion of the previous turn used to settle the run
+/// that had moved on to turn B, reporting before B had done anything.
+#[test]
+fn a_late_completion_of_the_previous_turn_does_not_settle_the_continuation() {
+    let ctx = Ctx::new("late-completion");
+
+    let out = ctx.ception(&["spawn", "late", "work"]).run().expect_code(0);
+    assert_has(&out.stdout, "B finished.");
+}
+
+/// A turn that ended so long before its turn/start reply that its report
+/// had aged out of retention used to be tracked again as running, forever.
+#[test]
+fn a_turn_whose_report_aged_out_before_its_start_reply_is_not_waited_on() {
+    let ctx = Ctx::new("finished-then-evicted");
+
+    let out = ctx.ception(&["spawn", "evicted", "work"]).timeout(secs(10)).run().expect_code(4);
+    assert_has(&out.stderr, "finished before codex confirmed it");
+}
+
 // ----- helpers ---------------------------------------------------------------------------
 
 fn requests<'a>(state: &'a Value, method: &'a str) -> impl Iterator<Item = &'a Value> + 'a {
