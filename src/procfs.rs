@@ -1,8 +1,10 @@
 //! Process primitives: identity via /proc starttime, death notification via
 //! pidfd, and detaching the daemon from the client's process tree.
 
+use std::collections::{HashMap, HashSet};
 use std::io;
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::time::Duration;
 use std::os::unix::process::CommandExt;
 
 use anyhow::{Context, Result};
@@ -26,9 +28,40 @@ pub fn starttime(pid: u32) -> Result<u64> {
 /// end up with.
 pub const OWNER_VAR: &str = "CEPTION_OWNER";
 
+fn carries(pid: u32, marker: &[u8]) -> bool {
+    std::fs::read(format!("/proc/{pid}/environ"))
+        .is_ok_and(|environ| environ.split(|&b| b == 0).any(|var| var == marker))
+}
+
+/// A process pinned by a pidfd: signals sent through it can't reach a
+/// process that later reuses the pid.
+pub struct Pinned {
+    pub pid: u32,
+    fd: OwnedFd,
+}
+
+impl Pinned {
+    fn open(pid: u32) -> Option<Self> {
+        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+        (raw >= 0).then(|| Self { pid, fd: unsafe { OwnedFd::from_raw_fd(raw as i32) } })
+    }
+
+    /// A pidfd turns readable once its process has exited.
+    fn exited(&self) -> bool {
+        let mut poll = libc::pollfd { fd: self.fd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        unsafe { libc::poll(&mut poll, 1, 0) > 0 }
+    }
+
+    fn signal(&self, signal: i32) {
+        let null = std::ptr::null::<libc::siginfo_t>();
+        unsafe { libc::syscall(libc::SYS_pidfd_send_signal, self.fd.as_raw_fd(), signal, null, 0) };
+    }
+}
+
 /// Live processes (other than us) whose environment carries
-/// `CEPTION_OWNER=<token>`, with their start times.
-pub fn owned_processes(token: &str) -> Vec<(u32, u64)> {
+/// `CEPTION_OWNER=<token>`. The environment is read again after pinning,
+/// so it is the pinned process's own.
+pub fn owned_processes(token: &str) -> Vec<Pinned> {
     let marker = format!("{OWNER_VAR}={token}");
     let me = std::process::id();
     let Ok(entries) = std::fs::read_dir("/proc") else {
@@ -37,35 +70,62 @@ pub fn owned_processes(token: &str) -> Vec<(u32, u64)> {
     entries
         .flatten()
         .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
-        .filter(|&pid| pid != me)
-        .filter(|&pid| {
-            std::fs::read(format!("/proc/{pid}/environ"))
-                .is_ok_and(|environ| environ.split(|&b| b == 0).any(|var| var == marker.as_bytes()))
-        })
-        .filter_map(|pid| Some((pid, starttime(pid).ok()?)))
+        .filter(|&pid| pid != me && carries(pid, marker.as_bytes()))
+        .filter_map(Pinned::open)
+        .filter(|pinned| carries(pinned.pid, marker.as_bytes()) && !pinned.exited())
         .collect()
 }
 
-/// SIGTERM the processes carrying `token`, then SIGKILL what is left. Each
-/// signal goes only to a pid whose start time still matches, so a reused
-/// pid is never hit. Returns how many there were.
-pub async fn kill_owned(token: &str) -> usize {
-    let found = owned_processes(token);
-    let alive = |&(pid, start): &(u32, u64)| starttime(pid).ok() == Some(start);
-    for (signal, wait_ms) in [(libc::SIGTERM, 2000), (libc::SIGKILL, 1000)] {
-        let live: Vec<_> = found.iter().copied().filter(alive).collect();
+pub struct Sweep {
+    pub found: usize,
+    /// Still alive when we gave up.
+    pub survivors: usize,
+}
+
+/// SIGTERM the processes carrying `token`, then SIGKILL what is left,
+/// rescanning throughout so processes forked meanwhile are caught too.
+pub async fn kill_owned(token: &str) -> Sweep {
+    let started = tokio::time::Instant::now();
+    let mut found = HashSet::new();
+    let mut signalled: HashMap<u32, i32> = HashMap::new();
+    loop {
+        let live = owned_processes(token);
+        found.extend(live.iter().map(|pinned| pinned.pid));
         if live.is_empty() {
-            break;
+            return Sweep { found: found.len(), survivors: 0 };
         }
-        for (pid, _) in &live {
-            unsafe { libc::kill(*pid as libc::pid_t, signal) };
+        let elapsed = started.elapsed();
+        if elapsed > Duration::from_secs(3) {
+            return Sweep { found: found.len(), survivors: live.len() };
         }
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
-        while live.iter().any(alive) && tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        let signal = if elapsed < Duration::from_secs(2) { libc::SIGTERM } else { libc::SIGKILL };
+        for pinned in &live {
+            if signalled.insert(pinned.pid, signal) != Some(signal) {
+                pinned.signal(signal);
+            }
         }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    found.len()
+}
+
+/// Whether any process other than a zombie is in process group `pgid`.
+pub fn group_has_live_members(pgid: u32) -> bool {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return false;
+    };
+    entries.flatten().filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok()).any(|pid| {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        // After "(comm) ": state, ppid, pgrp.
+        let Some(close) = stat.rfind(')') else {
+            return false;
+        };
+        let mut fields = stat[close + 2..].split_whitespace();
+        let state = fields.next();
+        let pgrp = fields.nth(1).and_then(|pgrp| pgrp.parse::<u32>().ok());
+        pgrp == Some(pgid) && state != Some("Z")
+    })
 }
 
 /// Becomes ready when the watched process exits.

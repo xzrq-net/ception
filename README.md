@@ -207,7 +207,10 @@ app-server and everything it starts also carry `CEPTION_OWNER=<random
 token>` in their environment, with the token kept beside the lock: exit
 sweeps up descendants that left the process group, and if a daemon is killed
 outright (SIGKILL), the label's next daemon kills whatever still carries its
-token before starting. Matching by token means nothing unrelated is hit.
+token before starting. Matching by token, and signalling through pidfds,
+means nothing unrelated is hit. The limit: a descendant that scrubs its
+environment (`env -i`), leaves the process group and ignores SIGTERM can
+outlive a SIGKILLed daemon; only a cgroup or a supervisor would close that.
 
 A daemon on its way out refuses new work; `send` and `goal` then wait for it
 to release the label and start a successor.

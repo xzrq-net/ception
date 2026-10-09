@@ -14,7 +14,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 
-use crate::procfs::PidWatch;
+use crate::procfs::{self, PidWatch};
 
 pub enum AppEvent {
     Message(Value),
@@ -98,6 +98,10 @@ pub struct AppServer {
     /// Fires when stderr hits EOF, so an exit description includes the
     /// server's last words.
     stderr_done: Option<oneshot::Receiver<()>>,
+    /// The server's exit, observed without reaping it: an unreaped leader,
+    /// even a zombie, keeps its pid and so the group id from being reused
+    /// while close() signals the group.
+    exit: PidWatch,
     closed: bool,
 }
 
@@ -135,11 +139,12 @@ impl AppServer {
         }
         let mut child = command.spawn().with_context(|| format!("start {}", argv.join(" ")))?;
         let pid = child.id().context("app-server pid")?;
-        let exit = PidWatch::child(pid)?;
+        let exit = PidWatch::child(pid)?.context("app-server exited at once")?;
+        let reader_exit = PidWatch::child(pid)?;
         let (tx, rx) = unbounded_channel();
         let tx_writer = tx.clone();
         let stderr_tail = Arc::new(Mutex::new(String::new()));
-        tokio::spawn(read_stdout(child.stdout.take().expect("piped"), tx.clone(), exit));
+        tokio::spawn(read_stdout(child.stdout.take().expect("piped"), tx.clone(), reader_exit));
         let (stderr_eof, stderr_done) = oneshot::channel();
         tokio::spawn(read_stderr(child.stderr.take().expect("piped"), tx, stderr_tail.clone(), stderr_eof));
         let (writer, lines) = unbounded_channel();
@@ -151,6 +156,7 @@ impl AppServer {
             next_id: 1,
             stderr_tail,
             stderr_done: Some(stderr_done),
+            exit,
             closed: false,
         };
         Ok((server, rx))
@@ -228,13 +234,9 @@ impl AppServer {
         if let Some(reason) = reason {
             return reason;
         }
-        let status = match tokio::time::timeout(Duration::from_secs(2), self.child.wait()).await {
-            Ok(Ok(status)) => match (status.code(), std::os::unix::process::ExitStatusExt::signal(&status)) {
-                (Some(code), _) => format!("exit {code}"),
-                (None, Some(signal)) => format!("signal {signal}"),
-                _ => "unknown status".to_string(),
-            },
-            _ => "stdout closed".to_string(),
+        let status = match tokio::time::timeout(Duration::from_secs(2), self.exit.exited()).await {
+            Ok(()) => self.peek_status(),
+            Err(_) => "stdout closed".to_string(),
         };
         if let Some(done) = self.stderr_done.take() {
             let _ = tokio::time::timeout(Duration::from_millis(500), done).await;
@@ -247,36 +249,44 @@ impl AppServer {
         }
     }
 
+    /// The exited server's status, read without reaping it.
+    fn peek_status(&self) -> String {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let flags = libc::WEXITED | libc::WNOWAIT | libc::WNOHANG;
+        if unsafe { libc::waitid(libc::P_PID, self.pgid as libc::id_t, &mut info, flags) } != 0 {
+            return "unknown status".to_string();
+        }
+        let status = unsafe { info.si_status() };
+        match info.si_code {
+            libc::CLD_EXITED => format!("exit {status}"),
+            libc::CLD_KILLED | libc::CLD_DUMPED => format!("signal {status}"),
+            _ => "unknown status".to_string(),
+        }
+    }
+
     /// Close stdin and give the server a moment to exit, then SIGTERM its
-    /// process group, then SIGKILL. Returns once the group is empty (or the
-    /// SIGKILL grace ran out), so a successor never overlaps old tools.
+    /// process group, then SIGKILL, until the group has no live members (or
+    /// the SIGKILL grace ran out), so a successor never overlaps old tools.
+    /// The leader is reaped only after that.
     pub async fn close(&mut self) {
         if self.closed {
             return;
         }
         self.closed = true;
         self.writer = None;
-        let _ = tokio::time::timeout(Duration::from_millis(100), self.child.wait()).await;
-        unsafe { libc::kill(-self.pgid, libc::SIGTERM) };
-        if !self.group_gone_within(Duration::from_secs(2)).await {
-            unsafe { libc::kill(-self.pgid, libc::SIGKILL) };
-            self.group_gone_within(Duration::from_secs(1)).await;
-        }
-    }
-
-    async fn group_gone_within(&mut self, limit: Duration) -> bool {
-        let deadline = Instant::now() + limit;
-        loop {
-            // Reap the leader: a zombie still counts as a group member.
-            let _ = self.child.try_wait();
-            if unsafe { libc::kill(-self.pgid, 0) } != 0 {
-                return true;
+        let pgid = self.pgid as u32;
+        let _ = tokio::time::timeout(Duration::from_millis(100), self.exit.exited()).await;
+        for (signal, grace) in [(libc::SIGTERM, 2000), (libc::SIGKILL, 1000)] {
+            if !procfs::group_has_live_members(pgid) {
+                break;
             }
-            if Instant::now() >= deadline {
-                return false;
+            unsafe { libc::kill(-self.pgid, signal) };
+            let deadline = Instant::now() + Duration::from_millis(grace);
+            while procfs::group_has_live_members(pgid) && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(25)).await;
             }
-            tokio::time::sleep(Duration::from_millis(25)).await;
         }
+        let _ = tokio::time::timeout(Duration::from_secs(1), self.child.wait()).await;
     }
 }
 

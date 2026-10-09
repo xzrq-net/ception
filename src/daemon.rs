@@ -10,7 +10,7 @@
 //! fresher notifications and for turns that settled while they were in flight.
 
 use std::collections::hash_map::RandomState;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::hash::BuildHasher;
 use std::io::Write;
@@ -155,9 +155,12 @@ async fn kill_leftovers(path: &Path, log: &mut Log) {
     };
     let token = token.trim();
     if !token.is_empty() {
-        let killed = procfs::kill_owned(token).await;
-        if killed > 0 {
-            log.line(&format!("[daemon] killed {killed} process(es) a previous daemon left running"));
+        let sweep = procfs::kill_owned(token).await;
+        if sweep.found > 0 {
+            log.line(&format!("[daemon] killed {} process(es) a previous daemon left running", sweep.found));
+        }
+        if sweep.survivors > 0 {
+            log.line(&format!("[daemon] {} of them survived SIGKILL", sweep.survivors));
         }
     }
     let _ = std::fs::remove_file(path);
@@ -406,6 +409,8 @@ enum Deferred {
 
 enum Event {
     Command { request: Request, reply: UnboundedSender<Reply> },
+    /// A connection taken by the refuser, counted so exit waits for its reply.
+    Connected,
     Disconnected,
     GraceExpired(u64),
     GoalStartExpired(u64),
@@ -452,6 +457,8 @@ struct Daemon {
     turns_settled: u64,
     /// Recently settled runs, newest last.
     settled: VecDeque<Retained>,
+    /// Every physical turn seen to end, retained or not.
+    finished_turns: HashSet<String>,
 
     next_id: u64,
     next_run: u64,
@@ -495,6 +502,7 @@ impl Daemon {
             deferred: VecDeque::new(),
             turns_settled: 0,
             settled: VecDeque::new(),
+            finished_turns: HashSet::new(),
             next_id: 0,
             next_run: 0,
             connections: 0,
@@ -555,7 +563,7 @@ impl Daemon {
                 self.stopping = true;
                 // Connections keep being answered, with Refused, until we exit.
                 if let Some(listener) = listener.take() {
-                    tokio::spawn(refuse_connections(listener));
+                    tokio::spawn(refuse_connections(listener, self.events.clone()));
                 }
                 self.interrupt_for_shutdown(&mut app_events, &mut events).await;
                 self.shutdown(&reason).await;
@@ -571,13 +579,20 @@ impl Daemon {
     }
 
     /// Replies are written by connection tasks; give them a moment before
-    /// the process exits under them.
+    /// the process exits under them, including whatever the refuser is
+    /// still taking from the listen backlog.
     async fn drain_connections(&mut self, events: &mut UnboundedReceiver<Event>) {
+        let backlog = Instant::now() + Duration::from_millis(100);
         let deadline = Instant::now() + Duration::from_secs(1);
-        while self.connections > 0 {
+        while self.connections > 0 || Instant::now() < backlog {
+            let wake = if self.connections > 0 { deadline } else { backlog };
             tokio::select! {
                 Some(event) = events.recv() => self.on_event(event).await,
-                _ = tokio::time::sleep_until(deadline) => return,
+                _ = tokio::time::sleep_until(wake) => {
+                    if wake == deadline {
+                        return;
+                    }
+                }
             }
         }
     }
@@ -671,6 +686,7 @@ impl Daemon {
     }
 
     fn retain(&mut self, op: u64, turns: Vec<String>, outcome: RetainedOutcome) {
+        self.finished_turns.extend(turns.iter().cloned());
         self.settled.push_back(Retained { op, turns, outcome });
         if self.settled.len() > RETAINED_RUNS {
             self.settled.pop_front();
@@ -705,6 +721,7 @@ impl Daemon {
                     self.dispatch(item).await;
                 }
             }
+            Event::Connected => self.connections += 1,
             Event::Disconnected => {
                 self.connections = self.connections.saturating_sub(1);
             }
@@ -1225,7 +1242,16 @@ impl Daemon {
             return true;
         }
         let Some(retained) = self.settled.iter().find(|retained| retained.turns.contains(&expected)) else {
-            return false;
+            if !self.finished_turns.contains(&expected) {
+                return false;
+            }
+            // Ended long enough ago that its report has aged out; never
+            // track it again as running.
+            let message = format!("turn {expected} finished before codex confirmed it; its report is in the log");
+            for client in self.starting.take().expect("checked").clients {
+                client.answer(Reply::error(message.clone()));
+            }
+            return true;
         };
         let starting = self.starting.take().expect("checked");
         for client in starting.clients {
@@ -1368,7 +1394,8 @@ impl Daemon {
         if !ours {
             return;
         }
-        let event_turn = params["turnId"].as_str();
+        // Items name their turn in turnId; turn/completed in turn.id.
+        let event_turn = params["turnId"].as_str().or_else(|| params["turn"]["id"].as_str());
         if self.active.is_none() {
             // Items of a turn whose turn/started we never saw.
             match event_turn {
@@ -1610,7 +1637,10 @@ impl Daemon {
         let _ = std::fs::remove_file(&self.paths.socket);
         self.app.close().await;
         // Descendants that left the process group still carry the token.
-        procfs::kill_owned(&self.owner).await;
+        let sweep = procfs::kill_owned(&self.owner).await;
+        if sweep.survivors > 0 {
+            self.log(&format!("[daemon] {} app-server descendant(s) survived SIGKILL", sweep.survivors));
+        }
         let _ = std::fs::remove_file(owner_path(&self.paths));
     }
 }
@@ -1661,8 +1691,10 @@ fn format_rate_limits(limits: &Value) -> String {
 
 /// After shutdown begins: answer every new connection with Refused, so a
 /// client that got in just then retries elsewhere instead of hanging.
-async fn refuse_connections(listener: UnixListener) {
+async fn refuse_connections(listener: UnixListener, events: UnboundedSender<Event>) {
     while let Ok((stream, _)) = listener.accept().await {
+        let _ = events.send(Event::Connected);
+        let events = events.clone();
         tokio::spawn(async move {
             let (read, mut write) = stream.into_split();
             let _ = BufReader::new(read).lines().next_line().await;
@@ -1671,6 +1703,7 @@ async fn refuse_connections(listener: UnixListener) {
                 line.push(b'\n');
                 let _ = write.write_all(&line).await;
             }
+            let _ = events.send(Event::Disconnected);
         });
     }
 }
