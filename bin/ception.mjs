@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import fs from "node:fs/promises";
 import process from "node:process";
 import { parseArgs } from "node:util";
 
@@ -30,6 +31,7 @@ function usage(message) {
   ception list [--all] [--json] [--cwd D]
   ception quota [--json] [--cwd D]
   ception watch L [--cwd D] [--report brief|items|full] [--follow]
+  ception skill
 
 labels are scoped to the project root resolved from the invocation cwd
 (or --cwd); a label spawned with --cwd must be addressed with the same --cwd`);
@@ -265,6 +267,12 @@ async function main(argv) {
         report: normalizeReport(values.report),
         follow: Boolean(values.follow)
       });
+      return;
+    }
+
+    case "skill": {
+      parseArgs({ args: rest, options: {} });
+      process.stdout.write(await fs.readFile(new URL("../SKILL.md", import.meta.url), "utf8"));
       return;
     }
 

@@ -157,6 +157,13 @@ async function cleanup(ctx, envs = []) {
   }
 }
 
+test("skill prints the guide verbatim", async () => {
+  const guide = await fs.readFile(path.join(REPO, "SKILL.md"), "utf8");
+  const result = await runCeption(["skill"]);
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(result.stdout, guide);
+});
+
 test("happy path: spawn renders report, persists state, logs reasoning", async (t) => {
   const ctx = await makeEnv("happy");
   t.after(() => cleanup(ctx));

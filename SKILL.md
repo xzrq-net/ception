@@ -1,17 +1,9 @@
----
-name: ception
-description:
-  Delegate implementation, investigation, and review work to OpenAI Codex (GPT)
-  running as a named background subagent. GPT works at your level; what it
-  lacks is the user. Hand it the goal, the reasons and the bounds, not a spec,
-  and keep the token churn out of your own context.
----
-
 # ception: Codex as a subagent
 
 `ception` runs Codex (GPT, the user's configured model) as a per-label daemon.
 You interact with it like a native subagent: spawn in background, get woken on
-completion, steer mid-flight, send follow-ups to the same thread.
+completion, steer mid-flight, send follow-ups to the same thread. The token
+churn stays out of your context.
 
 **WIP.** If the tool itself misbehaves — confusing errors, hangs, reports that
 don't match what happened, docs that disagree with behavior — tell the user
@@ -70,21 +62,11 @@ The first report is also a signal about your prompt. If corrections don't
 shrink each round, the framing is wrong; restate the goal. When you want a
 check on a design of your own, ask for its take before showing yours.
 
-## Choosing model and effort
+## Model and effort
 
-Pick the model at `spawn` — `send` keeps the label's choice, so switching models
-means a new label:
-
-- `--model gpt-5.6-luna` — cheap. For work where the solution is already
-  decided and correctness is mechanically checkable: rote renames, lint
-  cleanup, narrow edits with deterministic tests. Its failure mode is a
-  plausible patch that misses intent or an edge case. If a Luna task turns into
-  discovery or design, respawn on the default model rather than compensating
-  with follow-ups.
-- unset — the user's configured default (`gpt-6-astra`). Everything else.
-
-Do not pass `--effort` unless the user names a level; the codex config default
-applies.
+Do not pass `--model` or `--effort` unless the user names one; the codex config
+defaults apply. Both are fixed at `spawn` and `send` keeps the label's choice,
+so switching either means a new label.
 
 ## Operating procedure
 

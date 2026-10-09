@@ -37,7 +37,13 @@ ception list
 ception quota
 ception watch worker
 ception kill worker
+ception skill
 ```
+
+`skill` prints [SKILL.md](SKILL.md), the operating guide for the agent
+driving ception. Nothing loads it automatically: point the agent at it from
+its own instructions (CLAUDE.md or similar), e.g. "run `ception skill` before
+first use and again after compaction".
 
 `spawn` starts a fresh Codex thread. Both `spawn` and `send` print the log
 path on their first stdout line. `send` reuses the live daemon, or
