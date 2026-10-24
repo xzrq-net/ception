@@ -66,7 +66,6 @@ approval request anyway, the daemon rejects it and fails the turn (exit 4).
 
 Thread goals are disabled (`features.goals = false` on every thread): codex
 starts no turns of its own for a goal, and the model has no tool to set one.
-Every turn is one a client asked for, or a continuation codex folds into it.
 
 Report levels: `brief` (final message and a status/files/tokens/duration
 footer, the default), `items` (adds one line per command, edit and tool
@@ -139,19 +138,12 @@ session. Taking it over is deliberate: run with `CEPTION_SESSION=<that id>`.
 project), with a `session` column of `mine` or the session id. `kill --all`
 stops the calling session's daemons in the project.
 
-## Continuations
+## Turns codex starts by itself
 
-Codex can start a turn on its own: the continuation of a compacted turn on
-older app-servers. While a client waits, the daemon folds such turns into one
-report, holding a compacted turn's report for `CEPTION_CONTINUATION_GRACE_MS`.
-A turn that arrives after everything settled is still tracked, without
+With goals off, and compaction continuing inside the turn, codex shouldn't
+start turns of its own. If it does, the daemon tracks the turn without
 clients: `list` shows the label active and `watch` can attach, so an
 in-flight turn is never invisible.
-
-If a compacted turn ends with nothing but codex's `Instructions loaded for
-<path>.` acknowledgement, the report is marked failed (exit 2) with a warning:
-work done before the compaction is on disk but unreported, and `send` resumes
-it.
 
 ## Daemon lifecycle
 
@@ -223,8 +215,6 @@ project, under the label lock.
   spawn may sit through an npx download).
 - `CEPTION_GC_DAYS`: age before other sessions' idle labels are collected,
   default 7.
-- `CEPTION_CONTINUATION_GRACE_MS`: how long a compacted turn waits for
-  codex's continuation turn before settling anyway, default 2000.
 
 ## Development
 

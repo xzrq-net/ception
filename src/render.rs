@@ -115,19 +115,6 @@ fn text_list(v: Option<&Value>) -> Vec<String> {
         .collect()
 }
 
-/// `/^Instructions loaded(?: for [^\r\n]+)?\.$/u` against the trimmed text.
-fn is_compaction_amnesia_message(text: &str) -> bool {
-    let trimmed = text.trim_matches(is_js_space);
-    let Some(rest) = trimmed.strip_prefix("Instructions loaded") else {
-        return false;
-    };
-    let Some(rest) = rest.strip_suffix('.') else {
-        return false;
-    };
-    rest.is_empty()
-        || rest.strip_prefix(" for ").is_some_and(|target| !target.is_empty() && !target.contains(['\r', '\n']))
-}
-
 /// codexErrorInfo is either a bare name or a single-key object carrying
 /// details; rendered generically so codex's vocabulary passes through whole.
 fn error_info_name(info: Option<&Value>) -> Option<String> {
@@ -204,7 +191,6 @@ pub struct TurnAccumulator {
     pub prompt: String,
     pub status: String,
     pub compactions: u32,
-    pub derailed_by_compaction: bool,
     /// Wall clock for the log header; `started` times the turn.
     started_at: jiff::Timestamp,
     started: Instant,
@@ -224,8 +210,6 @@ pub struct TurnAccumulator {
     error_message: String,
     error_info: Option<String>,
     token_usage: Value,
-    /// The latest agent message since the last compaction, if any.
-    message_after_compaction: Option<String>,
 }
 
 impl TurnAccumulator {
@@ -237,7 +221,6 @@ impl TurnAccumulator {
             prompt: prompt.to_string(),
             status: "inProgress".to_string(),
             compactions: 0,
-            derailed_by_compaction: false,
             started_at: jiff::Timestamp::now(),
             started: Instant::now(),
             settled: None,
@@ -252,7 +235,6 @@ impl TurnAccumulator {
             error_message: String::new(),
             error_info: None,
             token_usage: Value::Null,
-            message_after_compaction: None,
         }
     }
 
@@ -292,16 +274,14 @@ impl TurnAccumulator {
         )
     }
 
-    /// A mid-turn compaction can end the turn and let codex continue the same
-    /// work in a fresh turn. Carry the accumulated report across so the client
-    /// that is still blocked gets one report covering both halves.
+    /// Codex moved on to a fresh turn before this one's completion arrived.
+    /// Carry the accumulated report across so the clients get one report
+    /// covering both.
     pub fn adopt_continuation(&mut self, turn_id: &str) {
         self.turn_id = turn_id.to_string();
         self.status = "inProgress".to_string();
         self.error_message.clear();
         self.error_info = None;
-        self.message_after_compaction = None;
-        self.derailed_by_compaction = false;
     }
 
     /// Feed one notification; returns the log lines it produced.
@@ -357,15 +337,6 @@ impl TurnAccumulator {
         self.error_message = js_string(error.get("message"));
         // The only machine-readable handle on why the server ended the turn.
         self.error_info = error_info_name(error.get("codexErrorInfo"));
-        // Amnesia signature: after a mid-turn context compaction, Codex emits
-        // only its instruction-loading acknowledgement as the final answer.
-        // Match the observed message rather than treating a text-only answer
-        // as failure: reasoning and an agent message can be a complete turn.
-        let amnesia = self.message_after_compaction.as_deref().is_some_and(is_compaction_amnesia_message);
-        if self.status == "completed" && amnesia {
-            self.status = "failed".to_string();
-            self.derailed_by_compaction = true;
-        }
     }
 
     fn handle_item_started(&mut self, item: &Value) -> Vec<String> {
@@ -402,7 +373,6 @@ impl TurnAccumulator {
         let line = match item.get("type").and_then(Value::as_str).unwrap_or("") {
             "contextCompaction" => {
                 self.compactions += 1;
-                self.message_after_compaction = None;
                 format!("[compaction] context compacted mid-turn (#{})", self.compactions)
             }
             "agentMessage" => {
@@ -412,9 +382,6 @@ impl TurnAccumulator {
                 }
                 if !text.is_empty() {
                     self.final_message = text.clone();
-                }
-                if self.compactions > 0 {
-                    self.message_after_compaction = Some(text.clone());
                 }
                 // Never truncated: this is the answer, and --report full is built
                 // from these lines. Capping it here made `full` deliver less than
@@ -499,18 +466,6 @@ impl TurnAccumulator {
     pub fn build_report(&self, level: ReportLevel) -> String {
         let mut body =
             if self.final_message.is_empty() { self.error_message.clone() } else { self.final_message.clone() };
-        if self.derailed_by_compaction {
-            body = [
-                "WARNING: turn derailed by mid-turn context compaction. The model lost",
-                "its working context, acknowledged its instructions, and stopped without",
-                "doing further work. Anything done before the compaction is on disk but",
-                "unreported. Send a follow-up prompt to resume (point it at the diff and",
-                "its notes file).",
-                "",
-                &format!("Final message from the model: {body}"),
-            ]
-            .join("\n");
-        }
 
         let mut footer = vec![format!("status: {}", self.status)];
         if let Some(info) = &self.error_info {
@@ -542,10 +497,10 @@ impl TurnAccumulator {
                 lines.join("\n")
             }
             ReportLevel::Brief => {
-                // Turns can end without an agent message (interrupted,
-                // compacted, cut off by an error). An almost empty report is worse than a terse trail of
-                // what it did — but brief must stay brief, so the trail is what
-                // it touched, not how it thought.
+                // Turns can end without an agent message (interrupted, cut off
+                // by an error). An almost empty report is worse than a terse
+                // trail of what it did — but brief must stay brief, so the
+                // trail is what it touched, not how it thought.
                 if body.is_empty() {
                     let acted: Vec<&String> =
                         self.item_lines.iter().filter(|line| !line.starts_with("[reasoning]")).collect();
@@ -597,91 +552,6 @@ mod tests {
     }
 
     #[test]
-    fn instruction_acknowledgement_after_compaction_is_treated_as_a_derailed_turn() {
-        let mut turn = accumulator();
-        complete_item(&mut turn, json!({ "id": "compaction", "type": "contextCompaction" }));
-        complete_item(
-            &mut turn,
-            json!({ "id": "message", "type": "agentMessage", "text": "Instructions loaded for `/tmp/project`." }),
-        );
-        complete_turn(&mut turn);
-
-        assert_eq!(turn.status, "failed");
-        assert!(turn.derailed_by_compaction);
-        assert!(
-            turn.build_report(ReportLevel::Brief).contains("WARNING: turn derailed by mid-turn context compaction")
-        );
-    }
-
-    #[test]
-    fn instruction_acknowledgement_without_compaction_remains_a_completed_turn() {
-        let mut turn = accumulator();
-        complete_item(&mut turn, json!({ "id": "message", "type": "agentMessage", "text": "Instructions loaded." }));
-        complete_turn(&mut turn);
-
-        assert_eq!(turn.status, "completed");
-        assert!(!turn.derailed_by_compaction);
-    }
-
-    #[test]
-    fn substantive_text_only_answer_after_compaction_remains_completed() {
-        let mut turn = accumulator();
-        complete_item(&mut turn, json!({ "id": "compaction", "type": "contextCompaction" }));
-        complete_item(
-            &mut turn,
-            json!({ "id": "reasoning", "type": "reasoning", "summary": ["Derived the answer"], "content": [] }),
-        );
-        complete_item(&mut turn, json!({ "id": "message", "type": "agentMessage", "text": "The answer is 42." }));
-        complete_turn(&mut turn);
-
-        assert_eq!(turn.status, "completed");
-        assert!(!turn.derailed_by_compaction);
-        assert!(turn.build_report(ReportLevel::Brief).starts_with("The answer is 42."));
-    }
-
-    #[test]
-    fn completion_of_pre_compaction_work_does_not_hide_the_amnesia_signature() {
-        let mut turn = accumulator();
-        turn.handle_notification(
-            "item/started",
-            &json!({ "item": { "id": "command", "type": "commandExecution", "command": "long-running-command" } }),
-        );
-        complete_item(&mut turn, json!({ "id": "compaction", "type": "contextCompaction" }));
-        complete_item(
-            &mut turn,
-            json!({
-                "id": "command",
-                "type": "commandExecution",
-                "command": "long-running-command",
-                "status": "completed",
-                "exitCode": 0
-            }),
-        );
-        complete_item(&mut turn, json!({ "id": "message", "type": "agentMessage", "text": "Instructions loaded." }));
-        complete_turn(&mut turn);
-
-        assert_eq!(turn.status, "failed");
-        assert!(turn.derailed_by_compaction);
-    }
-
-    #[test]
-    fn only_the_final_compactions_subsequent_message_determines_derailment() {
-        let mut turn = accumulator();
-        complete_item(&mut turn, json!({ "id": "compaction-1", "type": "contextCompaction" }));
-        complete_item(&mut turn, json!({ "id": "message-1", "type": "agentMessage", "text": "Instructions loaded." }));
-        complete_item(&mut turn, json!({ "id": "compaction-2", "type": "contextCompaction" }));
-        complete_item(
-            &mut turn,
-            json!({ "id": "message-2", "type": "agentMessage", "text": "Recovered and completed the task." }),
-        );
-        complete_turn(&mut turn);
-
-        assert_eq!(turn.compactions, 2);
-        assert_eq!(turn.status, "completed");
-        assert!(!turn.derailed_by_compaction);
-    }
-
-    #[test]
     fn a_long_final_message_survives_every_report_level_full_included() {
         let mut turn = accumulator();
         let long = format!("{}END", "x".repeat(6000));
@@ -696,15 +566,14 @@ mod tests {
     }
 
     #[test]
-    fn adopting_a_continuation_clears_the_derailed_verdict_from_the_compacted_half() {
+    fn an_adopted_turn_carries_the_report_across() {
         let mut turn = accumulator();
         complete_item(&mut turn, json!({ "id": "compaction", "type": "contextCompaction" }));
-        complete_item(
-            &mut turn,
-            json!({ "id": "ack", "type": "agentMessage", "text": "Instructions loaded for `/repo`." }),
+        complete_item(&mut turn, json!({ "id": "first", "type": "agentMessage", "text": "First half." }));
+        turn.handle_notification(
+            "turn/completed",
+            &json!({ "turn": { "status": "failed", "error": { "message": "boom" } } }),
         );
-        complete_turn(&mut turn);
-        assert_eq!(turn.status, "failed");
 
         turn.adopt_continuation("turn-2");
         complete_item(
@@ -714,10 +583,10 @@ mod tests {
         complete_turn(&mut turn);
 
         assert_eq!(turn.status, "completed");
-        assert!(!turn.derailed_by_compaction);
         let report = turn.build_report(ReportLevel::Brief);
         assert!(report.contains("Actually finished the work."));
         assert!(report.contains("compactions: 1"));
+        assert!(!report.contains("boom"));
     }
 
     #[test]

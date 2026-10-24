@@ -136,34 +136,16 @@ EOF
   takes codex's background shells and subagents with it; interrupting does
   not.
 
-## When one `spawn` is more than one Codex turn
+## Compaction and turns you didn't start
 
-Codex sometimes keeps working after a turn ends: compaction can make it continue
-in a follow-on turn by itself. The daemon follows the work across those turns
-and gives you a single report, so normally you need not care. Two things make it
-visible:
-
-- A `compactions: N` line in the footer means the model spent part of the run
+- A `compactions: N` line in the footer means the model spent part of the turn
   working from a summary. Verify that report against the diff more carefully
   than usual.
-- **A label showing `active` in `ception list` after you already got its
-  report.** Codex started another turn later than the daemon waited. Your report
-  covers only part of the run and the rest is still happening. Attach with
-  `ception watch <label>` — but if the continuation already finished, `watch`
-  says `no active turn` and only the log has the rest, so check the log before
-  concluding nothing happened. Do not start new work on that label, and do not
-  assume the working copy is quiescent, until it is idle.
-
-One residual failure: a turn reported **failed** with
-`WARNING: turn derailed by mid-turn context compaction` means compaction wiped
-the context instead of summarising it and the turn stopped. Work done before it is on disk but
-unreported — check the diff, then `ception send <label>` with a resume prompt
-pointing at the diff and any notes the agent kept. Confirm the label is idle
-first; sending into a live continuation steers it instead of resuming.
-
-Prevention: scope each turn small (one gate/phase per turn) and have the agent
-update notes at intermediate milestones — plus milestone commits where the
-target repo permits agent commits.
+- A label showing `active` in `ception list` when you started no turn means
+  codex started one by itself. Attach with `ception watch <label>`; if it
+  already finished, `watch` says `no active turn` and only the log has it. Do
+  not start new work on that label, or assume the working copy is quiescent,
+  until it is idle.
 
 ## After completion
 

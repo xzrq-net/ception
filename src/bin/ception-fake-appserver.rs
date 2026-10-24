@@ -7,8 +7,8 @@
 //!   `./fake-appserver-state.json`.
 //! - `CEPTION_FAKE_BEHAVIOR`: which scripted shape to play, default "happy".
 //!   See `turn_start` and `turn_start_special` for the branches.
-//! - `CEPTION_FAKE_CONTINUATION_DELAY_MS` (150), `CEPTION_FAKE_CONTINUATION_RUN_MS`
-//!   (0): timing of the continuation turn the server starts by itself.
+//! - `CEPTION_FAKE_UNPROMPTED_DELAY_MS` (150), `CEPTION_FAKE_UNPROMPTED_RUN_MS`
+//!   (0): timing of the turn `unprompted-turn` starts by itself.
 //!
 //! Concurrency mirrors the JS event loop: every request handler and every timer
 //! callback runs start to finish under one lock (`server()`), so they never
@@ -366,11 +366,9 @@ impl Turn {
 struct Server {
     active_turn: Option<Turn>,
     request_id: u64,
-    /// Set inside `with_batch`: messages collect here instead of going out.
-    batch: Option<Vec<Value>>,
 }
 
-static SERVER: Mutex<Server> = Mutex::new(Server { active_turn: None, request_id: 9000, batch: None });
+static SERVER: Mutex<Server> = Mutex::new(Server { active_turn: None, request_id: 9000 });
 
 fn server() -> MutexGuard<'static, Server> {
     SERVER.lock().unwrap()
@@ -438,21 +436,7 @@ fn wait_for_timers() {
 
 impl Server {
     fn send(&mut self, message: Value) {
-        match &mut self.batch {
-            Some(batch) => batch.push(message),
-            None => write_out(&format!("{message}\n")),
-        }
-    }
-
-    // One write, so the reader gets every line in a single chunk and dispatches
-    // them all before any of its own awaits resume. The real server can do this
-    // whenever it answers and then immediately runs and ends a turn.
-    fn with_batch(&mut self, f: impl FnOnce(&mut Self)) {
-        self.batch = Some(Vec::new());
-        f(self);
-        let messages = self.batch.take().unwrap();
-        let lines: Vec<String> = messages.iter().map(Value::to_string).collect();
-        write_out(&format!("{}\n", lines.join("\n")));
+        write_out(&format!("{message}\n"));
     }
 
     fn complete_turn(&mut self, turn: &Turn, status: &str, message: Option<&str>) {
@@ -507,37 +491,28 @@ impl Server {
         self.active_turn = Some(turn);
     }
 
-    // Reproduces the observed compaction shape: codex closes the turn with a bare
-    // instruction acknowledgement, then continues the real work in a fresh turn.
+    // Current codex compacts mid-turn and carries on in the same turn.
     fn start_compacted_turn(&mut self, turn: &Turn) {
         let Turn { thread_id, turn_id, .. } = turn;
         self.send(turn_started(thread_id, turn_id));
-        self.send(item_completed(
-            thread_id,
-            turn_id,
-            json!({ "type": "contextCompaction", "id": format!("compact_{turn_id}") }),
-        ));
-        self.send(agent_message(thread_id, turn_id, "Instructions loaded for `/repo`."));
+        let compaction = json!({ "type": "contextCompaction", "id": format!("compact_{turn_id}") });
+        self.send(item_completed(thread_id, turn_id, compaction));
+        self.send(agent_message(thread_id, turn_id, "Finished the work past the compaction."));
+        self.send(token_usage_updated(thread_id, turn_id));
         self.send(turn_completed(thread_id, turn_id, "completed", Value::Null));
+        self.active_turn = None;
+    }
 
-        fn finish(s: &mut Server, turn: &Turn) {
-            let Turn { thread_id, turn_id, .. } = turn;
-            s.send(agent_message(thread_id, turn_id, "Continued past the compaction and finished the work."));
-            s.send(token_usage_updated(thread_id, turn_id));
-            s.send(turn_completed(thread_id, turn_id, "completed", Value::Null));
-            s.active_turn = None;
-        }
-        let continuation = Turn::unprompted(thread_id);
-        set_timeout(env_ms("CEPTION_FAKE_CONTINUATION_DELAY_MS", 150), move |s| {
-            s.active_turn = Some(continuation.clone());
-            s.send(turn_started(&continuation.thread_id, &continuation.turn_id));
-            // Optionally keep the continuation running so tests can observe it live.
-            let run_ms = env_ms("CEPTION_FAKE_CONTINUATION_RUN_MS", 0);
-            if run_ms > 0 {
-                set_timeout(run_ms, move |s| finish(s, &continuation));
-            } else {
-                finish(s, &continuation);
-            }
+    /// A turn of codex's own, nobody's request, starting a while after the
+    /// requested one ended and running for a while.
+    fn start_unprompted_turn_later(&mut self, thread_id: &str) {
+        let turn = Turn::unprompted(thread_id);
+        set_timeout(env_ms("CEPTION_FAKE_UNPROMPTED_DELAY_MS", 150), move |s| {
+            s.active_turn = Some(turn.clone());
+            s.send(turn_started(&turn.thread_id, &turn.turn_id));
+            set_timeout(env_ms("CEPTION_FAKE_UNPROMPTED_RUN_MS", 0), move |s| {
+                s.complete_turn(&turn, "completed", Some("Unprompted turn finished its work."));
+            });
         });
     }
 
@@ -681,8 +656,11 @@ impl Server {
             self.complete_turn(&turn, "completed", None);
         } else if behavior == "steer" || turn.prompt.contains("slow") {
             self.start_long_turn(turn);
-        } else if behavior == "continuation" {
+        } else if behavior == "compaction" {
             self.start_compacted_turn(&turn);
+        } else if behavior == "unprompted-turn" {
+            self.complete_turn(&turn, "completed", None);
+            self.start_unprompted_turn_later(&turn.thread_id);
         } else if behavior == "fail" {
             self.complete_turn(&turn, "failed", Some("Partial output before failure."));
         } else if behavior == "server-request" {
@@ -705,24 +683,6 @@ impl Server {
                 self.send(reply(message, started(&turn)));
                 self.start_long_turn(turn);
                 DEAF.store(true, Ordering::SeqCst);
-            }
-            // The turn compacts, ends, and continues in turn B before the
-            // turn/start reply (naming the first turn) goes out; B's answer and
-            // completion come after it.
-            "late-start-reply" => {
-                let Turn { thread_id, turn_id, .. } = &turn;
-                let continuation = Turn::unprompted(thread_id);
-                let next = &continuation.turn_id;
-                self.with_batch(|s| {
-                    s.send(turn_started(thread_id, turn_id));
-                    let compaction = json!({ "type": "contextCompaction", "id": format!("compact_{turn_id}") });
-                    s.send(item_completed(thread_id, turn_id, compaction));
-                    s.send(turn_completed(thread_id, turn_id, "completed", Value::Null));
-                    s.send(turn_started(thread_id, next));
-                    s.send(reply(message, started(&turn)));
-                    s.send(agent_message(thread_id, next, "Continuation turn finished the work."));
-                    s.send(turn_completed(thread_id, next, "completed", Value::Null));
-                });
             }
             // Starts the turn, leaves a process holding stdout, and exits 17.
             "exit-with-child" => {

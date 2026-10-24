@@ -485,50 +485,42 @@ fn gc_drops_stale_labels_of_other_sessions_and_stale_temp_files() {
     assert!(exists(&fresh_temp));
 }
 
-// ----- continuations -------------------------------------------------------------------
+// ----- compaction and unprompted turns -------------------------------------------------
 
 #[test]
-fn a_compacted_turn_that_continues_in_a_new_turn_reports_the_continuations_result() {
-    let ctx = Ctx::new("continuation");
+fn a_compacted_turn_reports_its_compactions_and_settles_at_once() {
+    let ctx = Ctx::new("compaction");
 
-    // Without continuation tracking this exits 2 with the bare acknowledgement.
+    let started = Instant::now();
     let out = ctx.ception(&["spawn", "cont", "do the work"]).run().expect_code(0);
-    assert_has(&out.stdout, "Continued past the compaction and finished the work.");
-    assert_lacks(&out.stdout, "Instructions loaded");
+    assert_has(&out.stdout, "Finished the work past the compaction.");
     assert_has(&out.stdout, "compactions: 1");
+    assert!(started.elapsed() < secs(5), "settled after {:?}", started.elapsed());
 }
 
 #[test]
-fn an_unattended_continuation_turn_is_adopted_so_watch_and_list_can_see_it() {
-    let ctx = Ctx::new("continuation");
+fn a_turn_codex_starts_by_itself_is_adopted_so_watch_and_list_can_see_it() {
+    let ctx = Ctx::new("unprompted-turn");
 
-    // Grace window shorter than the continuation delay: the client is released
-    // before codex starts the follow-on turn, exactly as it happened in the wild.
-    // The continuation then stays live long enough to observe it from outside.
-    let env = ctx
-        .env
-        .set("CEPTION_CONTINUATION_GRACE_MS", 20)
-        .set("CEPTION_FAKE_CONTINUATION_DELAY_MS", 400)
-        .set("CEPTION_FAKE_CONTINUATION_RUN_MS", 3000);
-    let spawned = ctx.ception(&["spawn", "orphan", "do the work"]).env(&env).run();
-    assert_has(&spawned.stdout, "Instructions loaded");
+    // The requested turn reports at once; codex's own turn starts later and
+    // stays live long enough to observe from outside.
+    let env = ctx.env.set("CEPTION_FAKE_UNPROMPTED_DELAY_MS", 400).set("CEPTION_FAKE_UNPROMPTED_RUN_MS", 3000);
+    let spawned = ctx.ception(&["spawn", "orphan", "do the work"]).env(&env).run().expect_code(0);
+    assert_has(&spawned.stdout, "Handled the requested task");
+    assert_lacks(&spawned.stdout, "Unprompted turn");
 
-    // Adaptation: after the JS's fixed 600ms, keep polling briefly (the
-    // continuation runs 3s), so a loaded machine doesn't miss the start.
-    std::thread::sleep(ms(600));
-    let row = wait_for(secs(2), || {
+    let row = wait_for(secs(3), || {
         let rows = ctx.list(&env);
         row(&rows, "orphan").filter(|row| row["status"] == "active").cloned()
     })
-    .expect("the adopted continuation must show as active in list");
+    .expect("the adopted turn must show as active in list");
 
     // watch attaches to the adopted turn and blocks until it completes.
     let watched = ctx.ception(&["watch", "orphan"]).env(&env).run().expect_code(0);
-    assert_has(&watched.stdout, "Continued past the compaction and finished the work.");
+    assert_has(&watched.stdout, "Unprompted turn finished its work.");
 
     let log = fs::read_to_string(row["logPath"].as_str().unwrap()).unwrap();
-    assert_has(&log, "adopted an unattended continuation turn");
-    assert_has(&log, "Continued past the compaction and finished the work.");
+    assert_has(&log, "adopted a turn codex started by itself");
     let unknown_turn_started =
         log.lines().any(|line| line.find("unknown notification").is_some_and(|at| line[at..].contains("turn/started")));
     assert!(!unknown_turn_started, "{log}");
@@ -662,17 +654,6 @@ fn a_server_that_stops_reading_cannot_wedge_the_daemon() {
     assert_ne!(steered.code, Some(0), "{steered}");
     let spawned = first.wait_timeout(secs(5)).expect("spawn client hung");
     assert_ne!(spawned.code, Some(0), "{spawned}");
-}
-
-/// The turn/start reply arriving after the run had already continued into a
-/// new turn used to point the run back at its first turn, so the
-/// continuation's completion was ignored and the client hung.
-#[test]
-fn a_late_turn_start_reply_does_not_rewind_a_continued_run() {
-    let ctx = Ctx::new("late-start-reply");
-
-    let out = ctx.ception(&["spawn", "late", "do the work"]).timeout(secs(10)).run().expect_code(0);
-    assert_has(&out.stdout, "Continuation turn finished the work.");
 }
 
 /// A server exit went unnoticed while a descendant still held its stdout.
@@ -885,35 +866,6 @@ fn a_sigkilled_daemon_leaves_its_label_revivable() {
     let sent = ctx.ception(&["send", "killed", "follow up"]).run().expect_code(0);
     assert_has(&sent.stdout, "Resumed the prior run");
     assert_eq!(requests(&ctx.fake_state(), "thread/resume").count(), 1);
-}
-
-/// A `send` that arrives while a run is held for a continuation waits to see
-/// whether one comes. None does here: the held run settles to its own
-/// client, and the send gets a run (and a report) of its own.
-#[test]
-fn a_send_while_the_last_run_is_held_starts_its_own_run_once_the_hold_settles() {
-    let ctx = Ctx::new("continuation");
-    let env = ctx.env.set("CEPTION_CONTINUATION_GRACE_MS", 1500).set("CEPTION_FAKE_CONTINUATION_DELAY_MS", 20000);
-
-    let mut first = ctx.ception(&["spawn", "hold", "do the work"]).env(&env).spawn();
-    let log = ctx.log_path(SESSION, "hold");
-    assert!(
-        wait_until(WAIT, || fs::read_to_string(&log).is_ok_and(|log| log.contains("holding the report"))),
-        "the report was never held"
-    );
-
-    // "slow" parks the send's turn, so it can be steered to an end.
-    let mut sent = ctx.ception(&["send", "hold", "slow follow up"]).env(&env).spawn();
-    let held = first.wait();
-    assert_eq!(held.code, Some(2), "{held}");
-    assert_has(&held.stdout, "Instructions loaded");
-    assert_lacks(&held.stdout, "Steered response");
-
-    sent.wait_stdout("log: ");
-    let steered = ctx.ception(&["send", "hold", "add steering"]).env(&env).run().expect_code(0);
-    assert_has(&steered.stdout, "steered active turn");
-    let sent = sent.wait().expect_code(0);
-    assert_has(&sent.stdout, "Steered response");
 }
 
 /// A turn codex started by itself used to be taken for the requested one, so

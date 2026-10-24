@@ -3,7 +3,7 @@
 //!
 //! One actor owns all state and handles events in order: app-server output
 //! (in stream order, with RPC responses handled at their position as stored
-//! continuations, [`Pending`]), client commands, timers, child exits.
+//! continuations, [`Pending`]), client commands, child exits.
 //!
 //! Processes: the daemon is a child subreaper and the only thing that reaps
 //! its children, so everything codex starts stays in its process tree and a
@@ -11,9 +11,10 @@
 //! (TERM, then KILL) and reaps them until none are left; orphans the kernel
 //! hands it are reached the same way.
 //!
-//! Turns: a run is a turn plus the continuations codex folds into it. Runs
-//! are made only from codex's notifications: the first lifecycle event of an
-//! unseen turn starts a run, or continues the current one. Requests never
+//! Turns: a run is a turn, plus any turn codex moves on to before the
+//! current one's completion arrives. Runs are made only from codex's
+//! notifications: the first lifecycle event of an unseen turn starts a run,
+//! or continues the current one. Requests never
 //! make runs; a client waits on the turn codex names in its turn/start reply,
 //! and is attached once that turn shows up.
 
@@ -62,11 +63,6 @@ pub struct Options {
     pub watch_pid: Option<u32>,
     #[arg(long)]
     pub watch_starttime: Option<u64>,
-}
-
-fn env_duration(name: &str, default_ms: u64) -> Duration {
-    let ms = std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default_ms);
-    Duration::from_millis(ms)
 }
 
 pub fn spawn_timeout() -> Duration {
@@ -340,16 +336,13 @@ impl Client {
     }
 }
 
-/// A turn plus the continuation turns codex folds into it.
+/// A turn plus any turn codex moved on to before its completion arrived.
 struct Run {
     op: u64,
     /// Every physical turn of the run, the current one last.
     turns: Vec<String>,
     acc: TurnAccumulator,
     clients: Vec<Client>,
-    /// Compactions that already paid a grace hold, so a continuation that
-    /// ends clean doesn't wait again.
-    compactions_held: u32,
 }
 
 impl Run {
@@ -404,7 +397,6 @@ enum Event {
     /// A connection taken by the refuser, counted so exit waits for its reply.
     Connected,
     Disconnected,
-    GraceExpired(u64),
 }
 
 struct Daemon {
@@ -427,9 +419,6 @@ struct Daemon {
     thread_id: Option<String>,
     thread_starting: bool,
     run: Option<Run>,
-    /// Generation of the grace timer while a finished turn's report is held
-    /// for a continuation.
-    hold: Option<u64>,
     waiters: Vec<Waiter>,
     pending: HashMap<u64, Pending>,
     /// Commands that have to wait, in arrival order; see [`Daemon::must_defer`].
@@ -439,7 +428,6 @@ struct Daemon {
     /// Every turn seen to end, retained or not: never tracked again.
     finished_turns: HashSet<String>,
 
-    next_id: u64,
     next_run: u64,
     connections: usize,
     last_activity: Instant,
@@ -470,13 +458,11 @@ impl Daemon {
             thread_id: booted.thread_id,
             thread_starting: false,
             run: None,
-            hold: None,
             waiters: Vec::new(),
             pending: HashMap::new(),
             deferred: VecDeque::new(),
             settled: VecDeque::new(),
             finished_turns: HashSet::new(),
-            next_id: 0,
             next_run: 0,
             connections: 0,
             last_activity: Instant::now(),
@@ -581,7 +567,6 @@ impl Daemon {
 
     fn idle_eligible(&self) -> bool {
         self.run.is_none()
-            && self.hold.is_none()
             && self.connections == 0
             && self.waiters.is_empty()
             && self.pending.is_empty()
@@ -594,11 +579,6 @@ impl Daemon {
 
     fn label(&self) -> &str {
         &self.options.label
-    }
-
-    fn next_id(&mut self) -> u64 {
-        self.next_id += 1;
-        self.next_id
     }
 
     fn next_run(&mut self) -> u64 {
@@ -633,14 +613,6 @@ impl Daemon {
         if let Err(error) = self.persist() {
             self.log(&format!("[state] {error:#}"));
         }
-    }
-
-    fn after(&self, delay: Duration, event: Event) {
-        let events = self.events.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(delay).await;
-            let _ = events.send(event);
-        });
     }
 
     fn request(&mut self, method: &str, params: Value, pending: Pending) -> Result<()> {
@@ -684,26 +656,16 @@ impl Daemon {
             }
             Event::Connected => self.connections += 1,
             Event::Disconnected => self.connections = self.connections.saturating_sub(1),
-            Event::GraceExpired(generation) => {
-                if self.hold == Some(generation) {
-                    self.hold = None;
-                    self.log("[turn] no continuation arrived; settling");
-                    self.finish_run();
-                }
-            }
         }
     }
 
-    /// Anything needing the thread waits while it is being created. While a
-    /// run is held, codex may yet continue it: wait to see, so input steers
-    /// the continuation instead of starting new work that would fold into
-    /// the held run, and an interrupt has the continuation to aim at. An
+    /// Anything needing the thread waits while it is being created; an
     /// interrupt also waits while a requested turn is on its way.
     fn must_defer(&self, request: &Request) -> bool {
-        let settling = self.thread_starting || self.hold.is_some();
+        let creating = self.thread_starting;
         match request {
-            Request::Send { .. } => settling,
-            Request::Interrupt => settling || (self.run.is_none() && self.start_in_flight()),
+            Request::Send { .. } => creating,
+            Request::Interrupt => creating || (self.run.is_none() && self.start_in_flight()),
             _ => false,
         }
     }
@@ -853,7 +815,6 @@ impl Daemon {
                 }
                 let message = self.app.describe_exit(reason).await;
                 self.log(&format!("[app-server] {message}"));
-                self.hold = None;
                 self.fail_everyone(&message);
                 self.fail_pending(&message);
                 self.shutdown_request = Some("app-server exit".into());
@@ -1034,7 +995,7 @@ impl Daemon {
             self.log(&line);
         }
         if method == "turn/completed" {
-            self.complete_run();
+            self.finish_run();
         }
     }
 
@@ -1062,8 +1023,8 @@ impl Daemon {
             Some(prompt) => (prompt, None),
             None if self.start_in_flight() => ("(turn started)".to_string(), None),
             None => (
-                "(unattended continuation)".to_string(),
-                Some("[turn] adopted an unattended continuation turn; attach with `ception watch`"),
+                "(unrequested turn)".to_string(),
+                Some("[turn] adopted a turn codex started by itself; attach with `ception watch`"),
             ),
         };
         let op = self.next_run();
@@ -1072,12 +1033,11 @@ impl Daemon {
         if let Some(note) = note {
             self.log(note);
         }
-        self.run = Some(Run { op, turns: vec![id.to_string()], acc, clients: Vec::new(), compactions_held: 0 });
+        self.run = Some(Run { op, turns: vec![id.to_string()], acc, clients: Vec::new() });
         self.resolve_waiters();
     }
 
     fn continue_run(&mut self, id: &str) {
-        self.hold = None;
         let run = self.run.as_mut().expect("continuing a run");
         run.turns.push(id.to_string());
         run.acc.adopt_continuation(id);
@@ -1096,31 +1056,6 @@ impl Daemon {
         let op = self.next_run();
         self.settle(op, vec![id.to_string()], SettledOutcome::Report(Box::new(acc)));
         self.resolve_waiters();
-    }
-
-    /// A physical turn ending is not the run ending: after a compaction,
-    /// codex may continue in another turn by itself. Hold the clients and the
-    /// report until that settles; the timer is a stall safety net.
-    fn complete_run(&mut self) {
-        if self.hold.is_some() {
-            return;
-        }
-        let Some(run) = &mut self.run else {
-            return;
-        };
-        if run.acc.compactions <= run.compactions_held {
-            self.finish_run();
-            return;
-        }
-        run.compactions_held = run.acc.compactions;
-        let grace = env_duration("CEPTION_CONTINUATION_GRACE_MS", 2_000);
-        self.log(&format!(
-            "[turn] turn compacted; holding the report up to {}ms for a continuation turn",
-            grace.as_millis()
-        ));
-        let generation = self.next_id();
-        self.hold = Some(generation);
-        self.after(grace, Event::GraceExpired(generation));
     }
 
     fn finish_run(&mut self) {
@@ -1145,7 +1080,6 @@ impl Daemon {
         if let Err(error) = self.app.reject(id, method) {
             self.log(&format!("[error] {error:#}"));
         }
-        self.hold = None;
         let turn_id = self.run.as_ref().map(|run| run.current().to_string());
         self.fail_everyone(&description);
         if let (Some(turn_id), Some(thread_id)) = (turn_id, self.thread_id.clone()) {
@@ -1236,7 +1170,6 @@ impl Daemon {
     async fn shutdown(&mut self, reason: &str) {
         self.shutting_down = true;
         self.log(&format!("[daemon] shutting down: {reason}"));
-        self.hold = None;
         let message = format!("daemon shutting down: {reason}");
         self.fail_everyone(&message);
         for (_, client) in std::mem::take(&mut self.deferred) {
