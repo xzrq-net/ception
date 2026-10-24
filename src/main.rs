@@ -44,7 +44,7 @@ enum Command {
         effort: Option<String>,
         #[command(flatten)]
         wait: WaitArgs,
-        /// The prompt; `-` or nothing reads stdin.
+        /// The prompt; a lone `-` reads stdin.
         #[arg(trailing_var_arg = true)]
         prompt: Vec<String>,
     },

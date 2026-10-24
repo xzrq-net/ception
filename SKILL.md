@@ -29,10 +29,12 @@ Keep for yourself:
 
 GPT does not see your conversation or tool results. It does see the working
 copy, its `AGENTS.md`, and its own codex instructions. The user-level ones
-(`~/.codex/AGENTS.md`) are the same text as your `~/.claude/CLAUDE.md`, so
-tone, autonomy and engineering preferences need no restating. Send what it
-cannot recover and leave out what it can. On `send`, give only the delta; the
-thread keeps everything earlier unless the footer shows compactions.
+(`~/.codex/AGENTS.md`) are the same text as your `~/.claude/CLAUDE.md`, so tone,
+autonomy and engineering preferences need no restating. It runs at the project
+root with full access and no approvals: a work mode like "do not edit" is an
+instruction, not a sandbox. Send what it cannot recover and leave out what it
+can. On `send`, give only the delta; the thread keeps everything earlier unless
+the footer shows compactions.
 
 What it cannot recover:
 
@@ -66,7 +68,8 @@ check on a design of your own, ask for its take before showing yours.
 
 Do not pass `--model` or `--effort` unless the user names one; the codex config
 defaults apply. Both are fixed at `spawn` and `send` keeps the label's choice,
-so switching either means a new label.
+so switching either means a new label. `spawn` always starts a fresh thread;
+`send` is what resumes a label's stored one.
 
 ## Operating procedure
 
@@ -84,21 +87,23 @@ EOF
   Exit codes: 0 done, 2 failed, 3 interrupted, 4 infra/usage error, 5 still
   running after `--timeout`.
 - `--report` sets how much of the turn the report carries: `brief` (default) is
-  the final message plus footer, `items` adds the command/edit trail, `full` is
-  everything including reasoning. Use `items` when you'll want to audit what it
-  did without opening the log.
+  the final message plus footer, `items` adds a line per command, edit,
+  message and reasoning step, `full` is everything the log gets. Use `items` when you'll want to
+  audit what it did without opening the log.
 - If you spawned with `--cwd` pointing outside the current project, pass that
-  same `--cwd` to `send`, `interrupt`, `kill`, and `watch` too — without it they
-  look in the wrong project and fail with "no live daemon or stored thread".
-- Labels are scoped to the project root (nearest `.jj`/`.git` walking up from
-  the shell's cwd, so any subdirectory of the project reaches the same labels)
-  and to the session. In Claude Code that is the session id, which survives a
-  resume: a resumed session finds its labels and `send` revives their threads.
-  Another session's labels are invisible to yours and can't collide. Outside
-  Claude Code every caller in a project shares one `default` session unless
-  `CEPTION_SESSION` names one. If `send` fails because the label belongs to
-  another session, use a different label; take it over with
-  `CEPTION_SESSION=<that id>` only if that session is done with it.
+  same `--cwd` to every later command. Without it they look in the wrong
+  project: `send` and `watch` fail, but `interrupt` and `kill` find nothing to
+  stop and exit 0. Their exit 0 doesn't prove they reached the label; `list`
+  with that `--cwd` does.
+- Labels are scoped to the project root (nearest `.jj`/`.git`/`.hg` walking up
+  from the shell's cwd, so any subdirectory of the project reaches the same
+  labels) and to the session. In Claude Code that is the session id, which
+  survives a resume: a resumed session finds its labels and `send` revives their
+  threads. Another session's labels can't collide with yours; `list` shows them,
+  with their session id. Outside Claude Code every caller in a project shares
+  one `default` session unless `CEPTION_SESSION` names one. If `send` fails
+  because the label belongs to another session, use a different label; take it
+  over with `CEPTION_SESSION=<that id>` only if that session is done with it.
 - Follow-ups and course corrections go to the same thread:
   `ception send impl "..."`. If the turn is still running this steers it and
   returns immediately; if idle it starts a new turn and blocks. Steer when you
@@ -107,8 +112,8 @@ EOF
   Check it before committing to a long arc, and first if a turn fails on a
   usage limit.
 - Peek mid-run without ingesting reasoning:
-  `grep -E '^\[(cmd|edit|mcp|msg)\]' <logpath> | tail -20`. The full log
-  (including reasoning) is for the user, who may be tailing it.
+  `grep -E '^\[(cmd|edit|mcp|msg|turn|compaction|error)\]' <logpath> | tail -20`.
+  The full log (including reasoning) is for the user, who may be tailing it.
 - One turn at a time per label; use separate labels for parallel workstreams.
   Labels isolate threads, not files: parallel labels in the same cwd edit the
   same working copy. Give parallel writers disjoint paths or separate worktrees,
@@ -122,8 +127,9 @@ EOF
   daemon and its turn keep running. Reattach with `ception watch <label>`: it
   blocks until the current turn completes and delivers the report and exit code
   (at its own `--report` level, default brief — pass `--report full` to match a
-  full-report run). Idle daemon: prints `no active turn`, exits 0; no daemon:
-  exit 4, recover with `send`.
+  full-report run). If the turn already finished, `watch` prints
+  `no active turn` and exits 0; the report is then in the log. No daemon: exit
+  4, recover with `send`.
 - `ception interrupt <label>` cancels a runaway turn; `ception list` shows
   what's alive. Daemons exit on their own (idle timeout, or this Claude session
   ending) — `kill` is for stuck ones, not routine cleanup. Killing a daemon
@@ -148,12 +154,12 @@ visible:
   concluding nothing happened. Do not start new work on that label, and do not
   assume the working copy is quiescent, until it is idle.
 
-One residual failure: a turn reported **failed** with an `Instructions loaded.`
-warning means compaction wiped the context instead of summarising it and the
-turn stopped. Work done before it is on disk but unreported — check the diff,
-then `ception send <label>` with a resume prompt pointing at the diff and the
-agent's notes file. Confirm the label is idle first; sending into a live
-continuation steers it instead of resuming.
+One residual failure: a turn reported **failed** with
+`WARNING: turn derailed by mid-turn context compaction` means compaction wiped
+the context instead of summarising it and the turn stopped. Work done before it is on disk but
+unreported — check the diff, then `ception send <label>` with a resume prompt
+pointing at the diff and any notes the agent kept. Confirm the label is idle
+first; sending into a live continuation steers it instead of resuming.
 
 Prevention: scope each turn small (one gate/phase per turn) and have the agent
 update notes at intermediate milestones — plus milestone commits where the
