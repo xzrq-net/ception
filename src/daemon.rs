@@ -14,8 +14,8 @@
 //! Turns: a run is a turn plus the continuations codex folds into it. Runs
 //! are made only from codex's notifications: the first lifecycle event of an
 //! unseen turn starts a run, or continues the current one. Requests never
-//! make runs; a client waits on the turn codex names in its turn/start reply
-//! (or on the next run, for a goal), and is attached once that turn shows up.
+//! make runs; a client waits on the turn codex names in its turn/start reply,
+//! and is attached once that turn shows up.
 
 use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -38,8 +38,8 @@ use tokio::time::Instant;
 use crate::appserver::{AppEvent, AppServer, Incoming};
 use crate::paths::{LabelPaths, project_hash};
 use crate::procfs::{self, PidWatch};
-use crate::proto::{DaemonStatus, GoalAction, Outcome, Reply, Request};
-use crate::render::{ReportLevel, TurnAccumulator, format_goal};
+use crate::proto::{DaemonStatus, Outcome, Reply, Request};
+use crate::render::{ReportLevel, TurnAccumulator};
 use crate::store::{self, Record};
 
 #[derive(clap::Args, Clone, Debug)]
@@ -239,8 +239,7 @@ struct Booted {
     app: AppServer,
     app_events: UnboundedReceiver<AppEvent>,
     /// What arrived during startup besides the responses it waited for,
-    /// replayed into the actor in order. Resuming can report a goal and
-    /// even start its turn.
+    /// replayed into the actor in order.
     backlog: Vec<AppEvent>,
     listener: UnixListener,
     watch: Option<PidWatch>,
@@ -309,6 +308,9 @@ fn thread_params(project: &Path, model: Option<&str>) -> Value {
         "cwd": project,
         "approvalPolicy": "never",
         "sandbox": "danger-full-access",
+        // A thread goal has codex start turns of its own, and the model can
+        // set one itself. Every turn here is one a client asked for.
+        "config": { "features.goals": false },
     });
     if let Some(model) = model {
         params["model"] = json!(model);
@@ -365,76 +367,33 @@ struct Settled {
 }
 
 enum SettledOutcome {
-    /// With the goal as it stood when the run settled.
-    Report { acc: Box<TurnAccumulator>, goal: Option<Value> },
+    Report(Box<TurnAccumulator>),
     /// The run ended in an infrastructure failure, as its clients were told.
     Failed(String),
 }
 
-/// A client waiting for work that hasn't shown up yet.
+/// A client waiting on the turn codex named in its turn/start reply, which
+/// hasn't shown up yet: the turn it started, or the running one it steered
+/// the input into. `steer_run` is the run that was current when the request
+/// went out; landing in it means the input joined work already under way.
 struct Waiter {
     client: Client,
-    expect: Expect,
-}
-
-enum Expect {
-    /// The turn codex named in its turn/start reply: the one it started, or
-    /// the running one it steered the input into. `steer_run` is the run
-    /// that was current when the request went out; landing in it means the
-    /// input joined work already under way.
-    Turn { id: String, prompt: String, steer_run: Option<u64> },
-    /// The next run codex starts, for a goal; `timer` names its timeout.
-    NextRun { timer: u64 },
+    turn: String,
+    prompt: String,
+    steer_run: Option<u64>,
 }
 
 /// A request's continuation, run when its response arrives.
 enum Pending {
-    ThreadStart {
-        then: AfterThread,
-    },
-    TurnStart {
-        client: Client,
-        prompt: String,
-        steer_run: Option<u64>,
-    },
-    GoalSet {
-        client: Client,
-        action: GoalAction,
-        goal_updates: u64,
-        settled_count: u64,
-    },
-    GoalGet {
-        client: Client,
-        goal_updates: u64,
-    },
-    GoalClear {
-        client: Client,
-        goal_updates: u64,
-    },
-    /// An interrupt pausing the active goal first, so freeing the thread
-    /// doesn't just start the goal's next turn.
-    InterruptPause {
-        client: Client,
-        goal_updates: u64,
-    },
-    Interrupt {
-        client: Option<Client>,
-        turn_id: String,
-        paused: bool,
-    },
+    ThreadStart { then: AfterThread },
+    TurnStart { client: Client, prompt: String, steer_run: Option<u64> },
+    Interrupt { client: Option<Client>, turn_id: String },
 }
 
-enum AfterThread {
-    Send { client: Client, prompt: String },
-    Goal { client: Client, action: GoalAction, objective: Option<String> },
-}
-
-/// Work that has to wait: anything needing the thread while it is being
-/// created, and the turn half of an interrupt while there is nothing yet to
-/// interrupt.
-enum Deferred {
-    Command(Request, Client),
-    Interrupt { client: Client, paused: bool },
+/// A send waiting for its thread to be created.
+struct AfterThread {
+    client: Client,
+    prompt: String,
 }
 
 enum Event {
@@ -446,7 +405,6 @@ enum Event {
     Connected,
     Disconnected,
     GraceExpired(u64),
-    GoalStartExpired(u64),
 }
 
 struct Daemon {
@@ -472,14 +430,10 @@ struct Daemon {
     /// Generation of the grace timer while a finished turn's report is held
     /// for a continuation.
     hold: Option<u64>,
-    /// Anything but an "active" goal means codex starts no more turns.
-    goal: Option<Value>,
-    /// Goal notifications seen, so a reply can tell it is older than them.
-    goal_updates: u64,
     waiters: Vec<Waiter>,
     pending: HashMap<u64, Pending>,
-    deferred: VecDeque<Deferred>,
-    settled_count: u64,
+    /// Commands that have to wait, in arrival order; see [`Daemon::must_defer`].
+    deferred: VecDeque<(Request, Client)>,
     /// Recently settled runs, newest last.
     settled: VecDeque<Settled>,
     /// Every turn seen to end, retained or not: never tracked again.
@@ -517,12 +471,9 @@ impl Daemon {
             thread_starting: false,
             run: None,
             hold: None,
-            goal: None,
-            goal_updates: 0,
             waiters: Vec::new(),
             pending: HashMap::new(),
             deferred: VecDeque::new(),
-            settled_count: 0,
             settled: VecDeque::new(),
             finished_turns: HashSet::new(),
             next_id: 0,
@@ -659,23 +610,10 @@ impl Daemon {
         format!("{}.{op}", self.generation)
     }
 
-    fn goal_status(&self) -> Option<&str> {
-        self.goal.as_ref()?.get("status")?.as_str()
-    }
-
-    fn goal_active(&self) -> bool {
-        self.goal_status() == Some("active")
-    }
-
-    fn goal_line(&self) -> String {
-        format_goal(self.goal.as_ref(), Some(self.label()))
-    }
-
     /// A requested turn is on its way: a turn/start awaiting its reply, or
     /// a reply naming a turn not seen yet.
     fn start_in_flight(&self) -> bool {
-        self.pending.values().any(|pending| matches!(pending, Pending::TurnStart { .. }))
-            || self.waiters.iter().any(|waiter| matches!(waiter.expect, Expect::Turn { .. }))
+        self.pending.values().any(|pending| matches!(pending, Pending::TurnStart { .. })) || !self.waiters.is_empty()
     }
 
     fn persist(&self) -> Result<()> {
@@ -717,7 +655,6 @@ impl Daemon {
         if self.settled.len() > RETAINED_RUNS {
             self.settled.pop_front();
         }
-        self.settled_count += 1;
     }
 
     // ----- client commands -------------------------------------------------
@@ -731,9 +668,7 @@ impl Daemon {
                     self.last_activity = Instant::now();
                 }
                 let report = match &request {
-                    Request::Send { report, .. } | Request::Goal { report, .. } | Request::Watch { report, .. } => {
-                        *report
-                    }
+                    Request::Send { report, .. } | Request::Watch { report, .. } => *report,
                     _ => ReportLevel::Brief,
                 };
                 let client = Client { reply, report, acked: false };
@@ -741,11 +676,10 @@ impl Daemon {
                     client.answer(Reply::Refused { message: "daemon shutting down".into() });
                     return;
                 }
-                let item = Deferred::Command(request, client);
-                if self.must_defer(&item) {
-                    self.deferred.push_back(item);
+                if self.must_defer(&request) {
+                    self.deferred.push_back((request, client));
                 } else {
-                    self.dispatch(item).await;
+                    self.dispatch(request, client).await;
                 }
             }
             Event::Connected => self.connections += 1,
@@ -757,75 +691,52 @@ impl Daemon {
                     self.finish_run();
                 }
             }
-            Event::GoalStartExpired(timer) => {
-                let index = self
-                    .waiters
-                    .iter()
-                    .position(|waiter| matches!(waiter.expect, Expect::NextRun { timer: t } if t == timer));
-                if let Some(index) = index {
-                    let waiter = self.waiters.remove(index);
-                    let ms = env_duration("CEPTION_GOAL_START_MS", 30_000).as_millis();
-                    self.log(&format!("[goal] no turn started within {ms}ms"));
-                    let report = format!("{}\n\n(codex started no turn within {ms}ms)", self.goal_line());
-                    waiter.client.answer(self.goal_reply("ok", report));
-                }
-            }
         }
     }
 
-    fn must_defer(&self, item: &Deferred) -> bool {
-        let creating = self.thread_starting;
-        match item {
-            // While a run is held, codex may yet continue it: wait to see, so
-            // the input steers the continuation instead of starting new work
-            // that would fold into the held run.
-            Deferred::Command(Request::Send { .. }, _) => creating || self.hold.is_some(),
-            Deferred::Command(Request::Interrupt, _) => creating,
-            Deferred::Command(Request::Goal { action, .. }, _) => creating && *action != GoalAction::Show,
-            Deferred::Command(..) => false,
-            // Nothing to interrupt yet while a requested turn is on its way,
-            // or while a compaction hold decides whether a continuation comes.
-            Deferred::Interrupt { .. } => {
-                creating
-                    || (self.run.is_none() && self.start_in_flight())
-                    || (self.hold.is_some() && !self.goal_active())
-            }
+    /// Anything needing the thread waits while it is being created. While a
+    /// run is held, codex may yet continue it: wait to see, so input steers
+    /// the continuation instead of starting new work that would fold into
+    /// the held run, and an interrupt has the continuation to aim at. An
+    /// interrupt also waits while a requested turn is on its way.
+    fn must_defer(&self, request: &Request) -> bool {
+        let settling = self.thread_starting || self.hold.is_some();
+        match request {
+            Request::Send { .. } => settling,
+            Request::Interrupt => settling || (self.run.is_none() && self.start_in_flight()),
+            _ => false,
         }
     }
 
     async fn drain_deferred(&mut self) {
         while !self.stopping {
             match self.deferred.front() {
-                Some(item) if !self.must_defer(item) => {
-                    let item = self.deferred.pop_front().expect("front exists");
-                    self.dispatch(item).await;
+                Some((request, _)) if !self.must_defer(request) => {
+                    let (request, client) = self.deferred.pop_front().expect("front exists");
+                    self.dispatch(request, client).await;
                 }
                 _ => return,
             }
         }
     }
 
-    async fn dispatch(&mut self, item: Deferred) {
-        let result = match item {
-            Deferred::Interrupt { client, paused } => self.interrupt_current(client, paused),
-            Deferred::Command(request, client) => match request {
-                Request::Status => {
-                    client.answer(self.status_reply());
-                    Ok(())
-                }
-                Request::Send { prompt, .. } => self.send(prompt, client),
-                Request::Goal { action, objective, .. } => self.goal_command(action, objective, client),
-                Request::Interrupt => self.interrupt(client),
-                Request::Watch { run, .. } => {
-                    self.watch(run, client);
-                    Ok(())
-                }
-                Request::Shutdown => {
-                    client.answer(Reply::ok("ok", "shutdown accepted"));
-                    self.shutdown_request = Some("client shutdown".into());
-                    Ok(())
-                }
-            },
+    async fn dispatch(&mut self, request: Request, client: Client) {
+        let result = match request {
+            Request::Status => {
+                client.answer(self.status_reply());
+                Ok(())
+            }
+            Request::Send { prompt, .. } => self.send(prompt, client),
+            Request::Interrupt => self.interrupt(client),
+            Request::Watch { run, .. } => {
+                self.watch(run, client);
+                Ok(())
+            }
+            Request::Shutdown => {
+                client.answer(Reply::ok("ok", "shutdown accepted"));
+                self.shutdown_request = Some("client shutdown".into());
+                Ok(())
+            }
         };
         if let Err(error) = result {
             self.log(&format!("[error] {error:#}"));
@@ -841,15 +752,10 @@ impl Daemon {
                 thread_id: self.thread_id.clone(),
                 turn_id: self.run.as_ref().map(|run| run.current().to_string()),
                 state: if running { "active" } else { "idle" }.into(),
-                goal: self.goal.clone(),
                 log: self.paths.log.clone(),
             }),
             ..Default::default()
         })
-    }
-
-    fn goal_reply(&self, status: &str, report: String) -> Reply {
-        Reply::Result(Outcome { status: status.into(), report, goal: self.goal.clone(), ..Default::default() })
     }
 
     /// Attach to the current run, or to a named run: live, or settled and
@@ -884,7 +790,7 @@ impl Daemon {
     /// one; its reply names the turn, and the client waits on that.
     fn send(&mut self, prompt: String, client: Client) -> Result<()> {
         if self.thread_id.is_none() {
-            return self.start_thread(AfterThread::Send { client, prompt });
+            return self.start_thread(AfterThread { client, prompt });
         }
         let mut params = json!({
             "threadId": self.thread_id,
@@ -919,73 +825,14 @@ impl Daemon {
         }
     }
 
-    fn goal_command(&mut self, action: GoalAction, objective: Option<String>, client: Client) -> Result<()> {
-        let Some(thread_id) = self.thread_id.clone() else {
-            return match action {
-                GoalAction::Show | GoalAction::Clear => {
-                    client.answer(self.goal_reply("ok", self.goal_line()));
-                    Ok(())
-                }
-                _ => self.start_thread(AfterThread::Goal { client, action, objective }),
-            };
-        };
-        let goal_updates = self.goal_updates;
-        match action {
-            GoalAction::Show => {
-                let pending = Pending::GoalGet { client, goal_updates };
-                self.request("thread/goal/get", json!({ "threadId": thread_id }), pending)
-            }
-            GoalAction::Clear => {
-                let pending = Pending::GoalClear { client, goal_updates };
-                self.request("thread/goal/clear", json!({ "threadId": thread_id }), pending)
-            }
-            GoalAction::Set | GoalAction::Resume | GoalAction::Pause => {
-                let status = if action == GoalAction::Pause { "paused" } else { "active" };
-                let mut params = json!({ "threadId": thread_id, "status": status });
-                if let Some(objective) = &objective {
-                    params["objective"] = json!(objective);
-                }
-                let settled_count = self.settled_count;
-                let pending = Pending::GoalSet { client, action, goal_updates, settled_count };
-                self.request("thread/goal/set", params, pending)?;
-                if let Some(objective) = &objective {
-                    self.log(&format!("[goal] objective: {objective}"));
-                }
-                Ok(())
-            }
-        }
-    }
-
     fn interrupt(&mut self, client: Client) -> Result<()> {
-        // Paused even with no turn running: a held run or a goal about to
-        // start its next turn must stop too.
-        if self.goal_active()
-            && let Some(thread_id) = self.thread_id.clone()
-        {
-            let params = json!({ "threadId": thread_id, "status": "paused" });
-            let pending = Pending::InterruptPause { client, goal_updates: self.goal_updates };
-            return self.request("thread/goal/set", params, pending);
-        }
-        self.interrupt_current(client, false)
-    }
-
-    /// Interrupt whatever turn is running now, which after a goal pause may
-    /// be a continuation of the one the interrupt was aimed at.
-    fn interrupt_current(&mut self, client: Client, paused: bool) -> Result<()> {
-        let held_back = Deferred::Interrupt { client, paused };
-        if self.must_defer(&held_back) {
-            self.deferred.push_back(held_back);
-            return Ok(());
-        }
-        let Deferred::Interrupt { client, paused } = held_back else { unreachable!() };
-        let running = self.run.as_ref().filter(|_| self.hold.is_none()).map(|run| run.current().to_string());
+        let running = self.run.as_ref().map(|run| run.current().to_string());
         let (Some(turn_id), Some(thread_id)) = (running, self.thread_id.clone()) else {
-            let report = if paused { format!("no active turn\n{}", self.goal_line()) } else { "no active turn".into() };
-            client.answer(self.goal_reply("idle", report));
+            client.answer(Reply::ok("idle", "no active turn"));
             return Ok(());
         };
         let params = json!({ "threadId": thread_id, "turnId": turn_id });
-        let pending = Pending::Interrupt { client: Some(client), turn_id, paused };
+        let pending = Pending::Interrupt { client: Some(client), turn_id };
         self.request("turn/interrupt", params, pending)
     }
 
@@ -1026,14 +873,6 @@ impl Daemon {
         }
     }
 
-    /// Take a reply's goal snapshot unless a goal notification arrived since
-    /// the request went out; notifications are what settlement keys on.
-    fn take_goal_snapshot(&mut self, response: &Value, goal_updates: u64) {
-        if self.goal_updates == goal_updates {
-            self.goal = non_null(&response["goal"]);
-        }
-    }
-
     fn on_response(&mut self, pending: Pending, outcome: std::result::Result<Value, String>) -> Result<()> {
         match pending {
             Pending::ThreadStart { then } => {
@@ -1061,10 +900,7 @@ impl Daemon {
                     return Ok(());
                 }
                 self.log(&format!("[thread] started {thread_id}"));
-                match then {
-                    AfterThread::Send { client, prompt } => self.send(prompt, client),
-                    AfterThread::Goal { client, action, objective } => self.goal_command(action, objective, client),
-                }
+                self.send(then.prompt, then.client)
             }
             Pending::TurnStart { client, prompt, steer_run } => {
                 let turn_id = match outcome {
@@ -1075,75 +911,15 @@ impl Daemon {
                     }
                 };
                 match turn_id {
-                    Some(id) => self.waiters.push(Waiter { client, expect: Expect::Turn { id, prompt, steer_run } }),
+                    Some(turn) => self.waiters.push(Waiter { client, turn, prompt, steer_run }),
                     None => client.answer(Reply::error("turn/start returned no turn id")),
                 }
                 Ok(())
             }
-            Pending::GoalGet { client, goal_updates } => {
-                match outcome {
-                    Ok(response) => {
-                        self.take_goal_snapshot(&response, goal_updates);
-                        client.answer(self.goal_reply("ok", self.goal_line()));
-                    }
-                    Err(error) => client.answer(Reply::error(error)),
-                }
-                Ok(())
-            }
-            Pending::GoalClear { client, goal_updates } => {
-                match outcome {
-                    Ok(_) => {
-                        if self.goal_updates == goal_updates {
-                            self.goal = None;
-                        }
-                        self.log("[goal] cleared");
-                        let report = match &self.goal {
-                            None => "goal cleared".to_string(),
-                            Some(_) => format!("goal cleared, but a newer one is already set\n{}", self.goal_line()),
-                        };
-                        client.answer(self.goal_reply("ok", report));
-                    }
-                    Err(error) => client.answer(Reply::error(error)),
-                }
-                Ok(())
-            }
-            Pending::GoalSet { client, action, goal_updates, settled_count } => {
-                let response = match outcome {
-                    Ok(response) => response,
-                    Err(error) => {
-                        client.answer(Reply::error(error));
-                        return Ok(());
-                    }
-                };
-                self.take_goal_snapshot(&response, goal_updates);
-                let status = self.goal_status().unwrap_or("unknown").to_string();
-                self.log(&format!("[goal] {} -> {status}", goal_action_name(action)));
-                if action == GoalAction::Pause {
-                    client.answer(self.goal_reply("ok", self.goal_line()));
-                } else {
-                    self.attach_goal_client(client, settled_count);
-                }
-                Ok(())
-            }
-            Pending::InterruptPause { client, goal_updates } => match outcome {
-                Ok(response) => {
-                    self.take_goal_snapshot(&response, goal_updates);
-                    self.log("[goal] paused so the interrupt ends the run");
-                    self.interrupt_current(client, true)
-                }
-                Err(error) => {
-                    client.answer(Reply::error(error));
-                    Ok(())
-                }
-            },
-            Pending::Interrupt { client, turn_id, paused } => {
+            Pending::Interrupt { client, turn_id } => {
                 match (outcome, client) {
                     (Ok(_), Some(client)) => {
-                        let mut report = format!("interrupt requested for {turn_id}");
-                        if paused {
-                            report = format!("{report}\n{}", self.goal_line());
-                        }
-                        client.answer(self.goal_reply("ok", report));
+                        client.answer(Reply::ok("ok", format!("interrupt requested for {turn_id}")))
                     }
                     (Err(error), Some(client)) => client.answer(Reply::error(error)),
                     (Err(error), None) => self.log(&format!("[interrupt] {error}")),
@@ -1154,48 +930,14 @@ impl Daemon {
         }
     }
 
-    /// Where a goal client waits for the goal's work: a run that settled
-    /// before the reply arrived, the current run (codex folds a goal set
-    /// mid-turn into it), or the next run codex starts.
-    fn attach_goal_client(&mut self, client: Client, settled_before: u64) {
-        let goal_active = self.goal_active();
-        if self.settled_count > settled_before
-            && !goal_active
-            && let Some(settled) = self.settled.back()
-        {
-            let reply = match &settled.outcome {
-                SettledOutcome::Report { acc, .. } => turn_reply(acc, self.goal.clone(), client.report),
-                SettledOutcome::Failed(message) => Reply::error(message.clone()),
-            };
-            self.log("[goal] the goal's turn ran and stopped while it was being set");
-            client.answer(reply);
-            return;
-        }
-        if let Some(run) = &mut self.run {
-            run.clients.push(client);
-            return;
-        }
-        if !goal_active {
-            let report = format!("{}\n\n(codex started no turn)", self.goal_line());
-            client.answer(self.goal_reply("ok", report));
-            return;
-        }
-        let timer = self.next_id();
-        self.waiters.push(Waiter { client, expect: Expect::NextRun { timer } });
-        self.after(env_duration("CEPTION_GOAL_START_MS", 30_000), Event::GoalStartExpired(timer));
-    }
-
     /// Settle waiters whose turn has shown up: join it if it is in the
     /// current run (or answer at once if the input steered work already
     /// under way), or answer from its outcome if it already ended.
     fn resolve_waiters(&mut self) {
         for waiter in std::mem::take(&mut self.waiters) {
-            let Expect::Turn { id, steer_run, .. } = &waiter.expect else {
-                self.waiters.push(waiter);
-                continue;
-            };
+            let id = &waiter.turn;
             if let Some(run) = self.run.as_mut().filter(|run| run.turns.contains(id)) {
-                if *steer_run == Some(run.op) {
+                if waiter.steer_run == Some(run.op) {
                     let reply = Reply::ok("steered", format!("steered active turn {id}"));
                     waiter.client.answer(reply);
                 } else {
@@ -1236,32 +978,6 @@ impl Daemon {
             "turn/started" if ours => {
                 if let Some(id) = params["turn"]["id"].as_str() {
                     self.observe_turn(id);
-                }
-                return;
-            }
-            "thread/goal/updated" | "thread/goal/cleared" => {
-                // Codex's own subagents run threads and goals on this
-                // app-server; their status must not settle our run.
-                if !ours {
-                    return;
-                }
-                let goal = if method == "thread/goal/cleared" { None } else { non_null(&params["goal"]) };
-                let before = self.goal_status().map(str::to_string);
-                self.goal = goal;
-                self.goal_updates += 1;
-                let status = self.goal_status().map(str::to_string);
-                if status != before {
-                    self.log(&format!("[goal] {}", status.as_deref().unwrap_or("cleared")));
-                }
-                if status.as_deref() != Some("active") {
-                    if self.hold.take().is_some() {
-                        self.log("[goal] no longer active; settling the turn");
-                        self.finish_run();
-                    }
-                    // The goal stopped instead of starting the awaited run.
-                    if self.run.is_none() {
-                        self.release_next_run_waiters("(codex started no turn)");
-                    }
                 }
                 return;
             }
@@ -1341,18 +1057,10 @@ impl Daemon {
 
     fn start_run(&mut self, id: &str) {
         let thread_id = self.thread_id.clone().unwrap_or_default();
-        let requested = self.waiters.iter().find_map(|waiter| match &waiter.expect {
-            Expect::Turn { id: turn, prompt, .. } if turn == id => Some(prompt.clone()),
-            _ => None,
-        });
-        let clients = self.take_next_run_waiters();
-        let goal_pending = self.pending.values().any(|pending| matches!(pending, Pending::GoalSet { .. }));
+        let requested = self.waiters.iter().find(|waiter| waiter.turn == id).map(|waiter| waiter.prompt.clone());
         let (prompt, note) = match requested {
             Some(prompt) => (prompt, None),
             None if self.start_in_flight() => ("(turn started)".to_string(), None),
-            None if !clients.is_empty() || goal_pending => {
-                ("(goal turn)".to_string(), Some("[turn] codex started the goal's turn"))
-            }
             None => (
                 "(unattended continuation)".to_string(),
                 Some("[turn] adopted an unattended continuation turn; attach with `ception watch`"),
@@ -1364,17 +1072,15 @@ impl Daemon {
         if let Some(note) = note {
             self.log(note);
         }
-        self.run = Some(Run { op, turns: vec![id.to_string()], acc, clients, compactions_held: 0 });
+        self.run = Some(Run { op, turns: vec![id.to_string()], acc, clients: Vec::new(), compactions_held: 0 });
         self.resolve_waiters();
     }
 
     fn continue_run(&mut self, id: &str) {
         self.hold = None;
-        let clients = self.take_next_run_waiters();
         let run = self.run.as_mut().expect("continuing a run");
         run.turns.push(id.to_string());
         run.acc.adopt_continuation(id);
-        run.clients.extend(clients);
         self.log(&format!("[turn] continuing in turn {id}"));
         self.resolve_waiters();
     }
@@ -1388,57 +1094,30 @@ impl Daemon {
         acc.settle();
         self.log(&format!("[turn] {id} ended without being seen to start ({})", acc.status));
         let op = self.next_run();
-        let outcome = SettledOutcome::Report { acc: Box::new(acc), goal: self.goal.clone() };
-        self.settle(op, vec![id.to_string()], outcome);
+        self.settle(op, vec![id.to_string()], SettledOutcome::Report(Box::new(acc)));
         self.resolve_waiters();
     }
 
-    fn take_next_run_waiters(&mut self) -> Vec<Client> {
-        let (next, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.waiters)
-            .into_iter()
-            .partition(|waiter| matches!(waiter.expect, Expect::NextRun { .. }));
-        self.waiters = rest;
-        if !next.is_empty() {
-            self.log(&format!("[goal] {} client(s) attached to the goal's turn", next.len()));
-        }
-        next.into_iter().map(|waiter| waiter.client).collect()
-    }
-
-    fn release_next_run_waiters(&mut self, note: &str) {
-        let report = format!("{}\n\n{note}", self.goal_line());
-        let (next, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.waiters)
-            .into_iter()
-            .partition(|waiter| matches!(waiter.expect, Expect::NextRun { .. }));
-        self.waiters = rest;
-        for waiter in next {
-            waiter.client.answer(self.goal_reply("ok", report.clone()));
-        }
-    }
-
-    /// A physical turn ending is not the run ending: while a goal is active,
-    /// or after a compaction, codex may start another turn by itself. Hold
-    /// the clients and the report until that settles; the timer is a stall
-    /// safety net.
+    /// A physical turn ending is not the run ending: after a compaction,
+    /// codex may continue in another turn by itself. Hold the clients and the
+    /// report until that settles; the timer is a stall safety net.
     fn complete_run(&mut self) {
         if self.hold.is_some() {
             return;
         }
-        let goal_active = self.goal_active();
         let Some(run) = &mut self.run else {
             return;
         };
-        let compacted = run.acc.compactions > run.compactions_held;
-        if !goal_active && !compacted {
+        if run.acc.compactions <= run.compactions_held {
             self.finish_run();
             return;
         }
         run.compactions_held = run.acc.compactions;
-        let (grace, reason) = if goal_active {
-            (env_duration("CEPTION_GOAL_GRACE_MS", 30_000), "goal still active")
-        } else {
-            (env_duration("CEPTION_CONTINUATION_GRACE_MS", 2_000), "turn compacted")
-        };
-        self.log(&format!("[turn] {reason}; holding the report up to {}ms for a continuation turn", grace.as_millis()));
+        let grace = env_duration("CEPTION_CONTINUATION_GRACE_MS", 2_000);
+        self.log(&format!(
+            "[turn] turn compacted; holding the report up to {}ms for a continuation turn",
+            grace.as_millis()
+        ));
         let generation = self.next_id();
         self.hold = Some(generation);
         self.after(grace, Event::GraceExpired(generation));
@@ -1451,15 +1130,10 @@ impl Daemon {
         run.acc.settle();
         self.log(&run.acc.footer_line());
         for client in run.clients {
-            let reply = turn_reply(&run.acc, self.goal.clone(), client.report);
+            let reply = turn_reply(&run.acc, client.report);
             client.answer(reply);
         }
-        let outcome = SettledOutcome::Report { acc: Box::new(run.acc), goal: self.goal.clone() };
-        self.settle(run.op, run.turns, outcome);
-        // With the goal stopped no further run is coming.
-        if !self.goal_active() {
-            self.release_next_run_waiters("(codex started no turn)");
-        }
+        self.settle(run.op, run.turns, SettledOutcome::Report(Box::new(run.acc)));
         self.last_activity = Instant::now();
         self.persist_or_log();
         self.resolve_waiters();
@@ -1476,7 +1150,7 @@ impl Daemon {
         self.fail_everyone(&description);
         if let (Some(turn_id), Some(thread_id)) = (turn_id, self.thread_id.clone()) {
             let params = json!({ "threadId": thread_id, "turnId": turn_id });
-            let pending = Pending::Interrupt { client: None, turn_id, paused: false };
+            let pending = Pending::Interrupt { client: None, turn_id };
             if let Err(error) = self.request("turn/interrupt", params, pending) {
                 self.log(&format!("[error] interrupt after server request: {error:#}"));
             }
@@ -1502,12 +1176,7 @@ impl Daemon {
     fn fail_pending(&mut self, message: &str) {
         for (_, pending) in self.pending.drain() {
             let client = match pending {
-                Pending::TurnStart { client, .. }
-                | Pending::GoalSet { client, .. }
-                | Pending::GoalGet { client, .. }
-                | Pending::GoalClear { client, .. }
-                | Pending::InterruptPause { client, .. }
-                | Pending::Interrupt { client: Some(client), .. } => client,
+                Pending::TurnStart { client, .. } | Pending::Interrupt { client: Some(client), .. } => client,
                 Pending::ThreadStart { then } => {
                     then.fail(message);
                     continue;
@@ -1570,8 +1239,7 @@ impl Daemon {
         self.hold = None;
         let message = format!("daemon shutting down: {reason}");
         self.fail_everyone(&message);
-        for item in std::mem::take(&mut self.deferred) {
-            let (Deferred::Command(_, client) | Deferred::Interrupt { client, .. }) = item;
+        for (_, client) in std::mem::take(&mut self.deferred) {
             client.answer(Reply::Refused { message: message.clone() });
         }
         self.fail_pending(&message);
@@ -1591,23 +1259,21 @@ impl Daemon {
 
 impl AfterThread {
     fn fail(self, message: &str) {
-        let (AfterThread::Send { client, .. } | AfterThread::Goal { client, .. }) = self;
-        client.answer(Reply::error(message));
+        self.client.answer(Reply::error(message));
     }
 }
 
 fn settled_reply(outcome: &SettledOutcome, level: ReportLevel) -> Reply {
     match outcome {
-        SettledOutcome::Report { acc, goal } => turn_reply(acc, goal.clone(), level),
+        SettledOutcome::Report(acc) => turn_reply(acc, level),
         SettledOutcome::Failed(message) => Reply::error(message.clone()),
     }
 }
 
-fn turn_reply(acc: &TurnAccumulator, goal: Option<Value>, level: ReportLevel) -> Reply {
+fn turn_reply(acc: &TurnAccumulator, level: ReportLevel) -> Reply {
     Reply::Result(Outcome {
         status: acc.status.clone(),
         report: acc.build_report(level),
-        goal,
         turn_id: Some(acc.turn_id.clone()),
         daemon: None,
     })
@@ -1615,20 +1281,6 @@ fn turn_reply(acc: &TurnAccumulator, goal: Option<Value>, level: ReportLevel) ->
 
 fn text_input(text: &str) -> Value {
     json!({ "type": "text", "text": text, "text_elements": [] })
-}
-
-fn non_null(value: &Value) -> Option<Value> {
-    (!value.is_null()).then(|| value.clone())
-}
-
-fn goal_action_name(action: GoalAction) -> &'static str {
-    match action {
-        GoalAction::Set => "set",
-        GoalAction::Resume => "resume",
-        GoalAction::Pause => "pause",
-        GoalAction::Show => "show",
-        GoalAction::Clear => "clear",
-    }
 }
 
 fn format_rate_limits(limits: &Value) -> String {

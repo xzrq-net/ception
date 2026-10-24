@@ -6,10 +6,9 @@
 //!   starts, steers and interrupts; tests read it. Default
 //!   `./fake-appserver-state.json`.
 //! - `CEPTION_FAKE_BEHAVIOR`: which scripted shape to play, default "happy".
-//!   See `turn_start`, `turn_start_special` and `goal_set` for the branches.
+//!   See `turn_start` and `turn_start_special` for the branches.
 //! - `CEPTION_FAKE_CONTINUATION_DELAY_MS` (150), `CEPTION_FAKE_CONTINUATION_RUN_MS`
-//!   (0), `CEPTION_FAKE_GOAL_TURN_DELAY_MS` (100): timing of the turns the
-//!   server starts by itself.
+//!   (0): timing of the continuation turn the server starts by itself.
 //!
 //! Concurrency mirrors the JS event loop: every request handler and every timer
 //! callback runs start to finish under one lock (`server()`), so they never
@@ -315,33 +314,6 @@ fn token_usage_updated(thread_id: &str, turn_id: &str) -> Value {
     })
 }
 
-fn goal_updated(thread_id: &str, goal: Value) -> Value {
-    json!({ "method": "thread/goal/updated", "params": { "threadId": thread_id, "goal": goal } })
-}
-
-/// The turn error a server-side safeguard ends a goal's turn with.
-fn policy_stop() -> Value {
-    json!({
-        "message": "Turn stopped by a server-side content policy check.",
-        "codexErrorInfo": "policyStop",
-        "additionalDetails": null
-    })
-}
-
-/// The goal `goal-continuation` plays out, independent of `thread/goal/set`.
-fn fixture_goal(thread_id: &str, status: &str) -> Value {
-    json!({
-        "threadId": thread_id,
-        "objective": "Finish the fixture work",
-        "status": status,
-        "tokenBudget": null,
-        "tokensUsed": 100,
-        "timeUsedSeconds": 1,
-        "createdAt": 0,
-        "updatedAt": 0
-    })
-}
-
 /// Shaped like codex's GetAccountRateLimitsResponse. As on the real server, the
 /// account snapshot repeats in the by-id map under its own limit id, so
 /// `ception quota` has a duplicate to skip; "codex_spark" is one extra named
@@ -391,24 +363,14 @@ impl Turn {
     }
 }
 
-struct Goal {
-    objective: Value,
-    status: Value,
-}
-
 struct Server {
     active_turn: Option<Turn>,
     request_id: u64,
-    // Goals live in the app-server for real; the fake keeps them per process,
-    // which is enough because one daemon owns one app-server and one thread.
-    goal: Option<Goal>,
-    goal_turns: u32,
     /// Set inside `with_batch`: messages collect here instead of going out.
     batch: Option<Vec<Value>>,
 }
 
-static SERVER: Mutex<Server> =
-    Mutex::new(Server { active_turn: None, request_id: 9000, goal: None, goal_turns: 0, batch: None });
+static SERVER: Mutex<Server> = Mutex::new(Server { active_turn: None, request_id: 9000, batch: None });
 
 fn server() -> MutexGuard<'static, Server> {
     SERVER.lock().unwrap()
@@ -579,118 +541,6 @@ impl Server {
         });
     }
 
-    // The real cross-turn mechanism: an active thread goal makes codex start a
-    // follow-on turn by itself once the thread goes idle.
-    fn start_goal_turn(&mut self, turn: &Turn) {
-        let Turn { thread_id, turn_id, .. } = turn;
-        self.send(turn_started(thread_id, turn_id));
-        self.send(json!({
-            "method": "thread/goal/updated",
-            "params": { "threadId": thread_id, "turnId": turn_id, "goal": fixture_goal(thread_id, "active") }
-        }));
-        self.send(agent_message(thread_id, turn_id, "First half done."));
-        self.send(turn_completed(thread_id, turn_id, "completed", Value::Null));
-        // A subagent's own thread finishing its own goal, on this same connection,
-        // while our run is mid-hold. Nothing about it concerns this thread.
-        self.send(json!({
-            "method": "thread/goal/updated",
-            "params": { "threadId": "thr_subagent", "turnId": null, "goal": fixture_goal("thr_subagent", "complete") }
-        }));
-
-        let continuation = Turn::unprompted(thread_id);
-        set_timeout(env_ms("CEPTION_FAKE_CONTINUATION_DELAY_MS", 150), move |s| {
-            let Turn { thread_id, turn_id, .. } = &continuation;
-            s.active_turn = Some(continuation.clone());
-            s.send(turn_started(thread_id, turn_id));
-            s.send(agent_message(thread_id, turn_id, "Goal continuation finished the work."));
-            s.send(token_usage_updated(thread_id, turn_id));
-            s.send(json!({
-                "method": "thread/goal/updated",
-                "params": { "threadId": thread_id, "turnId": turn_id, "goal": fixture_goal(thread_id, "complete") }
-            }));
-            s.send(turn_completed(thread_id, turn_id, "completed", Value::Null));
-            s.active_turn = None;
-        });
-    }
-
-    /// The goal set through `thread/goal/set`; callers make sure there is one.
-    fn build_goal(&self, thread_id: &str) -> Value {
-        let goal = self.goal.as_ref().expect("no goal set");
-        json!({
-            "threadId": thread_id,
-            "objective": goal.objective,
-            "status": goal.status,
-            "tokenBudget": null,
-            "tokensUsed": 250,
-            "timeUsedSeconds": 3,
-            "createdAt": 0,
-            "updatedAt": now_seconds()
-        })
-    }
-
-    fn send_goal_updated(&mut self, thread_id: &str) {
-        let goal = self.build_goal(thread_id);
-        self.send(goal_updated(thread_id, goal));
-    }
-
-    fn set_goal_status(&mut self, thread_id: &str, status: &str) {
-        // Timers call this; the client may have cleared the goal meanwhile.
-        // (The JS fake crashed here.)
-        let Some(goal) = self.goal.as_mut() else {
-            return;
-        };
-        goal.status = json!(status);
-        self.send_goal_updated(thread_id);
-    }
-
-    fn goal_is_active(&self) -> bool {
-        self.goal.as_ref().is_some_and(|goal| goal.status == "active")
-    }
-
-    // What an active goal actually does: codex starts its own turn on the idle
-    // thread. The "goal-stopped" behaviour has the server end that first turn with
-    // a policy error, which is the shape a server-side safeguard produces — the
-    // turn fails and the goal goes to `blocked` until someone resumes it.
-    fn start_goal_turn_from_goal(&mut self, thread_id: &str) {
-        let turn = Turn::unprompted(thread_id);
-        self.active_turn = Some(turn.clone());
-        let stopping = matches!(BEHAVIOR.as_str(), "goal-stopped" | "goal-instant") && self.goal_turns == 0;
-        self.goal_turns += 1;
-        if *BEHAVIOR == "steer" {
-            // Park the goal's turn open so a test can steer it mid-flight.
-            self.start_long_turn(turn);
-            return;
-        }
-        let turn_id = &turn.turn_id;
-        self.send(turn_started(thread_id, turn_id));
-        let text = if stopping { "Working on the objective." } else { "Objective met; work finished." };
-        self.send(agent_message(thread_id, turn_id, text));
-        self.send(token_usage_updated(thread_id, turn_id));
-        if stopping {
-            self.send(turn_completed(thread_id, turn_id, "failed", policy_stop()));
-            self.active_turn = None;
-            self.set_goal_status(thread_id, "blocked");
-            return;
-        }
-        self.send(turn_completed(thread_id, turn_id, "completed", Value::Null));
-        self.active_turn = None;
-        self.set_goal_status(thread_id, "complete");
-    }
-
-    /// The fresh turn a goal starts after the running one ended, meeting the
-    /// objective (`goal-late-active`, `goal-during-turn`).
-    fn run_goal_continuation(&mut self, thread_id: &str, text: &str) {
-        let continuation = Turn::unprompted(thread_id);
-        let turn_id = &continuation.turn_id;
-        self.active_turn = Some(continuation.clone());
-        self.send(turn_started(thread_id, turn_id));
-        self.send(agent_message(thread_id, turn_id, text));
-        self.send(token_usage_updated(thread_id, turn_id));
-        self.set_goal_status(thread_id, "complete");
-        self.send(turn_completed(thread_id, turn_id, "completed", Value::Null));
-        self.active_turn = None;
-    }
-
     fn send_unsupported_request(&mut self, turn: &Turn) {
         let id = self.request_id;
         self.request_id += 1;
@@ -766,20 +616,6 @@ impl Server {
 
             "turn/start" => self.turn_start(message)?,
 
-            "thread/goal/set" => self.goal_set(message)?,
-
-            "thread/goal/get" => {
-                let thread_id = params["threadId"].as_str().unwrap_or_default();
-                let goal = if self.goal.is_some() { self.build_goal(thread_id) } else { Value::Null };
-                self.send(reply(message, json!({ "goal": goal })));
-            }
-
-            "thread/goal/clear" => {
-                let cleared = self.goal.take().is_some();
-                self.send(reply(message, json!({ "cleared": cleared })));
-                self.send(json!({ "method": "thread/goal/cleared", "params": { "threadId": params["threadId"] } }));
-            }
-
             "turn/steer" => self.turn_steer(message),
 
             "turn/interrupt" => {
@@ -847,8 +683,6 @@ impl Server {
             self.start_long_turn(turn);
         } else if behavior == "continuation" {
             self.start_compacted_turn(&turn);
-        } else if behavior == "goal-continuation" {
-            self.start_goal_turn(&turn);
         } else if behavior == "fail" {
             self.complete_turn(&turn, "failed", Some("Partial output before failure."));
         } else if behavior == "server-request" {
@@ -994,144 +828,6 @@ impl Server {
         None
     }
 
-    fn goal_set(&mut self, message: &Value) -> Result<(), String> {
-        let params = &message["params"];
-        let thread_id = find_thread(&params["threadId"])?.id;
-        let previous_objective = self.goal.take().map(|goal| goal.objective);
-        self.goal = Some(Goal {
-            objective: given(&params["objective"]).or(previous_objective).unwrap_or_else(|| json!("")),
-            status: given(&params["status"]).unwrap_or_else(|| json!("active")),
-        });
-        // The running turn, if any, addressed on this request's thread.
-        let parked = self.active_turn.clone().map(|turn| Turn { thread_id: thread_id.clone(), ..turn });
-
-        match (BEHAVIOR.as_str(), parked) {
-            // The goal is accepted and never starts a turn by itself.
-            ("slow-turn-start", _) => self.answer_goal(message, &thread_id),
-
-            // Ends the running turn and rejects the goal request in one write.
-            ("goal-set-error", parked) => {
-                self.goal = None;
-                self.with_batch(|s| {
-                    if let Some(parked) = &parked {
-                        s.complete_turn(parked, "completed", None);
-                    }
-                    s.send(reply_error(message, -32000, "goal rejected by fixture"));
-                });
-            }
-
-            // The goal is accepted, then stops without ever starting a turn.
-            ("goal-stalls", None) => {
-                self.answer_goal(message, &thread_id);
-                set_timeout(60, move |s| s.set_goal_status(&thread_id, "usageLimited"));
-            }
-
-            // The running turn ends between the reply and the goal taking effect;
-            // only then does the goal produce its own turn.
-            ("goal-late-active", Some(parked)) => {
-                self.with_batch(|s| {
-                    let goal = s.build_goal(&thread_id);
-                    s.send(reply(message, json!({ "goal": goal })));
-                    s.complete_turn(&parked, "completed", Some("Parked turn finished."));
-                    s.send_goal_updated(&thread_id);
-                });
-                set_timeout(60, move |s| s.run_goal_continuation(&thread_id, "Continuation after the late goal."));
-            }
-
-            // The running turn absorbs the goal and meets the objective itself,
-            // with no continuation at all.
-            ("goal-in-running-turn", Some(parked)) => {
-                self.answer_goal(message, &thread_id);
-                set_timeout(50, move |s| {
-                    s.set_goal_status(&parked.thread_id, "complete");
-                    s.complete_turn(&parked, "completed", Some("Objective met inside the running turn."));
-                });
-            }
-
-            // The running turn ends and the objective continues in a fresh turn —
-            // the one the goal client is actually waiting for.
-            ("goal-during-turn", Some(parked)) => {
-                self.answer_goal(message, &thread_id);
-                set_timeout(50, move |s| {
-                    s.complete_turn(&parked, "completed", Some("Parked turn finished."));
-                    set_timeout(50, move |s| {
-                        s.run_goal_continuation(&parked.thread_id, "Goal turn finished the work.")
-                    });
-                });
-            }
-
-            // Codex snapshots the goal, persists it, then answers. In between, the
-            // goal can start a turn and that turn can fail, so the reply arrives
-            // last, carrying the stale (active) snapshot. Plain: one write.
-            // "-split": each message its own write, 20ms apart.
-            (behavior @ ("goal-response-last" | "goal-response-last-split"), None) if self.goal_is_active() => {
-                let messages = self.goal_turn_before_reply(message, &thread_id);
-                if behavior == "goal-response-last" {
-                    self.with_batch(|s| messages.into_iter().for_each(|m| s.send(m)));
-                } else {
-                    self.send_spaced(messages, 20);
-                }
-            }
-
-            (behavior, parked) => {
-                let starts_turn = self.goal_is_active() && parked.is_none();
-                // "goal-instant" answers and runs the whole turn in one write, the
-                // shape a turn that fails the moment it starts produces.
-                if behavior == "goal-instant" && starts_turn {
-                    self.with_batch(|s| {
-                        s.answer_goal(message, &thread_id);
-                        s.start_goal_turn_from_goal(&thread_id);
-                    });
-                    return Ok(());
-                }
-                self.answer_goal(message, &thread_id);
-                if starts_turn {
-                    let delay = env_ms("CEPTION_FAKE_GOAL_TURN_DELAY_MS", 100);
-                    set_timeout(delay, move |s| s.start_goal_turn_from_goal(&thread_id));
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// The `goal-response-last` sequence, reply last. State changes land at once
-    /// (the goal ends `blocked`, no turn left running); only the writes may be
-    /// spread out.
-    fn goal_turn_before_reply(&mut self, message: &Value, thread_id: &str) -> Vec<Value> {
-        let stale = self.build_goal(thread_id);
-        let turn = Turn::unprompted(thread_id);
-        let turn_id = &turn.turn_id;
-        self.goal_turns += 1;
-        self.goal.as_mut().expect("goal just set").status = json!("blocked");
-        let blocked = self.build_goal(thread_id);
-        vec![
-            goal_updated(thread_id, stale.clone()),
-            turn_started(thread_id, turn_id),
-            agent_message(thread_id, turn_id, "Goal turn ran before the reply."),
-            token_usage_updated(thread_id, turn_id),
-            turn_completed(thread_id, turn_id, "failed", policy_stop()),
-            goal_updated(thread_id, blocked),
-            reply(message, json!({ "goal": stale })),
-        ]
-    }
-
-    /// Each message its own write, `gap_ms` apart, in order.
-    fn send_spaced(&mut self, messages: Vec<Value>, gap_ms: u64) {
-        let mut rest = messages.into_iter();
-        if let Some(first) = rest.next() {
-            self.send(first);
-        }
-        if rest.len() > 0 {
-            set_timeout(gap_ms, move |s| s.send_spaced(rest.collect(), gap_ms));
-        }
-    }
-
-    fn answer_goal(&mut self, message: &Value, thread_id: &str) {
-        let goal = self.build_goal(thread_id);
-        self.send(reply(message, json!({ "goal": goal })));
-        self.send_goal_updated(thread_id);
-    }
-
     fn turn_steer(&mut self, message: &Value) {
         let params = &message["params"];
         self.send(reply(message, json!({ "turnId": params["expectedTurnId"] })));
@@ -1152,11 +848,6 @@ impl Server {
             set_timeout(100, move |s| {
                 let text = format!("Steered response.\nSteer: {steer_prompt}");
                 s.complete_turn(&steered, "completed", Some(&text));
-                // A goal would keep starting turns; call it done so the steered
-                // turn is the end of the run.
-                if s.goal_is_active() {
-                    s.set_goal_status(&steered.thread_id, "complete");
-                }
             });
         }
     }

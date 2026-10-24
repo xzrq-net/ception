@@ -183,27 +183,6 @@ pub fn format_duration(elapsed: Duration) -> String {
     format!("{:.1}s", ms as f64 / 1000.0)
 }
 
-/// Codex's own long-run driver. Anything but `active` means it has stopped
-/// starting turns, and `complete` is the only stop that means the work is done.
-const GOAL_STOPPED_SHORT: [&str; 4] = ["paused", "blocked", "usageLimited", "budgetLimited"];
-
-pub fn format_goal(goal: Option<&Value>, label: Option<&str>) -> String {
-    let Some(goal) = goal.filter(|goal| truthy(Some(goal))) else {
-        return "no goal set".to_string();
-    };
-    let status = js_string(goal.get("status"));
-    let objective = one_line(&js_string(goal.get("objective")), 300);
-    let mut lines = vec![format!("goal: {status} — {objective}")];
-    if GOAL_STOPPED_SHORT.contains(&status.as_str()) {
-        let resume = match label.filter(|label| !label.is_empty()) {
-            Some(label) => format!("ception goal {label} --resume"),
-            None => "ception goal <label> --resume".to_string(),
-        };
-        lines.push(format!("the goal stopped before completing; restart the run with `{resume}`"));
-    }
-    lines.join("\n")
-}
-
 pub fn status_exit_code(status: &str) -> i32 {
     match status {
         "completed" | "ok" | "steered" | "idle" => 0,
@@ -563,8 +542,8 @@ impl TurnAccumulator {
                 lines.join("\n")
             }
             ReportLevel::Brief => {
-                // Turns codex starts for a goal often end without an agent
-                // message. An almost empty report is worse than a terse trail of
+                // Turns can end without an agent message (interrupted,
+                // compacted, cut off by an error). An almost empty report is worse than a terse trail of
                 // what it did — but brief must stay brief, so the trail is what
                 // it touched, not how it thought.
                 if body.is_empty() {
@@ -908,20 +887,6 @@ mod tests {
         assert_eq!(format_duration(ms(59_499)), "59.5s");
         assert_eq!(format_duration(ms(59_500)), "1m 0s");
         assert_eq!(format_duration(ms(125_400)), "2m 5s");
-    }
-
-    #[test]
-    fn goal_lines() {
-        assert_eq!(format_goal(None, None), "no goal set");
-        assert_eq!(format_goal(Some(&Value::Null), Some("x")), "no goal set");
-        let active = json!({ "status": "active", "objective": "ship\nit" });
-        assert_eq!(format_goal(Some(&active), Some("audit")), "goal: active — ship it");
-        let blocked = json!({ "status": "blocked", "objective": "ship it" });
-        assert_eq!(
-            format_goal(Some(&blocked), Some("audit")),
-            "goal: blocked — ship it\nthe goal stopped before completing; restart the run with `ception goal audit --resume`"
-        );
-        assert!(format_goal(Some(&blocked), None).ends_with("`ception goal <label> --resume`"));
     }
 
     #[test]

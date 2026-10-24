@@ -103,6 +103,22 @@ fn dead_daemon_plus_stored_thread_respawns_and_resumes() {
 }
 
 #[test]
+fn threads_start_and_resume_with_codex_goals_disabled() {
+    let ctx = Ctx::new("happy");
+
+    ctx.ception(&["spawn", "nogoal", "first"]).run().expect_code(0);
+    ctx.ception(&["kill", "nogoal"]).run().expect_code(0);
+    ctx.ception(&["send", "nogoal", "follow up"]).run().expect_code(0);
+
+    let state = ctx.fake_state();
+    let threads: Vec<&Value> = requests(&state, "thread/start").chain(requests(&state, "thread/resume")).collect();
+    assert_eq!(threads.len(), 2, "{state}");
+    for request in threads {
+        assert_eq!(request["params"]["config"]["features.goals"], false, "{request}");
+    }
+}
+
+#[test]
 fn server_initiated_request_is_rejected_and_fails_the_turn() {
     let ctx = Ctx::new("server-request");
 
@@ -518,258 +534,6 @@ fn an_unattended_continuation_turn_is_adopted_so_watch_and_list_can_see_it() {
     assert!(!unknown_turn_started, "{log}");
 }
 
-// ----- goals -------------------------------------------------------------------------------
-
-#[test]
-fn an_active_goal_holds_the_report_across_codexs_self_started_follow_on_turn() {
-    let ctx = Ctx::new("goal-continuation");
-
-    // The first physical turn ends with "First half done." while the goal is
-    // still active; only the continuation's answer should reach the client.
-    let out = ctx.ception(&["spawn", "goal", "do the work"]).run().expect_code(0);
-    assert_has(&out.stdout, "Goal continuation finished the work.");
-    assert_lacks(&out.stdout, "First half done.");
-}
-
-#[test]
-fn a_goal_that_stops_being_active_settles_the_turn_without_waiting_out_the_grace_window() {
-    let ctx = Ctx::new("happy");
-
-    // happy behaviour emits no goal at all, so nothing should be held back.
-    let env = ctx.env.set("CEPTION_GOAL_GRACE_MS", 60000);
-    let started = Instant::now();
-    ctx.ception(&["spawn", "nogoal", "do the work"]).env(&env).run().expect_code(0);
-    assert!(started.elapsed() < secs(8), "a goal-less turn must not pay the continuation grace window");
-}
-
-#[test]
-fn goal_on_a_fresh_label_starts_a_daemon_and_blocks_on_the_run_codex_starts() {
-    let ctx = Ctx::new("happy");
-
-    let out = ctx.ception(&["goal", "audit", "review every module and report findings"]).run().expect_code(0);
-    assert!(out.lines_starting("log: ").iter().any(|line| line.ends_with("audit.log")), "{out}");
-    assert_has(&out.stdout, "Objective met; work finished.");
-    assert_has(&out.stdout, "goal: complete — review every module");
-
-    let state = ctx.fake_state();
-    let goal_set = requests(&state, "thread/goal/set").next().unwrap();
-    assert_eq!(goal_set["params"]["objective"], "review every module and report findings");
-    assert_eq!(goal_set["params"]["status"], "active");
-    // No prompt turn was needed: the objective alone drove the work.
-    assert_eq!(array_len(&state["lastTurnStarts"]), 0);
-}
-
-#[test]
-fn a_policy_stopped_goal_reports_the_stop_keeps_the_daemon_and_resumes() {
-    let ctx = Ctx::new("goal-stopped");
-
-    // The turn fails and the goal goes to blocked; both facts have to reach the
-    // report, along with the command that restarts the run.
-    let stopped = ctx.ception(&["goal", "audit", "keep grinding on the objective"]).run().expect_code(2);
-    assert_has(&stopped.stdout, "status: failed");
-    assert_has(&stopped.stdout, "error code: policyStop");
-    assert_has(&stopped.stdout, "goal: blocked");
-    assert_has(&stopped.stdout, "ception goal audit --resume");
-
-    assert_has(&ctx.list_text(), "audit\tmine\tidle\tgoal=blocked");
-
-    let resumed = ctx.ception(&["goal", "audit", "--resume"]).run().expect_code(0);
-    assert_has(&resumed.stdout, "Objective met; work finished.");
-    assert_has(&resumed.stdout, "goal: complete");
-
-    // The whole point of resuming rather than respawning: one app-server across
-    // the stop, so codex's background shells and subagents are still there.
-    let state = ctx.fake_state();
-    assert_eq!(state["appServerStarts"], 1);
-    assert_eq!(goal_set_statuses(&state), ["active", "active"]);
-}
-
-#[test]
-fn goal_pause_stops_codex_starting_more_turns_and_show_reports_the_goal() {
-    let ctx = Ctx::new("happy");
-
-    ctx.ception(&["goal", "arc", "the long objective"]).run().expect_code(0);
-
-    let paused = ctx.ception(&["goal", "arc", "--pause"]).run().expect_code(0);
-    assert_has(&paused.stdout, "goal: paused");
-    assert!(paused.lines_starting("log: ").is_empty(), "{paused}");
-
-    let shown = ctx.ception(&["goal", "arc", "--show"]).run();
-    assert_has(&shown.stdout, "goal: paused — the long objective");
-
-    let cleared = ctx.ception(&["goal", "arc", "--clear"]).run();
-    assert_has(&cleared.stdout, "goal cleared");
-    assert_has(&ctx.ception(&["goal", "arc", "--show"]).run().stdout, "no goal set");
-}
-
-#[test]
-fn send_steers_the_turn_a_goal_started() {
-    let ctx = Ctx::new("steer");
-
-    // "steer" behaviour parks the goal's turn open until something steers it.
-    let mut running = ctx.ception(&["goal", "arc", "the long objective"]).spawn();
-    ctx.wait_listed("arc\tmine\tactive");
-
-    let steer = ctx.ception(&["send", "arc", "stop polishing the parser"]).run().expect_code(0);
-    assert_has(&steer.stdout, "steered active turn");
-
-    let finished = running.wait().expect_code(0);
-    assert_has(&finished.stdout, "Steer: stop polishing the parser");
-}
-
-#[test]
-fn interrupt_pauses_an_active_goal_so_the_run_actually_stops() {
-    let ctx = Ctx::new("steer");
-
-    let mut running = ctx.ception(&["goal", "arc", "the long objective"]).spawn();
-    ctx.wait_listed("arc\tmine\tactive");
-
-    let interrupted = ctx.ception(&["interrupt", "arc"]).run().expect_code(0);
-    assert_has(&interrupted.stdout, "goal: paused");
-    running.wait().expect_code(3);
-
-    // Without the pause, codex would start another turn on the freed thread.
-    assert_eq!(goal_set_statuses(&ctx.fake_state()), ["active", "paused"]);
-}
-
-#[test]
-fn a_goal_turn_that_starts_and_fails_in_one_batch_still_reaches_the_client() {
-    let ctx = Ctx::new("goal-instant");
-
-    // The fixture writes the turn's whole lifecycle in the same batch of lines
-    // as the goal/set response, so the daemon dispatches all of it before its
-    // own request await resumes. The client must still get the failure.
-    let env = ctx.env.set("CEPTION_GOAL_START_MS", 2000);
-    let out = ctx.ception(&["goal", "audit", "the objective"]).env(&env).run().expect_code(2);
-    assert_has(&out.stdout, "error code: policyStop");
-    assert_has(&out.stdout, "goal: blocked");
-    assert_lacks(&out.stdout, "started no turn");
-
-    // The same batch also carries the newer goal status. The reply to goal/set
-    // says "active" and arrives later in program order, so a daemon that trusts
-    // it keeps advertising a run that has already stopped.
-    assert_has(&ctx.list_text(), "goal=blocked");
-}
-
-/// Not in the JS suite. Codex snapshots the goal, persists it, then answers:
-/// the goal's whole turn, failure and the newer `blocked` status can all land
-/// before the reply, which carries the stale `active` snapshot.
-fn goal_reply_after_its_failed_turn(behavior: &str) {
-    let ctx = Ctx::new(behavior);
-
-    let out = ctx.ception(&["goal", "arc", "the objective"]).run().expect_code(2);
-    assert_has(&out.stdout, "Goal turn ran before the reply.");
-    assert_has(&out.stdout, "error code: policyStop");
-    assert_has(&out.stdout, "goal: blocked");
-    assert_lacks(&out.stdout, "started no turn");
-
-    assert_has(&ctx.list_text(), "goal=blocked");
-}
-
-/// Plain: the reply and everything before it in one write.
-#[test]
-fn a_goal_reply_arriving_after_its_failed_turn_in_one_write_reports_the_turn() {
-    goal_reply_after_its_failed_turn("goal-response-last");
-}
-
-/// Split: each message its own write, 20ms apart.
-#[test]
-fn a_goal_reply_arriving_after_its_failed_turn_in_split_writes_reports_the_turn() {
-    goal_reply_after_its_failed_turn("goal-response-last-split");
-}
-
-#[test]
-fn a_rejected_goal_reaches_its_client_even_as_another_turn_ends_in_the_same_write() {
-    let ctx = Ctx::new("goal-set-error");
-
-    // The fixture ends the running turn and rejects the goal in one write; the
-    // goal client must get the rejection, not the other turn's report.
-    let mut running = ctx.ception(&["spawn", "arc", "slow work"]).spawn();
-    ctx.wait_listed("arc\tmine\tactive");
-
-    let goal = ctx.ception(&["goal", "arc", "the objective"]).run().expect_code(4);
-    assert_has(&goal.stderr, "goal rejected by fixture");
-    assert_lacks(&goal.stdout, "Handled the requested task");
-
-    // The turn that was already running still reports to the client that started it.
-    let spawned = running.wait().expect_code(0);
-    assert_has(&spawned.stdout, "Handled the requested task");
-
-    let shown = ctx.ception(&["goal", "arc", "--show"]).run().expect_code(0);
-    assert_has(&shown.stdout, "no goal set");
-}
-
-#[test]
-fn a_goal_set_mid_turn_reports_the_turn_codex_starts_for_it_not_the_running_one() {
-    let ctx = Ctx::new("goal-during-turn");
-
-    let mut running = ctx.ception(&["spawn", "arc", "slow work"]).spawn();
-    ctx.wait_listed("arc\tmine\tactive");
-
-    let goal = ctx.ception(&["goal", "arc", "the objective"]).run().expect_code(0);
-    assert_has(&goal.stdout, "Goal turn finished the work.");
-    assert_lacks(&goal.stdout, "Parked turn finished.");
-    running.wait().expect_code(0);
-}
-
-#[test]
-fn a_goal_that_stops_before_starting_a_turn_answers_its_client_at_once() {
-    let ctx = Ctx::new("goal-stalls");
-
-    // The goal stops without ever starting a turn; the status change is the
-    // answer, not the start clock running out.
-    let env = ctx.env.set("CEPTION_GOAL_START_MS", 6000);
-    let started = Instant::now();
-    let out = ctx.ception(&["goal", "arc", "the objective"]).env(&env).run().expect_code(0);
-    assert_has(&out.stdout, "goal: usageLimited");
-    assert_has(&out.stdout, "started no turn");
-    assert!(started.elapsed() < secs(5), "waited out the start clock instead of using the status");
-}
-
-#[test]
-fn a_turn_that_ends_before_the_goal_takes_effect_is_not_reported_as_the_goals() {
-    let ctx = Ctx::new("goal-late-active");
-
-    // The running turn finishes between the goal/set reply and the goal taking
-    // effect; its work predates the objective and must not be reported as it.
-    let mut running = ctx.ception(&["spawn", "arc", "slow work"]).spawn();
-    ctx.wait_listed("arc\tmine\tactive");
-
-    let env = ctx.env.set("CEPTION_GOAL_START_MS", 3000);
-    let goal = ctx.ception(&["goal", "arc", "the objective"]).env(&env).run().expect_code(0);
-    assert_has(&goal.stdout, "Continuation after the late goal.");
-    assert_lacks(&goal.stdout, "Parked turn finished.");
-    running.wait().expect_code(0);
-}
-
-#[test]
-fn a_goal_met_by_the_turn_already_running_still_reports_to_its_client() {
-    let ctx = Ctx::new("goal-in-running-turn");
-
-    // Codex folds a goal set mid-turn into that turn; a client watching only
-    // for a fresh turn would time out while the work happens in front of it.
-    let mut running = ctx.ception(&["spawn", "arc", "slow work"]).spawn();
-    ctx.wait_listed("arc\tmine\tactive");
-
-    let env = ctx.env.set("CEPTION_GOAL_START_MS", 3000);
-    let goal = ctx.ception(&["goal", "arc", "the objective"]).env(&env).run().expect_code(0);
-    assert_has(&goal.stdout, "Objective met inside the running turn.");
-    assert_lacks(&goal.stdout, "started no turn");
-    running.wait().expect_code(0);
-}
-
-#[test]
-fn a_subagent_threads_goal_does_not_settle_this_threads_run() {
-    let ctx = Ctx::new("goal-continuation");
-
-    // The fixture completes a foreign thread's goal while our report is held for
-    // the continuation. Acting on it would cut the run short at "First half".
-    let env = ctx.env.set("CEPTION_FAKE_CONTINUATION_DELAY_MS", 600);
-    let out = ctx.ception(&["spawn", "sub", "do the work"]).env(&env).run().expect_code(0);
-    assert_has(&out.stdout, "Goal continuation finished the work.");
-    assert_lacks(&out.stdout, "First half done.");
-}
-
 // ----- quota -----------------------------------------------------------------------------
 
 #[test]
@@ -930,39 +694,6 @@ fn an_app_server_exit_is_noticed_while_a_descendant_holds_its_stdout() {
     assert!(!alive(holder), "stdout holder {holder} survived the daemon");
 }
 
-/// An interrupt with an active goal used to wait for a pending turn/start
-/// reply before pausing the goal, which could start more turns meanwhile.
-#[test]
-fn interrupt_pauses_an_active_goal_without_waiting_for_a_pending_turn_start() {
-    let ctx = Ctx::new("slow-turn-start");
-
-    // The fixture's goal never starts a turn; the waiter gives up quickly.
-    let env = ctx.env.set("CEPTION_GOAL_START_MS", 200);
-    let goal = ctx.ception(&["goal", "arc", "the objective"]).env(&env).run().expect_code(0);
-    assert_has(&goal.stdout, "started no turn");
-
-    let mut sent = ctx.ception(&["send", "arc", "manual turn"]).spawn();
-    ctx.wait_turn_starts(1);
-    let interrupted = ctx.ception(&["interrupt", "arc"]).run().expect_code(0);
-    assert_has(&interrupted.stdout, "goal: paused");
-    sent.wait().expect_code(3);
-
-    let state = ctx.fake_state();
-    assert_eq!(goal_set_statuses(&state), ["active", "paused"]);
-    let paused_at = state["requests"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .position(|r| r["method"] == "thread/goal/set" && r["params"]["status"] == "paused")
-        .unwrap();
-    let mark = state["marks"].as_array().unwrap().iter().find(|m| m["mark"] == "turn/start replied").unwrap();
-    let requests_before_reply = mark["requests"].as_u64().unwrap() as usize;
-    assert!(
-        paused_at < requests_before_reply,
-        "goal paused only after the turn/start reply (request #{paused_at}, reply after #{requests_before_reply})"
-    );
-}
-
 /// GC used to delete any old record temp file, even one a live daemon (the
 /// lock holder) may be rewriting.
 #[test]
@@ -1065,34 +796,6 @@ fn a_spawn_failing_before_its_turn_starts_reports_the_error_despite_the_timeout(
     let out = ctx.ception(&["spawn", "ghost", "--timeout", "0", "hello"]).run().expect_code(4);
     assert_has(&out.stderr, &format!("write {}: Is a directory", record.display()));
     assert_lacks(&out.stdout, "still running");
-}
-
-#[test]
-fn a_goal_rejected_before_its_turn_starts_reports_the_error_despite_the_timeout() {
-    let ctx = Ctx::new("goal-set-error");
-
-    let mut running = ctx.ception(&["spawn", "arc", "slow work"]).spawn();
-    ctx.wait_listed("arc\tmine\tactive");
-
-    let goal = ctx.ception(&["goal", "arc", "--timeout", "0", "the objective"]).run().expect_code(4);
-    assert_has(&goal.stderr, "goal rejected by fixture");
-    assert_lacks(&goal.stdout, "still running");
-    running.wait().expect_code(0);
-}
-
-#[test]
-fn goal_timeout_hands_back_the_goal_turns_run() {
-    let ctx = Ctx::new("steer");
-
-    // "steer" parks the turn the goal starts until something steers it.
-    let started = Instant::now();
-    let out = ctx.ception(&["goal", "arc", "--timeout", "1", "the long objective"]).run().expect_code(5);
-    assert!(started.elapsed() >= secs(1), "gave up after {:?}", started.elapsed());
-    let run = still_running_run(&out, "arc");
-
-    ctx.ception(&["send", "arc", "stop polishing the parser"]).run().expect_code(0);
-    let watched = ctx.ception(&["watch", "arc", "--run", &run]).run().expect_code(0);
-    assert_has(&watched.stdout, "Steer: stop polishing the parser");
 }
 
 #[test]
@@ -1261,26 +964,6 @@ fn a_run_lost_to_an_infrastructure_failure_stays_watchable() {
     assert_lacks(&watched.stderr, "not retained");
 }
 
-/// A retained report used to carry the goal as it is now, not as it stood
-/// when the run settled.
-#[test]
-fn a_retained_report_keeps_the_goal_as_it_stood_when_the_run_settled() {
-    let ctx = Ctx::new("steer");
-
-    // "steer" parks each goal turn until something steers it.
-    let out = ctx.ception(&["goal", "arc", "--timeout", "0", "first objective"]).run().expect_code(5);
-    let run = still_running_run(&out, "arc");
-    ctx.ception(&["send", "arc", "finish it"]).run().expect_code(0);
-    ctx.wait_listed("arc\tmine\tidle\tgoal=complete");
-
-    let out = ctx.ception(&["goal", "arc", "--timeout", "0", "second objective"]).run().expect_code(5);
-    still_running_run(&out, "arc");
-
-    let watched = ctx.ception(&["watch", "arc", "--run", &run]).timeout(secs(3)).run().expect_code(0);
-    assert_has(&watched.stdout, "goal: complete — first objective");
-    assert_lacks(&watched.stdout, "second objective");
-}
-
 /// The timeout used to start counting only once the daemon was up, so a slow
 /// app-server start was paid on top of it.
 #[test]
@@ -1395,12 +1078,6 @@ fn a_turn_whose_report_aged_out_before_its_start_reply_is_not_waited_on() {
 
 fn requests<'a>(state: &'a Value, method: &'a str) -> impl Iterator<Item = &'a Value> + 'a {
     state["requests"].as_array().into_iter().flatten().filter(move |request| request["method"] == method)
-}
-
-fn goal_set_statuses(state: &Value) -> Vec<String> {
-    requests(state, "thread/goal/set")
-        .map(|request| request["params"]["status"].as_str().unwrap().to_string())
-        .collect()
 }
 
 fn last_turn_start(state: &Value) -> &Value {

@@ -15,8 +15,8 @@ use tokio::time::Instant;
 
 use crate::daemon::{self, spawn_timeout};
 use crate::paths::{self, LabelPaths, project_hash, validate_name};
-use crate::proto::{DaemonStatus, GoalAction, Reply, Request};
-use crate::render::{format_goal, status_exit_code};
+use crate::proto::{DaemonStatus, Reply, Request};
+use crate::render::status_exit_code;
 use crate::session::{self, Session};
 use crate::store;
 use crate::{AtArgs, Command, WaitArgs, procfs, quota};
@@ -25,16 +25,6 @@ pub async fn run(command: Command) -> Result<u8> {
     match command {
         Command::Spawn { label, model, effort, wait, prompt } => spawn(&label, model, effort, &wait, prompt).await,
         Command::Send { label, wait, prompt } => send(&label, &wait, prompt).await,
-        Command::Goal { label, resume, pause, show, clear, wait, objective } => {
-            let action = match (resume, pause, show, clear) {
-                (true, ..) => GoalAction::Resume,
-                (_, true, ..) => GoalAction::Pause,
-                (_, _, true, _) => GoalAction::Show,
-                (.., true) => GoalAction::Clear,
-                _ => GoalAction::Set,
-            };
-            goal(&label, action, &wait, objective).await
-        }
         Command::Interrupt { label, at } => interrupt(&label, &at).await,
         Command::Kill { label, all, at } => kill(label.as_deref(), all, &at).await,
         Command::List { all, json, at } => list(all, json, &at).await,
@@ -306,7 +296,7 @@ async fn converse(socket: &Path, request: &Request, label: &str, deadline: Optio
                 run = Some(accepted);
             }
             Reply::Refused { .. } => return Ok(Conversation::Refused),
-            reply => return finish(reply, label).map(Conversation::Done),
+            reply => return finish(reply).map(Conversation::Done),
         }
     }
 }
@@ -347,7 +337,7 @@ fn still_running(label: &str, run: &str) -> u8 {
     5
 }
 
-fn finish(reply: Reply, label: &str) -> Result<u8> {
+fn finish(reply: Reply) -> Result<u8> {
     let outcome = match reply {
         Reply::Error { message } | Reply::Refused { message } => bail!(message),
         Reply::Accepted { .. } => bail!("daemon sent no final reply"),
@@ -355,13 +345,6 @@ fn finish(reply: Reply, label: &str) -> Result<u8> {
     };
     if !outcome.report.is_empty() {
         println!("{}", outcome.report.trim_end());
-    }
-    // A turn report says what happened in the turn; the goal says whether
-    // codex is going to keep going. Both are needed to know if the run is over.
-    if outcome.turn_id.is_some()
-        && let Some(goal) = &outcome.goal
-    {
-        println!("\n{}", format_goal(Some(goal), Some(label)));
     }
     Ok(status_exit_code(&outcome.status) as u8)
 }
@@ -424,38 +407,6 @@ async fn send(label: &str, wait: &WaitArgs, prompt: Vec<String>) -> Result<u8> {
     converse_reviving(&scope, label, &paths, &request, deadline, || None).await
 }
 
-/// Setting or resuming a goal blocks on the run codex starts for it; pause,
-/// show and clear answer at once. Setting one on a label with no thread yet
-/// starts a fresh daemon: the objective alone is enough to start a run.
-async fn goal(label: &str, action: GoalAction, wait: &WaitArgs, objective: Vec<String>) -> Result<u8> {
-    let objective = match action {
-        GoalAction::Set => Some(read_text(objective, "objective", "goal")?),
-        _ if !objective.is_empty() => bail!("goal: an objective only goes with setting a goal"),
-        _ => None,
-    };
-    let deadline = wait.deadline();
-    let scope = Scope::resolve(&wait.at)?;
-    let paths = scope.label(label)?;
-    scope.gc();
-    let request = Request::Goal { action, objective, report: wait.report };
-    // A label with no thread yet gets a fresh daemon.
-    let revival = || {
-        (action == GoalAction::Set && !paths.record.exists()).then_some(Revival::Fresh { model: None, effort: None })
-    };
-    if matches!(action, GoalAction::Set | GoalAction::Resume) {
-        return converse_reviving(&scope, label, &paths, &request, deadline, revival).await;
-    }
-    // Pause, show and clear answer at once and print no log line.
-    match revival() {
-        Some(revival) => ensure_daemon(&scope, label, &paths, &revival).await?,
-        None => revive(&scope, label, &paths).await?,
-    };
-    match converse(&paths.socket, &request, label, None).await? {
-        Conversation::Done(code) => Ok(code),
-        Conversation::Refused => bail!("the daemon for {label} is shutting down; try again"),
-    }
-}
-
 async fn interrupt(label: &str, at: &AtArgs) -> Result<u8> {
     let scope = Scope::resolve(at)?;
     let paths = scope.label(label)?;
@@ -463,7 +414,7 @@ async fn interrupt(label: &str, at: &AtArgs) -> Result<u8> {
         println!("no active turn");
         return Ok(0);
     }
-    finish(call(&paths.socket, &Request::Interrupt).await?, label)
+    finish(call(&paths.socket, &Request::Interrupt).await?)
 }
 
 async fn kill(label: Option<&str>, all: bool, at: &AtArgs) -> Result<u8> {
@@ -489,7 +440,7 @@ async fn kill(label: Option<&str>, all: bool, at: &AtArgs) -> Result<u8> {
         println!("no live daemon");
         return Ok(0);
     }
-    finish(call(&paths.socket, &Request::Shutdown).await?, label)
+    finish(call(&paths.socket, &Request::Shutdown).await?)
 }
 
 async fn list(all: bool, json_output: bool, at: &AtArgs) -> Result<u8> {
@@ -500,14 +451,12 @@ async fn list(all: bool, json_output: bool, at: &AtArgs) -> Result<u8> {
     for entry in entries {
         let paths = entry.paths()?;
         let daemon = status(&paths).await;
-        let goal = daemon.as_ref().and_then(|d| d.goal.as_ref()).and_then(|g| g["status"].as_str().map(str::to_string));
         rows.push(json!({
             "label": entry.label,
             "cwd": entry.record.cwd,
             "hash": entry.hash,
             "session": if entry.session == scope.session.key { "mine".to_string() } else { entry.session.clone() },
             "status": daemon.as_ref().map_or("dead".to_string(), |d| d.state.clone()),
-            "goal": goal,
             "threadId": daemon.as_ref().and_then(|d| d.thread_id.clone()).unwrap_or(entry.record.thread_id.clone()),
             "lastUsed": timestamp(entry.modified),
             "logPath": paths.log,
@@ -520,11 +469,10 @@ async fn list(all: bool, json_output: bool, at: &AtArgs) -> Result<u8> {
     let text = |value: &Value| value.as_str().map_or("-".to_string(), str::to_string);
     for row in &rows {
         println!(
-            "{}\t{}\t{}\tgoal={}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}",
             text(&row["label"]),
             text(&row["session"]),
             text(&row["status"]),
-            text(&row["goal"]),
             text(&row["threadId"]),
             text(&row["lastUsed"]),
             text(&row["logPath"]),

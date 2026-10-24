@@ -24,17 +24,11 @@ ception send "$label" --cwd "$scratch" \
   "Reply with exactly the single word: pong2. Do not run any commands."
 
 echo
-echo "== goal: codex drives its own turns from the objective =="
-ception goal "$label" --cwd "$scratch" \
-  "Create a file named done.txt in the working directory whose only content is the word ok. Once that file exists with that content the objective is met and nothing further is needed. Do not do anything else."
-test -f "$scratch/done.txt" || { echo "goal did not produce done.txt"; exit 1; }
-
-echo
-echo "== goal --pause / --show / --resume =="
-ception goal "$label" --cwd "$scratch" --pause
-ception goal "$label" --cwd "$scratch" --show
-ception goal "$label" --cwd "$scratch" --resume
-ception goal "$label" --cwd "$scratch" --clear
+echo "== goals are off: codex has no goal tools =="
+out="$(ception send "$label" --cwd "$scratch" \
+  "Is a tool named create_goal available to you right now? Reply with exactly one word, yes or no. Do not run any commands.")"
+echo "$out"
+grep -qiE '^no\.?$' <<<"$out" || { echo "codex reports goal tools (features.goals override not applied?)"; exit 1; }
 
 echo
 echo "== list =="

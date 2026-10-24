@@ -35,8 +35,6 @@ in `~/.claude/CLAUDE.md`: "To delegate work to Codex, use `ception`; run
 ception spawn worker "inspect this repo"
 ception send worker "continue with the fix"
 ception send worker - < long-prompt.md
-ception goal worker - < arc.md
-ception goal worker --resume
 ception interrupt worker
 ception list
 ception quota
@@ -56,7 +54,7 @@ blocks. Prompts are the remaining words, or stdin for a lone `-`.
 Both `spawn` and `send` print the log path on their first stdout line.
 
 Flags on `spawn`: `--model`, `--effort`; model settings default to
-`~/.codex/config.toml`. `spawn`, `send`, `goal` and `watch` take
+`~/.codex/config.toml`. `spawn`, `send` and `watch` take
 `--report brief|items|full` and `--timeout SECS`; every command takes `--cwd`.
 Labels are scoped by the project root resolved from the invocation directory,
 so a label spawned with `--cwd` must be addressed with the same `--cwd` (or
@@ -65,6 +63,10 @@ from inside that project).
 Codex always runs with full access and approvals disabled; ception is meant
 for environments where the harness itself runs unsandboxed. If Codex sends an
 approval request anyway, the daemon rejects it and fails the turn (exit 4).
+
+Thread goals are disabled (`features.goals = false` on every thread): codex
+starts no turns of its own for a goal, and the model has no tool to set one.
+Every turn is one a client asked for, or a continuation codex folds into it.
 
 Report levels: `brief` (final message and a status/files/tokens/duration
 footer, the default), `items` (adds one line per command, edit and tool
@@ -96,45 +98,6 @@ delivers its retained report, or the failure that ended it (the daemon keeps
 the last 16). Run ids carry the daemon's generation, so a restarted daemon
 refuses an old one rather than mistake it for new work. Failures before the
 turn starts are reported directly, as without the flag.
-
-## Goals: runs codex drives itself
-
-A thread goal makes codex start turn after turn by itself until the objective
-is met:
-
-```sh
-ception goal audit "<the arc: what done looks like>"   # set, and block on the run
-ception goal audit - < arc.md                           # objective from stdin
-ception goal audit --resume                             # restart a stopped goal
-ception goal audit --pause                              # stop starting new turns
-ception goal audit --show                               # objective and status
-ception goal audit --clear
-```
-
-Setting an objective, and `--resume`, behave like `spawn`: print the log path,
-block until the run settles, deliver one report covering the whole run. While
-a goal is `active` the daemon holds the report across turn boundaries
-(`CEPTION_GOAL_GRACE_MS` is the stall safety net). Set during a running turn,
-the objective is folded into that turn. The other forms answer at once. A
-goal alone can start a label that has no thread yet, on the default model;
-`spawn` first to choose one.
-
-Every turn report ends with a goal line, and `ception list` has a `goal=`
-column:
-
-- `active`: codex will start another turn.
-- `complete`: the objective is met. The only status that means done.
-- `paused`, `blocked`, `usageLimited`, `budgetLimited`: stopped short. A turn
-  error blocks the goal (`error code:` in the footer names it), and the
-  report prints the `--resume` command that restarts the run.
-
-Resuming keeps the same daemon, app-server and thread, so codex's background
-shells and subagents survive the stop; a stopped goal leaves the daemon idle,
-so `CEPTION_IDLE_TIMEOUT_SECS` (4h) is the real resume deadline.
-
-`ception interrupt` pauses an active goal before interrupting, even with no
-turn running; otherwise freeing the thread would just start the goal's next
-turn.
 
 ## Quota
 
@@ -178,12 +141,12 @@ stops the calling session's daemons in the project.
 
 ## Continuations
 
-Codex can start a turn on its own: an active goal's next turn, or the
-continuation of a compacted turn on older app-servers. While a client waits,
-the daemon folds such turns into one report (compacted turns get the shorter
-`CEPTION_CONTINUATION_GRACE_MS` hold). A turn that arrives after everything
-settled is still tracked, without clients: `list` shows the label active and
-`watch` can attach, so an in-flight turn is never invisible.
+Codex can start a turn on its own: the continuation of a compacted turn on
+older app-servers. While a client waits, the daemon folds such turns into one
+report, holding a compacted turn's report for `CEPTION_CONTINUATION_GRACE_MS`.
+A turn that arrives after everything settled is still tracked, without
+clients: `list` shows the label active and `watch` can attach, so an
+in-flight turn is never invisible.
 
 If a compacted turn ends with nothing but codex's `Instructions loaded for
 <path>.` acknowledgement, the report is marked failed (exit 2) with a warning:
@@ -217,7 +180,7 @@ while to exit, and anything it started can outlive it, so a revived label
 can briefly overlap leftovers of its predecessor. Closing that would take a
 cgroup or an outside supervisor.
 
-A daemon on its way out refuses new work; `send` and `goal` then wait for it
+A daemon on its way out refuses new work; `send` then waits for it
 to release the label and start a successor.
 
 A daemon exits when:
@@ -246,7 +209,7 @@ Under `${XDG_STATE_HOME:-~/.local/state}/ception/`:
   the locks and can reach each other's daemons.
 
 Labels of other sessions idle longer than `CEPTION_GC_DAYS` (7) with no live
-daemon are deleted (record and log) on the next spawn/send/goal/list in that
+daemon are deleted (record and log) on the next spawn/send/list in that
 project, under the label lock.
 
 ## Environment variables
@@ -260,12 +223,8 @@ project, under the label lock.
   spawn may sit through an npx download).
 - `CEPTION_GC_DAYS`: age before other sessions' idle labels are collected,
   default 7.
-- `CEPTION_GOAL_GRACE_MS`: with an active goal, how long a completed turn
-  waits for codex's follow-on turn before settling anyway, default 30000. A
-  goal status change settles it sooner.
-- `CEPTION_GOAL_START_MS`: how long `goal`/`--resume` waits for codex to start
-  the goal's turn before answering with the goal state, default 30000.
-- `CEPTION_CONTINUATION_GRACE_MS`: the same for compacted turns, default 2000.
+- `CEPTION_CONTINUATION_GRACE_MS`: how long a compacted turn waits for
+  codex's continuation turn before settling anyway, default 2000.
 
 ## Development
 

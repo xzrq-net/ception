@@ -104,8 +104,8 @@ EOF
   returns immediately; if idle it starts a new turn and blocks. Steer when you
   see divergence; don't poll.
 - `ception quota` shows the account's rate-limit windows (no label, no tokens).
-  Check it before committing to a long arc, and first if a run stops with
-  `usageLimited`.
+  Check it before committing to a long arc, and first if a turn fails on a
+  usage limit.
 - Peek mid-run without ingesting reasoning:
   `grep -E '^\[(cmd|edit|mcp|msg)\]' <logpath> | tail -20`. The full log
   (including reasoning) is for the user, who may be tailing it.
@@ -114,7 +114,7 @@ EOF
   same working copy. Give parallel writers disjoint paths or separate worktrees,
   and tell each which changes belong to someone else.
 - No background shells in your harness, or tool calls that time out? Pass
-  `--timeout SECS` to `spawn`/`send`/`goal`/`watch`: once the turn is running
+  `--timeout SECS` to `spawn`/`send`/`watch`: once the turn is running
   and SECS have passed, the call prints `still running: run N` and exits 5;
   collect the result later with `ception watch <label> --run N` (blocks, or
   prints the retained report if the run already settled).
@@ -125,61 +125,17 @@ EOF
   full-report run). Idle daemon: prints `no active turn`, exits 0; no daemon:
   exit 4, recover with `send`.
 - `ception interrupt <label>` cancels a runaway turn; `ception list` shows
-  what's alive, including each label's goal status. Daemons exit on their own
-  (idle timeout, or this Claude session ending) — `kill` is for stuck ones, not
-  routine cleanup. Killing a daemon takes codex's background shells and
-  subagents with it; interrupting or pausing does not.
-
-## Long arcs: goals
-
-For work measured in hours rather than turns — an audit, a migration, a sweep
-across a large surface — set a **goal** instead of prompting turn by turn. Codex
-then starts its own turns, back to back, until the objective is met:
-
-```sh
-ception goal audit - <<'EOF'
-<the arc: what done looks like, the boundaries, what to report>
-EOF
-```
-
-This blocks like `spawn` and returns one report for the whole run. Everything
-above about prompting applies to the objective, with more weight: it is the
-standing instruction for every turn, and you will not be consulted between
-them. Say what done looks like, what is out of bounds, and what to write down
-as it goes; notes on disk survive compaction.
-
-`goal` also works on a name with no daemon yet, on the default model. `spawn`
-first for a different model, or for an opening turn on a different footing
-than the arc (a scoping pass, say).
-
-**Read the goal line, not just the report.** Every turn report ends with one:
-
-- `goal: complete` — the objective is met. The only status that means done.
-- `goal: paused | blocked | usageLimited | budgetLimited` — codex stopped
-  short; the report also prints the `--resume` command. A failed turn (server
-  policy stops included — `error code:` in the footer names them) leaves the
-  goal `blocked`.
-- `goal: active` after you already have the report means codex is still going
-  (see the section below).
-
-`ception goal <label> --resume` blocks on the restarted run and keeps the same
-daemon, app-server and thread, so codex's background shells and subagents
-survive the stop. The deadline is the daemon's idle timeout (4h by default);
-for an arc that may sit stopped longer, spawn under a raised
-`CEPTION_IDLE_TIMEOUT_SECS`. If it stops at the same place twice, read the log
-before resuming again.
-
-Steering mid-run works as usual — `ception send <label> "..."` steers the live
-turn; setting the objective again changes the standing instruction.
-`ception interrupt <label>` pauses the goal and then interrupts, so it really
-stops the run; `--pause` lets the current turn finish and stops the next one.
+  what's alive. Daemons exit on their own (idle timeout, or this Claude session
+  ending) — `kill` is for stuck ones, not routine cleanup. Killing a daemon
+  takes codex's background shells and subagents with it; interrupting does
+  not.
 
 ## When one `spawn` is more than one Codex turn
 
-Codex sometimes keeps working after a turn ends — with an active thread goal it
-starts follow-on turns by itself, and compaction can do the same. The daemon
-follows the work across those turns and gives you a single report, so normally
-you need not care. Two things make it visible:
+Codex sometimes keeps working after a turn ends: compaction can make it continue
+in a follow-on turn by itself. The daemon follows the work across those turns
+and gives you a single report, so normally you need not care. Two things make it
+visible:
 
 - A `compactions: N` line in the footer means the model spent part of the run
   working from a summary. Verify that report against the diff more carefully

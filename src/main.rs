@@ -56,27 +56,7 @@ enum Command {
         #[arg(trailing_var_arg = true)]
         prompt: Vec<String>,
     },
-    /// Set LABEL's thread goal (codex then drives its own turns), or manage it.
-    Goal {
-        label: String,
-        /// Restart a stopped goal.
-        #[arg(long, group = "goal_action")]
-        resume: bool,
-        /// Stop codex from starting further turns.
-        #[arg(long, group = "goal_action")]
-        pause: bool,
-        /// Print the objective and status.
-        #[arg(long, group = "goal_action")]
-        show: bool,
-        #[arg(long, group = "goal_action")]
-        clear: bool,
-        #[command(flatten)]
-        wait: WaitArgs,
-        /// The objective; `-` or nothing reads stdin.
-        #[arg(trailing_var_arg = true)]
-        objective: Vec<String>,
-    },
-    /// Interrupt LABEL's live turn (pausing an active goal first).
+    /// Interrupt LABEL's live turn.
     Interrupt {
         label: String,
         #[command(flatten)]
